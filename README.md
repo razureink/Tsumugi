@@ -25,7 +25,7 @@ Tsumugi（つむぎ，日语"纺线"）是一个用 Go 标准库从零写的内�
 
 ## 快速开始
 
-首次访问 <http://localhost:8080/> 会进入安装向导，按提示创建管理员账号后即可登录控制台。
+首次访问 <http://localhost:10232/> 会进入安装向导，按提示创建管理员账号后即可登录控制台。
 
 ## 部署
 
@@ -40,8 +40,8 @@ docker compose up -d --build
 | 端口 | 用途 |
 | ---- | ---- |
 | 9999 | 二进制协议 |
-| 8080 | 监控 / 管理面板 |
-| 3306 | MySQL 兼容协议 |
+| 10232 | 监控 / 管理面板 |
+| 3309 | MySQL 兼容协议 |
 
 数据落在 `./data` 目录（容器内挂载为 volume，删除容器不丢数据）。常用操作：
 
@@ -86,19 +86,19 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
 
 ### 部署到生产环境的建议
 
-- **端口**：二进制协议 9999、面板 8080 建议只对内网或加反向代理（Nginx/Caddy）暴露；MySQL 3306 按需开放。
+- **端口**：二进制协议 9999、面板 10232 建议只对内网或加反向代理（Nginx/Caddy）暴露；MySQL 3309 按需开放。
 - **数据持久化**：`data/` 里是 WAL 文件 + 用户/权限配置，务必做好备份；Docker 部署时确认 `./data` 卷挂载成功。
 - **刷盘策略**：追求性能用 `durability=batch`（崩溃最多丢一个刷盘周期，默认 100ms）；数据不能丢用 `fsync`。写配置可热生效，不用重启。
 - **WAL 整理**：默认开启自动 `COMPACT`（低峰期、WAL 超 64MB 时触发），也可在设置页手动"立即整理 WAL"。
-- **反向代理**：面板走 HTTPS 时，把 `/`、`/dashboard`、`/admin`、`/api/*` 都转发到 8080 即可，无需额外配置。
-- **首次部署流程**：启动 → 访问 8080 → 安装向导创建管理员 → 进控制台。`data/users.json` 里存的是 SHA-256 哈希，不会出现默认口令。
+- **反向代理**：面板走 HTTPS 时，把 `/`、`/dashboard`、`/admin`、`/api/*` 都转发到 10232 即可，无需额外配置。
+- **首次部署流程**：启动 → 访问 10232 → 安装向导创建管理员 → 进控制台。`data/users.json` 里存的是 SHA-256 哈希，不会出现默认口令。
 
 ### 监控面板
 
-- Dashboard：<http://localhost:8080/dashboard>
-- JSON API：<http://localhost:8080/api/stats>
-- Prometheus：<http://localhost:8080/metrics>
-- 数据管理：<http://localhost:8080/admin>
+- Dashboard：<http://localhost:10232/dashboard>
+- JSON API：<http://localhost:10232/api/stats>
+- Prometheus：<http://localhost:10232/metrics>
+- 数据管理：<http://localhost:10232/admin>
 
 Dashboard 的 5 个环形指标（CPU / 内存 / QPS / TPS / 磁盘写入）都可以点击，展开最近 60 秒的实时曲线，含当前值 / 峰值 / 均值 / 最低 / 采样点数。面板还有实时趋势区、系统信息、命令明细和压测工具，每 2 秒自动刷新。
 
@@ -121,20 +121,20 @@ Dashboard 的 5 个环形指标（CPU / 内存 / QPS / TPS / 磁盘写入）都�
 | `ttl_clean_ms` | `30000` | TTL 清理周期 |
 | `idle_timeout_s` | `60` | 连接空闲超时 |
 | `backup_dir` | `./backup` | 备份目录 |
-| `metrics_port` | `8080` | 监控 / 管理面板端口 |
+| `metrics_port` | `10232` | 监控 / 管理面板端口 |
 | `enable_checksum` | `true` | WAL CRC32 校验 |
 | `durability` | `batch` | `batch` 定时批量 fsync，吞吐高，崩溃最多丢一个刷盘周期；`fsync` 每条写立即落盘，实时持久化 |
 | `mysql_enabled` | `false` | 是否开启 MySQL 兼容协议 |
-| `mysql_port` | `3306` | MySQL 协议监听端口 |
+| `mysql_port` | `3309` | MySQL 协议监听端口 |
 
 兼容旧的 `.env` 写法，启动时若发现 `.env` 会把它迁移进 `config/tsumugi.json` 然后删掉 `.env`，之后的配置统一走文件。
 
 ### MySQL 协议兼容
 
-设置页里勾选"启用 MySQL 协议服务"，或直接把 `config/tsumugi.json` 里 `mysql_enabled` 改为 `true` 并重启，服务会多监听一个 3306 端口：
+设置页里勾选"启用 MySQL 协议服务"，或直接把 `config/tsumugi.json` 里 `mysql_enabled` 改为 `true` 并重启，服务会多监听一个 3309 端口：
 
 ```bash
-mysql -h 127.0.0.1 -P 3306 -u <管理员账号> -p
+mysql -h 127.0.0.1 -P 3309 -u <管理员账号> -p
 mysql -e "CREATE TABLE t(id INT PRIMARY KEY, name VARCHAR(20)); INSERT INTO t VALUES (1,'a'); SELECT * FROM t;"
 ```
 

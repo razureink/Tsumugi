@@ -6,13 +6,13 @@ services:
     container_name: tsumugi
     restart: unless-stopped
     ports:
-      - "9999:9999"    # 二进制协议
-      - "8080:8080"    # 监控 / 管理面板
-      - "3306:3306"    # MySQL 兼容协议
+      - "9999:9999"      # 二进制协议
+      - "10232:10232"    # 监控 / 管理面板
+      - "3309:3309"      # MySQL 兼容协议
     environment:
       TSUMUGI_DURABILITY: "batch"
       TSUMUGI_MYSQL: "true"
-      TSUMUGI_MYSQL_PORT: "3306"
+      TSUMUGI_MYSQL_PORT: "3309"
       TSUMUGI_PORT: "9999"
     volumes:
       - ./data:/app/data

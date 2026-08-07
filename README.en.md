@@ -55,7 +55,7 @@ go run .
 go run ./examples
 ```
 
-On first visit to <http://localhost:8080/> you'll be guided through a setup wizard to create the admin account, then sign in.
+On first visit to <http://localhost:10232/> you'll be guided through a setup wizard to create the admin account, then sign in.
 
 ## Deployment
 
@@ -70,8 +70,8 @@ docker compose up -d --build
 | Port | Purpose |
 | ---- | ---- |
 | 9999 | Binary protocol |
-| 8080 | Dashboard / admin panel |
-| 3306 | MySQL protocol |
+| 10232 | Dashboard / admin panel |
+| 3309 | MySQL protocol |
 
 Data is stored in `./data` (mounted as a volume, survives container removal). Useful commands:
 
@@ -116,12 +116,12 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
 
 ### Production notes
 
-- **Ports**: expose 9999 and 8080 only to your intranet or behind a reverse proxy (Nginx/Caddy); open 3306 only if you need remote MySQL access.
+- **Ports**: expose 9999 and 10232 only to your intranet or behind a reverse proxy (Nginx/Caddy); open 3309 only if you need remote MySQL access.
 - **Persistence**: `data/` holds the WAL plus user/privilege files — back it up. With Docker, make sure the `./data` volume is mounted.
 - **Durability**: use `batch` for max throughput (may lose up to one flush interval, default 100ms, on crash); use `fsync` if you cannot afford to lose writes. Changes apply hot, no restart needed.
 - **WAL compaction**: auto `COMPACT` is on by default (idle periods, WAL over 64MB); you can also trigger it manually in the Settings page.
-- **Reverse proxy**: for HTTPS, forward `/`, `/dashboard`, `/admin` and `/api/*` to port 8080 — nothing extra to configure.
-- **First-run flow**: start → visit 8080 → create the admin via the wizard → sign in. `data/users.json` stores SHA-256 hashes; there is no default password.
+- **Reverse proxy**: for HTTPS, forward `/`, `/dashboard`, `/admin` and `/api/*` to port 10232 — nothing extra to configure.
+- **First-run flow**: start → visit 10232 → create the admin via the wizard → sign in. `data/users.json` stores SHA-256 hashes; there is no default password.
 
 Expected output:
 
@@ -142,9 +142,9 @@ Expected output:
 
 After startup, visit:
 
-- **Dashboard**: <http://localhost:8080/dashboard>
-- **JSON API**: <http://localhost:8080/api/stats>
-- **Prometheus metrics**: <http://localhost:8080/metrics>
+- **Dashboard**: <http://localhost:10232/dashboard>
+- **JSON API**: <http://localhost:10232/api/stats>
+- **Prometheus metrics**: <http://localhost:10232/metrics>
 
 The dashboard's header renders **four MD3 Expressive circular progress gauges** with live metrics:
 
@@ -160,7 +160,7 @@ Info chips below show total commands, errors, hottest command, uptime, and gorou
 Click **Start Stress Test** on the dashboard, or trigger it directly:
 
 ```
-curl "http://localhost:8080/stress?duration=10&workers=4"
+curl "http://localhost:10232/stress?duration=10&workers=4"
 ```
 
 The dashboard refreshes QPS / TPS and per-command stats every 2 seconds; watch the gauges and throughput change live while the stress test runs.
@@ -183,7 +183,7 @@ All settings live in `loadConfig()` inside `config.go`:
 | `TTLCleanInterval` | `30s` | TTL cleanup period |
 | `IdleTimeout` | `60s` | Connection idle timeout |
 | `BackupDir` | `./backup` | Backup directory |
-| `MetricsPort` | `8080` | Monitoring HTTP port |
+| `MetricsPort` | `10232` | Monitoring HTTP port |
 | `EnableChecksum` | `true` | CRC32 checksums in WAL |
 | `Durability` | `batch` | Persistence mode: `batch` (periodic batched fsync, max throughput, may lose up to one flush-interval of writes on crash); `fsync` (fsync every write, real-time durability, throughput capped by disk fsync speed) |
 

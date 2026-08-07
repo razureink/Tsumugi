@@ -41,7 +41,7 @@ var mysqlCfg = &mysqlConfigStore{path: mysqlConfigPath}
 func defaultMySQLConfig() MySQLConfig {
 	return MySQLConfig{
 		Version: "8.0.36-Tsumugi",
-		Port:    3306,
+		Port:    3309,
 		Variables: map[string]string{
 			"version":                   "8.0.36-Tsumugi",
 			"version_comment":           "Tsumugi (MySQL-compatible in-memory database)",
@@ -69,7 +69,7 @@ func defaultMySQLConfig() MySQLConfig {
 			"lower_case_table_names":    "0",
 			"innodb_buffer_pool_size":   "134217728",
 			"datadir":                   "./data",
-			"port":                      "3306",
+			"port":                      "3309",
 			"protocol_version":          "10",
 			"server_id":                 "1",
 			"time_zone":                 "SYSTEM",

@@ -681,7 +681,7 @@ async function fetchStats(force){
 function renderSysInfo(d){
   var rows=[
     [t('sysVer'),'<span class="pk-badge" style="background:var(--md-primary-container);color:var(--md-on-primary-container)">'+esc(d.server_version||'Tsumugi-0.1')+'</span>'],
-    [t('sysPort'),esc(d.binary_port)+' · '+t('sysMetrics')+' :'+(location.port||8080)],
+    [t('sysPort'),esc(d.binary_port)+' · '+t('sysMetrics')+' :'+(location.port||10232)],
     [t('sysMysql'),d.mysql_enabled?t('mysqlOn',d.mysql_port):t('mySqlOff')],
     [t('sysTables'),'<b>'+esc(d.table_count||0)+'</b> '+t('unitTables')],
     [t('sysRows'),'<b>'+esc(d.total_rows||0)+'</b> '+t('unitRows')],
@@ -961,11 +961,11 @@ async function saveSettings(){
   var body={
     user:$('sUser').value.trim(), password:$('sPassword').value,
     binary_port:parseInt($('sPort').value)||9999,
-    metrics_port:parseInt($('sMetrics').value)||8080,
+    metrics_port:parseInt($('sMetrics').value)||10232,
     durability:$('sDurability').value,
     flush_interval_ms:parseInt($('sFlush').value)||100,
     mysql_enabled:$('sMysqlEnable').checked,
-    mysql_port:parseInt($('sMysqlPort').value)||3306,
+    mysql_port:parseInt($('sMysqlPort').value)||3309,
     auto_compact:$('sAutoCompact').checked,
     compact_idle_seconds:parseInt($('sCompactIdle').value)||60,
     compact_min_wal_mb:parseInt($('sCompactMin').value)||64,
