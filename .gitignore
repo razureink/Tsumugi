@@ -4,8 +4,8 @@ config/
 
 # 二进制产物
 *.exe
-tsumugi
-tsumugi-cli
+/tsumugi
+/tsumugi-cli
 
 # 运行日志
 *.log

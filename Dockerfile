@@ -3,8 +3,7 @@
 FROM golang:1.24-alpine AS builder
 WORKDIR /build
 COPY go.mod ./
-COPY main.go config.go db.go server.go metrics.go admin.go auth.go app_html.go mysql.go mysql_config.go settings.go users.go setup_wizard.go i18n_msg.go logger.go rb_tree.go sql_parser.go restart.go restart_other.go restart_windows.go ./
-COPY cmd/ cmd/
+COPY . .
 RUN CGO_ENABLED=0 go build -o /build/tsumugi .
 
 # 运行阶段：最小化运行镜像

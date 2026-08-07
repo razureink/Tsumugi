@@ -1,0 +1,8 @@
+# 构建上下文排除项
+.git
+data
+config
+backup
+*.exe
+*.log
+node_modules
