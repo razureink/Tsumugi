@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  tsumugi:
+    build: .
+    container_name: tsumugi
+    restart: unless-stopped
+    ports:
+      - "9999:9999"    # 二进制协议
+      - "8080:8080"    # 监控 / 管理面板
+      - "3306:3306"    # MySQL 兼容协议
+    environment:
+      TSUMUGI_DURABILITY: "batch"
+      TSUMUGI_MYSQL: "true"
+      TSUMUGI_MYSQL_PORT: "3306"
+      TSUMUGI_PORT: "9999"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/api/setup/status"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
