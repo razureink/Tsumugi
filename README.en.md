@@ -57,7 +57,9 @@ go run ./examples
 
 On first visit to <http://localhost:8080/> you'll be guided through a setup wizard to create the admin account, then sign in.
 
-### Docker
+## Deployment
+
+### Option 1: Docker Compose (recommended)
 
 A Dockerfile and docker-compose.yml are included:
 
@@ -65,7 +67,61 @@ A Dockerfile and docker-compose.yml are included:
 docker compose up -d --build
 ```
 
-Mapped ports: `9999` (binary protocol), `8080` (dashboard / admin), `3306` (MySQL protocol). Data is stored in `./data` (mounted as a volume).
+| Port | Purpose |
+| ---- | ---- |
+| 9999 | Binary protocol |
+| 8080 | Dashboard / admin panel |
+| 3306 | MySQL protocol |
+
+Data is stored in `./data` (mounted as a volume, survives container removal). Useful commands:
+
+```bash
+docker compose logs -f          # follow logs
+docker compose restart           # restart
+docker compose down              # stop (data stays in ./data)
+docker compose down -v           # stop and wipe data
+```
+
+MySQL protocol is enabled by default in `docker-compose.yml` (`TSUMUGI_MYSQL=true`), with a health check configured.
+
+### Option 2: Build and run directly
+
+Requires Go 1.21+:
+
+```bash
+# build (Linux)
+go build -o tsumugi .
+
+# run
+./tsumugi
+```
+
+On Windows you get `tsumugi.exe` — run it from a terminal or double-click. `data/` and `config/` are auto-created next to the binary.
+
+Or just:
+
+```bash
+go run .
+```
+
+### Option 3: Custom builds
+
+```bash
+# static build, portable to any machine
+CGO_ENABLED=0 go build -o tsumugi .
+
+# cross-compile (e.g. build a Linux binary on Windows)
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
+```
+
+### Production notes
+
+- **Ports**: expose 9999 and 8080 only to your intranet or behind a reverse proxy (Nginx/Caddy); open 3306 only if you need remote MySQL access.
+- **Persistence**: `data/` holds the WAL plus user/privilege files — back it up. With Docker, make sure the `./data` volume is mounted.
+- **Durability**: use `batch` for max throughput (may lose up to one flush interval, default 100ms, on crash); use `fsync` if you cannot afford to lose writes. Changes apply hot, no restart needed.
+- **WAL compaction**: auto `COMPACT` is on by default (idle periods, WAL over 64MB); you can also trigger it manually in the Settings page.
+- **Reverse proxy**: for HTTPS, forward `/`, `/dashboard`, `/admin` and `/api/*` to port 8080 — nothing extra to configure.
+- **First-run flow**: start → visit 8080 → create the admin via the wizard → sign in. `data/users.json` stores SHA-256 hashes; there is no default password.
 
 Expected output:
 

@@ -25,27 +25,17 @@ Tsumugi（つむぎ，日语"纺线"）是一个用 Go 标准库从零写的内�
 
 ## 快速开始
 
-### 直接运行
-
-```bash
-# 启动服务端
-go run .
-
-# 另开一个终端，跑示例客户端
-go run ./examples
-```
-
 首次访问 <http://localhost:8080/> 会进入安装向导，按提示创建管理员账号后即可登录控制台。
 
-### Docker 部署
+## 部署
 
-仓库带 Dockerfile 和 docker-compose.yml：
+### 方式一：Docker Compose（推荐）
+
+仓库自带 `Dockerfile` 与 `docker-compose.yml`，一条命令起服务：
 
 ```bash
 docker compose up -d --build
 ```
-
-服务默认映射端口：
 
 | 端口 | 用途 |
 | ---- | ---- |
@@ -53,7 +43,55 @@ docker compose up -d --build
 | 8080 | 监控 / 管理面板 |
 | 3306 | MySQL 兼容协议 |
 
-数据落在 `./data` 目录（已挂载为 volume），配置通过环境变量注入，见 docker-compose.yml。
+数据落在 `./data` 目录（容器内挂载为 volume，删除容器不丢数据）。常用操作：
+
+```bash
+docker compose logs -f          # 看日志
+docker compose restart           # 重启
+docker compose down              # 停止（数据保留在 ./data）
+docker compose down -v           # 停止并清空数据
+```
+
+`docker-compose.yml` 里已默认开启 MySQL 协议（`TSUMUGI_MYSQL=true`）并设置健康检查。
+
+### 方式二：直接编译运行
+
+需要 Go 1.21+：
+
+```bash
+# 编译（Linux 直接 build 即可）
+go build -o tsumugi .
+
+# 启动
+./tsumugi
+```
+
+Windows 上编译出来的是 `tsumugi.exe`，双击或命令行运行都行。数据、配置在程序所在目录的 `data/`、`config/` 下自动生成。
+
+也可以不编译直接跑：
+
+```bash
+go run .
+```
+
+### 方式三：自定义编译（如去掉 MySQL 或调整构建参数）
+
+```bash
+# 静态编译，适合塞进小镜像 / 拷贝到任意机器
+CGO_ENABLED=0 go build -o tsumugi .
+
+# 跨平台编译（比如在 Windows 上编译 Linux 版）
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
+```
+
+### 部署到生产环境的建议
+
+- **端口**：二进制协议 9999、面板 8080 建议只对内网或加反向代理（Nginx/Caddy）暴露；MySQL 3306 按需开放。
+- **数据持久化**：`data/` 里是 WAL 文件 + 用户/权限配置，务必做好备份；Docker 部署时确认 `./data` 卷挂载成功。
+- **刷盘策略**：追求性能用 `durability=batch`（崩溃最多丢一个刷盘周期，默认 100ms）；数据不能丢用 `fsync`。写配置可热生效，不用重启。
+- **WAL 整理**：默认开启自动 `COMPACT`（低峰期、WAL 超 64MB 时触发），也可在设置页手动"立即整理 WAL"。
+- **反向代理**：面板走 HTTPS 时，把 `/`、`/dashboard`、`/admin`、`/api/*` 都转发到 8080 即可，无需额外配置。
+- **首次部署流程**：启动 → 访问 8080 → 安装向导创建管理员 → 进控制台。`data/users.json` 里存的是 SHA-256 哈希，不会出现默认口令。
 
 ### 监控面板
 
