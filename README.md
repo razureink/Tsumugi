@@ -4,7 +4,7 @@ Tsumugi（つむぎ，日语"纺线"）是一个用 Go 标准库从零写的内�
 
 项目定位是教学 / 学习向，代码精简、没有外部依赖，适合顺着读一遍存储引擎、WAL、事务和监控的实现。
 
-[English Ver.](READDME.en.md) 
+[English Ver.](README.en.md) 
 
 ## 特性
 
