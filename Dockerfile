@@ -16,3 +16,8 @@ COPY --from=builder /build/tsumugi-cli /usr/local/bin/tsumugi-cli
 EXPOSE 9999 8080 3306
 VOLUME ["/app/data"]
 ENTRYPOINT ["tsumugi"]
+
+# 导出阶段：仅含两个可执行文件，供宿主机全局安装
+FROM scratch AS binaries
+COPY --from=builder /build/tsumugi /tsumugi
+COPY --from=builder /build/tsumugi-cli /tsumugi-cli
