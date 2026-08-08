@@ -173,16 +173,25 @@ func (db *DB) adminRows(tableName string, afterPK int64, limit int) (map[string]
 // ==================== HTTP 处理器 ====================
 
 func (db *DB) handleAdminTables(w http.ResponseWriter, r *http.Request) {
+	u := currentUser(r)
 	dbName := r.URL.Query().Get("db")
+	if dbName != "" && !u.canUseDB(dbName) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: database not allowed"})
+		return
+	}
 	tables, err := db.adminTables(dbName)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	cur := db.getCurDB()
+	if dbName != "" && mysqlCfg.hasDatabase(dbName) {
+		cur = dbName
+	}
 	writeJSON(w, map[string]interface{}{
-		"tables":    tables,
-		"databases": mysqlCfg.get().Databases,
-		"cur_db":    db.getCurDB(),
+		"tables":    filterTables(tables, u),
+		"databases": filterDBList(mysqlCfg.get().Databases, u),
+		"cur_db":    cur,
 	})
 }
 
@@ -215,6 +224,11 @@ func (db *DB) handleAdminDBCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid database name"})
 		return
 	}
+	u := currentUser(r)
+	if !u.fullAccess() {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: creating databases is admin-only"})
+		return
+	}
 	_, _, _, rawMsg, err := db.runSQL("CREATE DATABASE " + name)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
@@ -245,6 +259,11 @@ func (db *DB) handleAdminDBDrop(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid database name"})
 		return
 	}
+	u := currentUser(r)
+	if !u.fullAccess() {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: dropping databases is admin-only"})
+		return
+	}
 	_, _, _, _, err := db.runSQL("DROP DATABASE " + name)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
@@ -263,7 +282,12 @@ type dbManageRequest struct {
 }
 
 func (db *DB) handleAdminRows(w http.ResponseWriter, r *http.Request) {
+	u := currentUser(r)
 	table := r.URL.Query().Get("table")
+	if !u.canUseTable(table) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: table not allowed"})
+		return
+	}
 	afterPK := int64(-1)
 	if v := r.URL.Query().Get("after_pk"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -294,6 +318,15 @@ func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", 400)
 		return
 	}
+	u := currentUser(r)
+	if ok, reason := u.canExecSQL(strings.ToUpper(req.SQL)); !ok {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": reason})
+		return
+	}
+	if !u.canExecTableSQL(req.SQL) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: statement references tables"})
+		return
+	}
 	columns, rows, affected, rawMsg, err := db.runSQL(req.SQL)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
@@ -317,6 +350,11 @@ func (db *DB) handleAdminInsert(w http.ResponseWriter, r *http.Request) {
 	var req insertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", 400)
+		return
+	}
+	u := currentUser(r)
+	if !u.canUseTable(req.Table) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: table not allowed"})
 		return
 	}
 	t := db.getTable(req.Table)
@@ -350,6 +388,11 @@ func (db *DB) handleAdminDelete(w http.ResponseWriter, r *http.Request) {
 	var req deleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", 400)
+		return
+	}
+	u := currentUser(r)
+	if !u.canUseTable(req.Table) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: table not allowed"})
 		return
 	}
 	t := db.getTable(req.Table)
@@ -462,6 +505,7 @@ func (db *DB) handleUserList(w http.ResponseWriter, r *http.Request) {
 		CanStress bool     `json:"can_stress"`
 		CanManage bool     `json:"can_manage"`
 		Databases []string `json:"databases"`
+		Tables    []string `json:"tables"`
 		CreatedAt int64    `json:"created_at"`
 		LastLogin int64    `json:"last_login"`
 	}
@@ -469,7 +513,8 @@ func (db *DB) handleUserList(w http.ResponseWriter, r *http.Request) {
 	for _, u := range list {
 		safe = append(safe, safeUser{
 			Username: u.Username, IsAdmin: u.IsAdmin, CanStress: u.CanStress,
-			CanManage: u.CanManage, Databases: u.Databases, CreatedAt: u.CreatedAt, LastLogin: u.LastLogin,
+			CanManage: u.CanManage, Databases: u.Databases, Tables: u.Tables,
+			CreatedAt: u.CreatedAt, LastLogin: u.LastLogin,
 		})
 	}
 	writeJSON(w, map[string]interface{}{"ok": true, "users": safe})
@@ -490,6 +535,7 @@ func (db *DB) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		CanStress bool     `json:"can_stress"`
 		CanManage bool     `json:"can_manage"`
 		Databases []string `json:"databases"`
+		Tables    []string `json:"tables"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid request"})
@@ -506,6 +552,7 @@ func (db *DB) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		CanStress: req.CanStress,
 		CanManage: req.CanManage,
 		Databases: req.Databases,
+		Tables:    req.Tables,
 		CreatedAt: time.Now().Unix(),
 	}
 	globalUsers.Add(nu)
@@ -549,6 +596,7 @@ func (db *DB) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 		CanStress *bool    `json:"can_stress,omitempty"`
 		CanManage *bool    `json:"can_manage,omitempty"`
 		Databases []string `json:"databases,omitempty"`
+		Tables    []string `json:"tables,omitempty"`
 		Password  string   `json:"password,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" {
@@ -571,6 +619,9 @@ func (db *DB) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Databases != nil {
 		target.Databases = req.Databases
+	}
+	if req.Tables != nil {
+		target.Tables = req.Tables
 	}
 	if req.Password != "" {
 		target.Password = hashPasswd(req.Password)

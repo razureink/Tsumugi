@@ -95,23 +95,23 @@ func parseArgs() options {
 }
 
 func printUsage() {
-	fmt.Println("Tsumugi CLI - Tsumugi 命令行管理工具")
+	fmt.Println(tr("cliTitle"))
 	fmt.Println()
-	fmt.Println("用法:")
+	fmt.Println(tr("usageHead"))
 	fmt.Println("  tsumugi-cli [-host HOST] [-port PORT] [-user USER] [-pass PASS] [-e SQL] [-f FILE]")
 	fmt.Println()
-	fmt.Println("参数:")
-	fmt.Println("  -host, --host  <addr>   服务器地址（默认 127.0.0.1，环境变量 TSUMUGI_HOST）")
-	fmt.Println("  -port, --port   <port>  二进制协议端口（默认 9999，环境变量 TSUMUGI_PORT）")
-	fmt.Println("  -user, --user   <name>  用户名（默认 root，环境变量 TSUMUGI_USER）")
-	fmt.Println("  -pass, --pass   <pwd>   密码（默认 password，环境变量 TSUMUGI_PASS）")
-	fmt.Println("  -e, --exec      <sql>   执行单条 SQL 后退出（支持分号分隔多条）")
-	fmt.Println("  -f, --file      <file>  执行 SQL 脚本文件后退出")
-	fmt.Println("  -h, --help              显示帮助")
+	fmt.Println(tr("argsHead"))
+	fmt.Println("  -host, --host  <addr>   " + tr("optHost"))
+	fmt.Println("  -port, --port   <port>  " + tr("optPort"))
+	fmt.Println("  -user, --user   <name>  " + tr("optUser"))
+	fmt.Println("  -pass, --pass   <pwd>   " + tr("optPass"))
+	fmt.Println("  -e, --exec      <sql>   " + tr("optExec"))
+	fmt.Println("  -f, --file      <file>  " + tr("optFile"))
+	fmt.Println("  -h, --help              " + tr("optHelp"))
 	fmt.Println()
-	fmt.Println("交互模式内建命令：help / exit / status / compact / backup /")
-	fmt.Println("  set durability <batch|fsync> / import --table T --file F.csv [--db D]")
-	fmt.Println("数据库管理：SHOW DATABASES / CREATE DATABASE / DROP DATABASE / USE <db>")
+	fmt.Println(tr("builtins"))
+	fmt.Println(tr("builtins2"))
+	fmt.Println(tr("dbmgmt"))
 }
 
 func main() {
@@ -384,7 +384,7 @@ func renderTable(cols []string, rows [][]string) {
 		fmt.Println(line(r))
 	}
 	fmt.Println(sep())
-	fmt.Printf("%d rows in set\n", len(rows))
+	fmt.Printf(tr("rowsInSet")+"\n", len(rows))
 }
 
 // ---- 交互 REPL ----
@@ -396,7 +396,7 @@ func repl(o options) {
 	}
 	defer c.conn.Close()
 
-	fmt.Printf("Welcome to Tsumugi CLI\nType 'help' or 'exit'.\n\n")
+	fmt.Print(tr("welcome"))
 	sc := bufio.NewScanner(os.Stdin)
 	hist := loadHistory()
 	idx := len(hist) // 暂未实现上下翻历史
@@ -415,7 +415,7 @@ func repl(o options) {
 		}
 		switch {
 		case line == "exit" || line == "quit" || line == "q":
-			fmt.Println("Bye")
+			fmt.Println(tr("bye"))
 			return
 		case line == "help":
 			printHelp()
@@ -444,24 +444,24 @@ func dispatchLine(c *client, line string) bool {
 		return true
 	case line == "compact":
 		if err := c.simpleCmd(cmdCompact); err != nil {
-			fmt.Printf("ERROR: %v\n", err)
+			fmt.Printf(tr("errPrefix")+"\n", err)
 		} else {
-			fmt.Println("WAL flushed / compacted")
+			fmt.Println(tr("compactDone"))
 		}
 		return true
 	case line == "backup":
 		if err := c.simpleCmd(cmdBackup); err != nil {
-			fmt.Printf("ERROR: %v\n", err)
+			fmt.Printf(tr("errPrefix")+"\n", err)
 		} else {
-			fmt.Println("backup completed")
+			fmt.Println(tr("backupDone"))
 		}
 		return true
 	case strings.HasPrefix(line, "set durability "):
 		mode := strings.TrimSpace(strings.TrimPrefix(line, "set durability "))
 		if err := c.setDurability(mode); err != nil {
-			fmt.Printf("ERROR: %v\n", err)
+			fmt.Printf(tr("errPrefix")+"\n", err)
 		} else {
-			fmt.Printf("durability set to %s\n", mode)
+			fmt.Printf(tr("durabilitySet")+"\n", mode)
 		}
 		return true
 	case strings.HasPrefix(line, "import "):
@@ -472,15 +472,15 @@ func dispatchLine(c *client, line string) bool {
 }
 
 func printHelp() {
-	fmt.Println("Commands:")
-	fmt.Println("  <SQL>                       执行任意 SQL（SELECT/CREATE/INSERT/USE...）")
-	fmt.Println("  status                      显示服务状态（QPS/TPS/内存/磁盘）")
-	fmt.Println("  compact                     触发 WAL 整理")
-	fmt.Println("  backup                      触发备份")
-	fmt.Println("  set durability <batch|fsync> 切换持久化模式")
-	fmt.Println("  import --table T --file F.csv [--db D]  批量导入 CSV")
-	fmt.Println("  help / exit                 帮助 / 退出")
-	fmt.Println("数据库管理：SHOW DATABASES / CREATE DATABASE / DROP DATABASE / USE")
+	fmt.Println(tr("helpHead"))
+	fmt.Println("  <SQL>                       " + tr("helpSql"))
+	fmt.Println("  status                      " + tr("helpStatus"))
+	fmt.Println("  compact                     " + tr("helpCompact"))
+	fmt.Println("  backup                      " + tr("helpBackup"))
+	fmt.Println("  set durability <batch|fsync> " + tr("helpDura"))
+	fmt.Println("  import --table T --file F.csv [--db D]   " + tr("helpImport"))
+	fmt.Println("  help / exit                 " + tr("helpExit"))
+	fmt.Println(tr("dbmgmt"))
 }
 
 // runStatements 按分号拆分执行多条语句（忽略引号内的分号）。
@@ -518,7 +518,7 @@ func runStatements(c *client, sql string) {
 func runOne(c *client, sql string) {
 	cols, rows, affected, rawMsg, err := c.execSQL(sql)
 	if err != nil {
-		fmt.Printf("ERROR: %v\n", err)
+		fmt.Printf(tr("errPrefix")+"\n", err)
 		return
 	}
 	if cols != nil {
@@ -528,7 +528,7 @@ func runOne(c *client, sql string) {
 	if rawMsg != "" {
 		fmt.Println(rawMsg)
 	} else {
-		fmt.Printf("Query OK, %d row(s) affected\n", affected)
+		fmt.Printf(tr("queryOk")+"\n", affected)
 	}
 }
 
@@ -536,7 +536,7 @@ func runOne(c *client, sql string) {
 func runStatus(c *client) {
 	raw, err := c.status()
 	if err != nil {
-		fmt.Printf("ERROR: %v\n", err)
+		fmt.Printf(tr("errPrefix")+"\n", err)
 		return
 	}
 	var m map[string]interface{}
@@ -545,9 +545,9 @@ func runStatus(c *client) {
 		return
 	}
 	ms := func(k string) string { return fmt.Sprintf("%v", m[k]) }
-	fmt.Printf("commands: %-10s errors: %-10s qps: %s   tps: %s\n", ms("total_commands"), ms("total_errors"), ms("qps"), ms("tps"))
-	fmt.Printf("cpu: %s%%   mem: %s MB   goroutines: %s   durability: %s\n", ms("cpu_percent"), ms("mem_mb"), ms("goroutines"), ms("durability"))
-	fmt.Printf("wal: %s MB written\n", ms("wal_total_mb"))
+	fmt.Printf(tr("statRow1")+"\n", ms("total_commands"), ms("total_errors"), ms("qps"), ms("tps"))
+	fmt.Printf(tr("statRow2")+"\n", ms("cpu_percent"), ms("mem_mb"), ms("goroutines"), ms("durability"))
+	fmt.Printf(tr("statRow3")+"\n", ms("wal_total_mb"))
 }
 
 // runImport 从 CSV 文件批量导入到指定表。
@@ -576,18 +576,18 @@ func runImport(c *client, line string) {
 		}
 	}
 	if table == "" || file == "" {
-		fmt.Println("usage: import --table <table> --file <data.csv> [--db <database>]")
+		fmt.Println(tr("impUsage"))
 		return
 	}
 	if db != "" {
 		if _, _, _, _, err := c.execSQL("USE " + db); err != nil {
-			fmt.Printf("ERROR: USE %s: %v\n", db, err)
+			fmt.Printf(tr("impUseErr")+"\n", db, err)
 			return
 		}
 	}
 	f, err := os.Open(file)
 	if err != nil {
-		fmt.Printf("ERROR: %v\n", err)
+		fmt.Printf(tr("errPrefix")+"\n", err)
 		return
 	}
 	defer f.Close()
@@ -600,7 +600,7 @@ func runImport(c *client, line string) {
 	r.FieldsPerRecord = -1
 	header, err := r.Read()
 	if err != nil {
-		fmt.Printf("ERROR: read header: %v\n", err)
+		fmt.Printf(tr("impHeadErr")+"\n", err)
 		return
 	}
 	// 找主键：从 CREATE TABLE 提取不现实，用表的第一列约定或全列值方式。这里用列名直接构造 INSERT。
@@ -611,7 +611,7 @@ func runImport(c *client, line string) {
 			break
 		}
 		if err != nil {
-			fmt.Printf("ERROR: %v\n", err)
+			fmt.Printf(tr("errPrefix")+"\n", err)
 			return
 		}
 		cols := make([]string, 0, len(header))
@@ -622,15 +622,15 @@ func runImport(c *client, line string) {
 		}
 		sql := "INSERT INTO " + table + " (" + strings.Join(cols, ",") + ") VALUES (" + strings.Join(vals, ",") + ")"
 		if _, _, _, _, err := c.execSQL(sql); err != nil {
-			fmt.Printf("ERROR at line %d: %v\n", ok+2, err)
+			fmt.Printf(tr("impLineErr")+"\n", ok+2, err)
 			return
 		}
 		ok++
 		if ok%1000 == 0 {
-			fmt.Printf("  ...%d rows\n", ok)
+			fmt.Printf(tr("impProgress")+"\n", ok)
 		}
 	}
-	fmt.Printf("imported %d rows into %s\n", ok, table)
+	fmt.Printf(tr("impDone")+"\n", ok, table)
 }
 
 func quoteCSV(s string) string {

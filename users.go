@@ -20,6 +20,7 @@ type User struct {
 	CanStress bool     `json:"can_stress"`
 	CanManage bool     `json:"can_manage"`
 	Databases []string `json:"databases"` // 空=全部
+	Tables    []string `json:"tables"`    // 空=该库下全部表；值为带前缀的物理表名
 	CreatedAt int64    `json:"created_at"`
 	LastLogin int64    `json:"last_login"`
 }

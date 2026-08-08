@@ -26,6 +26,7 @@ var dashDictMonitor = map[string]map[string]string{
 	"chErr":       {"zh":"错误","en":"Errors","ja":"エラー","ko":"오류","fr":"Erreurs","de":"Fehler","es":"Errores","pt":"Erros","ru":"Ошибки","vi":"Lỗi"},
 	"chTopCmd":    {"zh":"最热命令","en":"Top command","ja":"最多コマンド","ko":"최다 명령","fr":"Commande populaire","de":"Top-Befehl","es":"Comando principal","pt":"Comando mais usado","ru":"Частая команда","vi":"Lệnh nhiều nhất"},
 	"chUptime":    {"zh":"运行时长","en":"Uptime","ja":"稼働時間","ko":"가동 시간","fr":"Temps de fonctionnement","de":"Betriebszeit","es":"Tiempo activo","pt":"Tempo ativo","ru":"Время работы","vi":"Thời gian chạy"},
+	"uptime":      {"zh":"已运行","en":"Running","ja":"稼働中","ko":"가동 중","fr":"En marche","de":"Läuft","es":"En ejecución","pt":"Em execução","ru":"Работает","vi":"Đang chạy"},
 	"chThreads":   {"zh":"协程 / 核","en":"Goroutines / cores","ja":"Goroutine / コア","ko":"고루틴 / 코어","fr":"Goroutines / cœurs","de":"Goroutinen / Kerne","es":"Goroutines / núcleos","pt":"Goroutines / núcleos","ru":"Горутины / ядра","vi":"Goroutines / lõi"},
 	"chDura":      {"zh":"持久化","en":"Durability","ja":"永続化","ko":"영구성","fr":"Durabilité","de":"Persistenz","es":"Persistencia","pt":"Durabilidade","ru":"Надежность","vi":"Độ bền"},
 	"trendTitle":  {"zh":"实时趋势（最近 60 秒）","en":"Live trends (last 60s)","ja":"リアルタイム傾向（直近60秒）","ko":"실시간 추이 (60초)","fr":"Tendances (60 dernières s)","de":"Live-Trends (60 s)","es":"Tendencias (60 s)","pt":"Tendências (60 s)","ru":"Тенденции (60 с)","vi":"Xu hướng (60 giây)"},

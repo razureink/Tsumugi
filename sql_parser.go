@@ -231,6 +231,157 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		if !p.matchKeyword("SHOW") {
 			break
 		}
+		// SHOW FULL COLUMNS / SHOW COLUMNS FROM tbl [FROM db] [LIKE '..']
+		p.matchKeyword("FULL")
+		if p.peek().upper == "COLUMNS" {
+			p.next()
+			if !p.matchKeyword("FROM") {
+				err = fmt.Errorf("expected FROM in SHOW COLUMNS")
+				return
+			}
+			tbl, e := p.readTableIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			dbName := db.getCurDB()
+			if p.matchKeyword("FROM") {
+				if t := p.next(); t.kind == "ident" || t.kind == "str" {
+					dbName = t.val
+				}
+			}
+			columns, rows, err = db.describeTable(dbName, tbl)
+			return
+		}
+		// SHOW TABLE STATUS FROM db [LIKE '..']
+		if p.matchKeyword("TABLE") && p.matchKeyword("STATUS") {
+			dbName := db.getCurDB()
+			if p.matchKeyword("FROM") {
+				if d := p.next(); d.kind == "ident" || d.kind == "str" {
+					dbName = d.val
+				}
+			}
+			for p.matchKeyword("LIKE") {
+				p.next()
+			}
+			columns, rows, err = db.tableStatus(dbName)
+			return
+		}
+		// SHOW INDEX / SHOW INDEXES / SHOW KEYS FROM tbl [FROM db]
+		if p.matchKeyword("INDEX") || p.matchKeyword("INDEXES") || p.matchKeyword("KEYS") {
+			if !p.matchKeyword("FROM") {
+				err = fmt.Errorf("expected FROM in SHOW INDEX")
+				return
+			}
+			tbl, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			dbName := db.getCurDB()
+			if p.matchKeyword("FROM") {
+				if d := p.next(); d.kind == "ident" || d.kind == "str" {
+					dbName = d.val
+				}
+			}
+			columns, rows, err = db.showIndex(dbName, tbl)
+			return
+		}
+		// SHOW CREATE TABLE / CREATE DATABASE / CREATE VIEW
+		if p.matchKeyword("CREATE") {
+			if p.matchKeyword("DATABASE") {
+				columns = []string{"Database", "Create Database"}
+				name := ""
+				if p.matchKeyword("IF") {
+					p.matchKeyword("NOT")
+					p.matchKeyword("EXISTS")
+				}
+				if d := p.next(); d.kind == "ident" || d.kind == "str" {
+					name = d.val
+				}
+				rows = [][]interface{}{{name, "CREATE DATABASE `" + name + "` /*!40100 DEFAULT CHARACTER SET utf8mb4 */"}}
+				return
+			}
+			p.matchKeyword("VIEW")
+			if !p.matchKeyword("TABLE") {
+				break
+			}
+			tbl, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			columns = []string{"Table", "Create Table"}
+			rows = [][]interface{}{{tbl, db.createTableStmt(tbl)}}
+			return
+		}
+		// SHOW GRANTS [FOR user@host]
+		if p.matchKeyword("GRANTS") {
+			grantees := "CURRENT_USER"
+			if len(mysqlCfg.get().Users) > 0 {
+				grantees = mysqlCfg.get().Users[0].User + "@" + mysqlCfg.get().Users[0].Host
+			}
+			columns = []string{"Grants for " + grantees}
+			for _, u := range mysqlCfg.get().Users {
+				rows = append(rows, []interface{}{"GRANT USAGE ON *.* TO `" + u.User + "`@`" + u.Host + "`"})
+			}
+			return
+		}
+		// SHOW ENGINES
+		if p.matchKeyword("ENGINES") {
+			columns, rows, err = db.queryInfoSchema("ENGINES", nil, nil)
+			return
+		}
+		// SHOW PLUGINS
+		if p.matchKeyword("PLUGINS") {
+			columns, rows, err = db.queryInfoSchema("PLUGINS", nil, nil)
+			return
+		}
+		// SHOW CHARACTER SET / SHOW CHARSET
+		if p.matchKeyword("CHARACTER") {
+			p.matchKeyword("SET")
+			columns, rows, err = db.queryInfoSchema("CHARACTER_SETS", nil, nil)
+			return
+		}
+		if p.matchKeyword("CHARSET") {
+			columns, rows, err = db.queryInfoSchema("CHARACTER_SETS", nil, nil)
+			return
+		}
+		// SHOW COLLATION [LIKE '..']
+		if p.matchKeyword("COLLATION") {
+			if p.matchKeyword("LIKE") {
+				p.next()
+			}
+			columns, rows, err = db.queryInfoSchema("COLLATIONS", nil, nil)
+			return
+		}
+		// SHOW STATUS / SHOW GLOBAL STATUS / SHOW SESSION STATUS
+		if p.matchKeyword("STATUS") {
+			columns = []string{"Variable_name", "Value"}
+			snap := db.stats.Snapshot()
+			for _, k := range []string{"total_commands", "total_errors"} {
+				rows = append(rows, []interface{}{strings.ToUpper(k), snap[k]})
+			}
+			sortRowsByFirst(rows)
+			return
+		}
+		if p.matchKeyword("PROCESSLIST") {
+			columns = []string{"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}
+			return
+		}
+		if p.matchKeyword("TRIGGERS") {
+			columns = []string{"Trigger", "Event", "Table", "Statement", "Timing", "Created", "sql_mode", "Definer", "character_set_client"}
+			return
+		}
+		if p.matchKeyword("EVENTS") {
+			columns = []string{"Event", "Definer", "Time", "Type", "Status"}
+			return
+		}
+		if p.matchKeyword("WARNINGS") || p.matchKeyword("ERRORS") {
+			columns = []string{"Level", "Code", "Message"}
+			rows = nil
+			return
+		}
 		if p.matchKeyword("TABLES") {
 			tables, e := db.adminTables("")
 			if e != nil {
@@ -383,7 +534,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		}
 		err = fmt.Errorf("table not found: %s", nameTok.val)
 		return
-	case "SELECT":
+case "SELECT":
 		return db.parseSelect(p)
 	case "INSERT":
 		return db.parseInsert(p)
@@ -429,6 +580,15 @@ func (p *sqlParser) parseIdent() (string, error) {
 	return t.val, nil
 }
 
+// readTableIdent 读取表名/库表名标识符；关键字也可作表名（如 information_schema.TABLES、mysql.KILL）。
+func (p *sqlParser) readTableIdent() (string, error) {
+	t := p.next()
+	if t.kind != "ident" && t.kind != "kw" && t.kind != "str" {
+		return "", fmt.Errorf("expected identifier, got %q", t.val)
+	}
+	return t.val, nil
+}
+
 func (p *sqlParser) parseValue() (interface{}, error) {
 	t := p.next()
 	// 参数绑定占位符：? 从运行参数按下标取值（prepared execute）。
@@ -458,6 +618,38 @@ func (p *sqlParser) parseValue() (interface{}, error) {
 
 func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	p.next() // SELECT
+	// 无 FROM 的标量查询（SELECT @@version, SELECT VERSION(), SELECT NOW() 等）
+	if c, r, e := db.queryScalarSelect(p); r != nil {
+		columns, rows, err = c, r, e
+		return
+	}
+	// COUNT 聚合：SELECT COUNT(*) FROM tbl [WHERE ..] / SELECT COUNT(1) 等
+	isCount := p.peek().upper == "COUNT" && p.toks[p.i+1].kind == "sym" && p.toks[p.i+1].val == "("
+	if isCount {
+		p.next() // COUNT
+		p.next() // (
+		inExpr := false
+		for {
+			t := p.next()
+			if t.kind == "sym" && t.val == ")" {
+				break
+			}
+			if t.kind == "eof" {
+				err = fmt.Errorf("expected ) in COUNT")
+				return
+			}
+			if t.kind == "ident" {
+				inExpr = true
+			}
+		}
+		if !p.matchKeyword("FROM") {
+			err = fmt.Errorf("expected FROM")
+			return
+		}
+		_ = inExpr
+		columns, rows, affected, rawMsg, err = db.countSelect(p)
+		return
+	}
 	var selectCols []string
 	if t := p.next(); t.kind == "sym" && t.val == "*" {
 		selectCols = nil // 表示所有列
@@ -479,7 +671,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		err = fmt.Errorf("expected FROM")
 		return
 	}
-	tableName, e := p.parseIdent()
+	tableName, e := p.readTableIdent()
 	if e != nil {
 		err = e
 		return
@@ -487,7 +679,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	// 支持 mysql.user 形式（tokenizer 拆成 mysql . user）
 	for p.peek().kind == "sym" && p.peek().val == "." {
 		p.next()
-		part, pe := p.parseIdent()
+		part, pe := p.readTableIdent()
 		if pe != nil {
 			err = pe
 			return
@@ -629,6 +821,17 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			}
 		}
 		return db.queryMysqlTable(mt, conds, selectCols)
+	}
+	// information_schema.* 虚拟系统表
+	if strings.HasPrefix(strings.ToLower(tableName), "information_schema.") {
+		it := strings.ToLower(strings.TrimPrefix(tableName, "information_schema."))
+		for _, c := range rawConds {
+			if c.op == "=" {
+				conds[c.field] = c.val
+			}
+		}
+		columns, rows, err = db.queryInfoSchema(it, conds, selectCols)
+		return
 	}
 	t := db.getTable(tableName)
 	if t == nil {

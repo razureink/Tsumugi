@@ -241,7 +241,7 @@ const appHTML = `<!DOCTYPE html>
     </div>
     <div class="nav" id="navMonitor" data-t="navMonitor" onclick="switchView('monitor')"><span class="mat material-symbols-outlined">monitoring</span>实时监控</div>
     <div class="nav" id="navAdmin" data-t="navAdmin" onclick="switchView('admin')"><span class="mat material-symbols-outlined">table_view</span>数据管理</div>
-    <div class="nav" id="navUsers" onclick="switchView('users')"><span class="mat material-symbols-outlined">group</span>账号管理</div>
+    <div class="nav" id="navUsers" data-t="navUsers" onclick="switchView('users')"><span class="mat material-symbols-outlined">group</span>账号管理</div>
     <div class="nav" id="navSettings" data-t="navSettings" onclick="switchView('settings')"><span class="mat material-symbols-outlined">settings</span>设置</div>
     <div class="spacer"></div>
     <div class="side-foot" id="sideFoot" data-t="sideFoot">连接中…</div>
@@ -301,7 +301,7 @@ const appHTML = `<!DOCTYPE html>
       </div>
 
       <div class="chips">
-        <div class="chip"><span class="mat material-symbols-outlined">database</span><div><div class="c-label" data-t="chTotalCmd">总命令</div><div class="c-value" id="totalCmds">-</div></div><div class="c-mini" id="totalCmdsRate"></div></div>
+        <div class="chip"><span class="mat material-symbols-outlined">database</span><div><div class="c-label" data-t="chTotal">总命令</div><div class="c-value" id="totalCmds">-</div></div><div class="c-mini" id="totalCmdsRate"></div></div>
         <div class="chip"><span class="mat material-symbols-outlined">warning</span><div><div class="c-label" data-t="chErr">错误</div><div class="c-value" id="totalErrs">-</div></div><div class="c-mini" id="totalErrsRate"></div></div>
         <div class="chip"><span class="mat material-symbols-outlined">local_fire_department</span><div><div class="c-label" data-t="chTopCmd">最热命令</div><div class="c-value" id="topCmd">-</div></div><div class="c-mini" id="topCmdCount"></div></div>
         <div class="chip"><span class="mat material-symbols-outlined">schedule</span><div><div class="c-label" data-t="chUptime">运行时长</div><div class="c-value" id="uptime">-</div></div><div class="c-mini" data-t="uptime">已运行</div></div>
@@ -431,6 +431,16 @@ const appHTML = `<!DOCTYPE html>
           <button class="btn btn-fill" onclick="createUser()" style="width:auto;padding:12px 24px" data-t="uCreateBtn">创建</button>
           <button class="btn btn-text" onclick="$('addUserCard').style.display='none'" style="width:auto" data-t="uCancelBtn">取消</button>
         </div>
+        <div class="acl-left" style="margin-top:14px;display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start">
+          <div style="flex:1;min-width:220px">
+            <span class="field-label" data-t="uDatabases">可用数据库（留空=全部）</span>
+            <div id="auDbs" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
+          </div>
+          <div style="flex:1;min-width:220px">
+            <label class="field-label" data-t="uTables">可用表（逗号分隔，如 users,report_stats；留空=全部）</label>
+            <input class="txt" id="auTables" placeholder="users, report_stats" style="margin-top:8px">
+          </div>
+        </div>
         <div id="auErr" class="err-msg" style="display:none;margin-top:10px"></div>
       </div>
 
@@ -458,6 +468,16 @@ const appHTML = `<!DOCTYPE html>
           </div>
           <button class="btn btn-fill" onclick="updateUser()" style="width:auto;padding:12px 24px" data-t="uSaveBtn">保存</button>
           <button class="btn btn-text" onclick="$('editUserCard').style.display='none'" style="width:auto" data-t="uCancelBtn">取消</button>
+        </div>
+        <div class="acl-left" style="margin-top:14px;display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start">
+          <div style="flex:1;min-width:220px">
+            <span class="field-label" data-t="uDatabases">可用数据库（留空=全部）</span>
+            <div id="euDbs" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
+          </div>
+          <div style="flex:1;min-width:220px">
+            <label class="field-label" data-t="uTables">可用表（逗号分隔，如 users,report_stats；留空=全部）</label>
+            <input class="txt" id="euTables" placeholder="users, report_stats" style="margin-top:8px">
+          </div>
         </div>
       </div>
     </div>
@@ -652,7 +672,7 @@ function switchView(v){
   document.title = v==='monitor' ? t('docTitleMonitor') : v==='settings' ? t('docTitleSettings') : v==='users' ? t('docTitleUsers') : t('docTitleAdmin');
   if(v==='admin'){ if(!token){location.href='/';return;} refreshTables(); }
   if(v==='monitor'){ fetchStats(true); }
-  if(v==='users'){ if(!token){location.href='/';return;} loadUsers(); }
+  if(v==='users'){ if(!token){location.href='/';return;} loadUsers(); refreshUserDbs(); }
   if(v==='settings'){ if(!token){location.href='/';return;} loadSettings(); }
 }
 
@@ -1136,18 +1156,54 @@ function renderUsers(){
   if(!h)h='<tr><td colspan="6" class="empty">'+t('uEmpty')+'</td></tr>';
   $('userTable').innerHTML=h;
 }
-function showAddUser(){$('addUserCard').style.display='';$('auErr').style.display='none';$('auName').focus();}
+var userDbs=[]; // 数据库列表缓存（用户管理用）
+async function refreshUserDbs(){
+  try{
+    var r=await api('/api/admin/tables');
+    if(r.status===401){return;}
+    var d=await r.json();
+    userDbs=d.databases||[];
+  }catch(e){userDbs=[];}
+}
+// fillDbs 把可用数据库渲染为复选框组。sel 为已勾选项数组/null。
+function fillDbs(elId, sel){
+  var el=$(elId); if(!el)return;
+  var set={}; (sel||[]).forEach(function(d){set[d]=1;});
+  var h='';
+  (userDbs||[]).forEach(function(db){
+    h+='<label class="acl-db" style="display:inline-flex;align-items:center;gap:5px;font-size:12.5px;cursor:pointer;border:1px solid var(--md-outline-variant);border-radius:999px;padding:5px 11px">'+
+      '<input type="checkbox" '+(set[db]?'checked':'')+' value="'+esc(db)+'"> '+esc(db)+'</label>';
+  });
+  if(!h)h='<span style="font-size:12.5px;color:var(--md-on-surface-variant)">（加载中，请先刷新数据页）</span>';
+  el.innerHTML=h;
+}
+function selDbs(elId){
+  var el=$(elId); if(!el)return [];
+  var out=[];
+  el.querySelectorAll('input[type=checkbox]:checked').forEach(function(c){out.push(c.value);});
+  return out;
+}
+function showAddUser(){
+  fillDbs('auDbs', null);
+  $('auTables').value='';
+  $('addUserCard').style.display='';$('auErr').style.display='none';$('auName').focus();
+}
 async function createUser(){
   var u=$('auName').value.trim(),p=$('auPass').value;
   var err=$('auErr');
   if(!u){err.textContent=t('uNeedName');err.style.display='';return;}
   if(p.length<6){err.textContent=t('uNeedPass');err.style.display='';return;}
   try{
-    var r=await api('/api/admin/users/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,is_admin:$('auAdmin').checked,can_stress:$('auStress').checked})});
+    var body={username:u,password:p,is_admin:$('auAdmin').checked,can_stress:$('auStress').checked,
+      databases:selDbs('auDbs'),tables:splitTables($('auTables').value)};
+    var r=await api('/api/admin/users/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(!d.ok){err.textContent=d.error||t('uCreateFail');err.style.display='';return;}
     $('addUserCard').style.display='none';toast(t('uCreated',u));loadUsers();
   }catch(e){err.textContent=t('netErr');err.style.display='';}
+}
+function splitTables(s){
+  return s.split(',').map(function(x){return x.trim();}).filter(Boolean);
 }
 function editUser(name){
   var u=usersData.find(function(x){return x.username===name;});
@@ -1157,11 +1213,14 @@ function editUser(name){
   $('euAdmin').checked=u.is_admin;
   $('euStress').checked=u.can_stress;
   $('euManage').checked=u.can_manage;
+  fillDbs('euDbs', u.databases||[]);
+  $('euTables').value=(u.tables||[]).join(', ');
   $('editUserCard').style.display='';
 }
 async function updateUser(){
   var u=$('euName').value,p=$('euPass').value;
-  var body={username:u,is_admin:$('euAdmin').checked,can_stress:$('euStress').checked,can_manage:$('euManage').checked};
+  var body={username:u,is_admin:$('euAdmin').checked,can_stress:$('euStress').checked,can_manage:$('euManage').checked,
+    databases:selDbs('euDbs'),tables:splitTables($('euTables').value)};
   if(p.length>0){
     if(p.length<6){toast(t('uNeedPass'),true);return;}
     body.password=p;
@@ -1192,7 +1251,7 @@ async function deleteUser(name){
   switchView(v);
   if(v==='monitor'){ fetchStats(true); setInterval(function(){fetchStats();},1000); }
   if(v==='admin' && token){ refreshTables(); }
-  if(v==='users' && token){ loadUsers(); }
+  if(v==='users' && token){ loadUsers(); refreshUserDbs(); }
 })();
 </script>
 </body>
