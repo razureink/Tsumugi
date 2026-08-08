@@ -10,6 +10,7 @@ import (
 func renderApp(w http.ResponseWriter, db *DB, page string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	html := strings.Replace(appHTML, "__APP_PAGE__", page, 1)
+	html = strings.Replace(html, "/*__I18N__*/", dashDictJS, 1)
 	fmt.Fprint(w, html)
 }
 
@@ -217,7 +218,6 @@ const appHTML = `<!DOCTYPE html>
     <div class="nav" id="navUsers" onclick="switchView('users')"><span class="mat material-symbols-outlined">group</span>账号管理</div>
     <div class="nav" id="navSettings" data-t="navSettings" onclick="switchView('settings')"><span class="mat material-symbols-outlined">settings</span>设置</div>
     <div class="spacer"></div>
-    <div class="nav" style="cursor:pointer" onclick="switchLang()"><span class="mat material-symbols-outlined">language</span>语言 / Language</div>
     <div class="side-foot" id="sideFoot" data-t="sideFoot">连接中…</div>
   </aside>
 
@@ -375,52 +375,52 @@ const appHTML = `<!DOCTYPE html>
     <!-- ============ 账号管理视图 ============ -->
     <div class="view" id="view-users">
       <div class="topbar">
-        <div><h2><span class="mat material-symbols-outlined">group</span>账号管理</h2><div class="sub">管理系统用户与权限配置</div></div>
+        <div><h2><span class="mat material-symbols-outlined">group</span><span data-t="usersTitle">账号管理</span></h2><div class="sub" data-t="usersSub">管理系统用户与权限配置</div></div>
         <div>
           <button class="btn btn-text" onclick="loadUsers()"><span class="material-symbols-outlined">refresh</span><span data-t="btnRefresh">刷新</span></button>
-          <button class="btn btn-fill" onclick="showAddUser()"><span class="material-symbols-outlined">person_add</span>添加用户</button>
+          <button class="btn btn-fill" onclick="showAddUser()"><span class="material-symbols-outlined">person_add</span><span data-t="uAdd">添加用户</span></button>
         </div>
       </div>
 
       <div class="card" id="addUserCard" style="display:none">
-        <h3><span class="mat material-symbols-outlined">person_add</span>添加用户</h3>
+        <h3><span class="mat material-symbols-outlined">person_add</span><span data-t="uAddTitle">添加用户</span></h3>
         <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
-          <div style="flex:1;min-width:140px"><label class="field-label">用户名</label><input class="txt" id="auName" placeholder="username"></div>
-          <div style="flex:1;min-width:140px"><label class="field-label">密码</label><input class="txt" id="auPass" type="password" placeholder="至少 6 位"></div>
+          <div style="flex:1;min-width:140px"><label class="field-label" data-t="uUserName">用户名</label><input class="txt" id="auName" placeholder="username"></div>
+          <div style="flex:1;min-width:140px"><label class="field-label" data-t="uPassPh">密码</label><input class="txt" id="auPass" type="password" placeholder="至少 6 位"></div>
           <div style="display:flex;gap:16px;align-items:center;padding-bottom:4px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="auAdmin"> 管理员</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="auStress"> 可压测</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="auAdmin"> <span data-t="uAdmin">管理员</span></label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="auStress"> <span data-t="uStress">可压测</span></label>
           </div>
-          <button class="btn btn-fill" onclick="createUser()" style="width:auto;padding:12px 24px">创建</button>
-          <button class="btn btn-text" onclick="$('addUserCard').style.display='none'" style="width:auto">取消</button>
+          <button class="btn btn-fill" onclick="createUser()" style="width:auto;padding:12px 24px" data-t="uCreateBtn">创建</button>
+          <button class="btn btn-text" onclick="$('addUserCard').style.display='none'" style="width:auto" data-t="uCancelBtn">取消</button>
         </div>
         <div id="auErr" class="err-msg" style="display:none;margin-top:10px"></div>
       </div>
 
       <div class="card">
-        <h3><span class="mat material-symbols-outlined">people</span>用户列表</h3>
+        <h3><span class="mat material-symbols-outlined">people</span><span data-t="uListTitle">用户列表</span></h3>
         <div class="data-wrap">
           <table class="grid">
             <thead><tr>
-              <th>用户名</th><th>角色</th><th>权限</th><th>创建时间</th><th>最后登录</th><th style="width:80px"></th>
+              <th data-t="thUname">用户名</th><th data-t="thRole">角色</th><th data-t="thPerms">权限</th><th data-t="thCreated">创建时间</th><th data-t="thLast">最后登录</th><th style="width:80px" data-t="thOps">操作</th>
             </tr></thead>
-            <tbody id="userTable"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+            <tbody id="userTable"><tr><td colspan="6" class="empty" data-t="loading">加载中…</td></tr></tbody>
           </table>
         </div>
       </div>
 
       <div class="card" id="editUserCard" style="display:none">
-        <h3><span class="mat material-symbols-outlined">edit</span>编辑用户</h3>
+        <h3><span class="mat material-symbols-outlined">edit</span><span data-t="uEditTitle">编辑用户</span></h3>
         <input type="hidden" id="euName">
         <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
-          <div style="flex:1;min-width:140px"><label class="field-label">新密码（留空不改）</label><input class="txt" id="euPass" type="password"></div>
+          <div style="flex:1;min-width:140px"><label class="field-label" data-t="uNewPass">新密码（留空不改）</label><input class="txt" id="euPass" type="password"></div>
           <div style="display:flex;gap:16px;align-items:center;padding-bottom:4px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="euAdmin"> 管理员</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="euStress"> 可压测</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="euManage"> 可管理</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="euAdmin"> <span data-t="uAdmin">管理员</span></label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="euStress"> <span data-t="uStress">可压测</span></label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="euManage"> <span data-t="uManage">可管理</span></label>
           </div>
-          <button class="btn btn-fill" onclick="updateUser()" style="width:auto;padding:12px 24px">保存</button>
-          <button class="btn btn-text" onclick="$('editUserCard').style.display='none'" style="width:auto">取消</button>
+          <button class="btn btn-fill" onclick="updateUser()" style="width:auto;padding:12px 24px" data-t="uSaveBtn">保存</button>
+          <button class="btn btn-text" onclick="$('editUserCard').style.display='none'" style="width:auto" data-t="uCancelBtn">取消</button>
         </div>
       </div>
     </div>
@@ -436,28 +436,34 @@ const appHTML = `<!DOCTYPE html>
 
       <div class="settings-grid">
         <div class="card">
-          <h3><span class="mat material-symbols-outlined">server</span><span id="settingsCardSrv">服务器</span></h3>
-          <label class="field-label" id="lblUser">管理员用户名</label><input class="txt" id="sUser">
-          <label class="field-label" id="lblPass">管理员密码</label><input class="txt" id="sPassword" type="password">
-          <label class="field-label" id="lblPort">二进制协议端口</label><input class="txt" id="sPort" type="number">
-          <label class="field-label" id="lblMetrics">监控端口</label><input class="txt" id="sMetrics" type="number">
-          <label class="field-label" id="lblDura">刷盘模式</label>
+          <h3><span class="mat material-symbols-outlined">translate</span><span data-t="settingsCardLang">界面语言</span></h3>
+          <p style="color:var(--md-on-surface-variant);font-size:13px;margin-bottom:14px" data-t="settingsLangSub">界面将立即切换为所选语言</p>
+          <select class="txt" id="langSelect" onchange="setLang(this.value)"></select>
+        </div>
+
+        <div class="card">
+          <h3><span class="mat material-symbols-outlined">server</span><span id="settingsCardSrv" data-t="settingsCardSrv">服务器</span></h3>
+          <label class="field-label" id="lblUser" data-t="lblUser">管理员用户名</label><input class="txt" id="sUser">
+          <label class="field-label" id="lblPass" data-t="lblPass">管理员密码</label><input class="txt" id="sPassword" type="password">
+          <label class="field-label" id="lblPort" data-t="lblPort">二进制协议端口</label><input class="txt" id="sPort" type="number">
+          <label class="field-label" id="lblMetrics" data-t="lblMetrics">监控端口</label><input class="txt" id="sMetrics" type="number">
+          <label class="field-label" id="lblDura" data-t="lblDura">刷盘模式</label>
           <select class="txt" id="sDurability">
             <option value="batch">batch（批量，高性能）</option>
             <option value="fsync">fsync（每写立即落盘）</option>
           </select>
-          <label class="field-label" id="lblFlush">持久化间隔 (ms)</label><input class="txt" id="sFlush" type="number">
+          <label class="field-label" id="lblFlush" data-t="lblFlush">持久化间隔 (ms)</label><input class="txt" id="sFlush" type="number">
         </div>
 
         <div class="card">
-          <h3><span class="mat material-symbols-outlined">dns</span><span id="settingsCardMysql">MySQL 兼容</span></h3>
-          <label class="field-chip"><input type="checkbox" id="sMysqlEnable"> <span id="lblMysqlEnable">启用 MySQL 协议服务</span></label>
-          <label class="field-label" id="lblMysqlPort">MySQL 端口</label><input class="txt" id="sMysqlPort" type="number">
-          <label class="field-label" id="lblMysqlVersion">MySQL 版本</label><input class="txt" id="sMysqlVersion">
+          <h3><span class="mat material-symbols-outlined">dns</span><span id="settingsCardMysql" data-t="settingsCardMysql">MySQL 兼容</span></h3>
+          <label class="field-chip"><input type="checkbox" id="sMysqlEnable"> <span id="lblMysqlEnable" data-t="lblMysqlEnable">启用 MySQL 协议服务</span></label>
+          <label class="field-label" id="lblMysqlPort" data-t="lblMysqlPort">MySQL 端口</label><input class="txt" id="sMysqlPort" type="number">
+          <label class="field-label" id="lblMysqlVersion" data-t="lblMysqlVersion">MySQL 版本</label><input class="txt" id="sMysqlVersion">
           <div class="divider"></div>
           <div style="display:flex;justify-content:space-between;align-items:center">
-            <span><b id="lblMysqlVars">MySQL 变量</b></span>
-            <button class="btn btn-tonal" onclick="addVarRow()"><span class="material-symbols-outlined">add</span><span id="lblAddVar">加变量</span></button>
+            <span><b id="lblMysqlVars" data-t="lblMysqlVars">MySQL 变量</b></span>
+            <button class="btn btn-tonal" onclick="addVarRow()"><span class="material-symbols-outlined">add</span><span id="lblAddVar" data-t="lblAddVar">加变量</span></button>
           </div>
           <div id="varRows"></div>
         </div>
@@ -477,7 +483,7 @@ const appHTML = `<!DOCTYPE html>
       </div>
 
       <div style="margin-top:18px;display:flex;gap:12px;align-items:center">
-        <button class="btn btn-fill" onclick="saveSettings()"><span class="material-symbols-outlined">save</span><span id="lblSave">保存设置</span></button>
+        <button class="btn btn-fill" onclick="saveSettings()"><span class="material-symbols-outlined">save</span><span id="lblSave" data-t="lblSave">保存设置</span></button>
         <span class="result-msg" id="settingsMsg"></span>
       </div>
     </div>
@@ -517,76 +523,62 @@ function pctColor(p){if(p>=90)return '#b3261e';if(p>=70)return '#f4a300';return 
 function setRing(id,pct,color){var r=$('ring'+id.charAt(0).toUpperCase()+id.slice(1));if(!r)return;var o=327-327*Math.max(0,Math.min(100,pct))/100;r.style.stroke=color;r.style.strokeDashoffset=o;}
 
 /* ---- i18n ---- */
-var I18N_TEXT={
-  navMonitor:['实时监控','Monitor'],navAdmin:['数据管理','Data'],navSettings:['设置','Settings'],
-  sideFoot:['连接中…','Connecting…'],monitorTitle:['实时监控','Live Monitor'],monitorSub:['Tsumugi 数据库运行状态 · 点击环形指标查看曲线','Tsumugi runtime · click a gauge for its history'],
-  btnRefresh:['刷新','Refresh'],btnNewTable:['新建表','New table'],btnRun:['执行','Run'],btnRunStress:['开始压测','Start stress test'],btnClear:['清空','Clear'],btnAddCol:['加列','Add column'],
-  btnCreateTable:['创建表','Create table'],btnCancel:['取消','Cancel'],
-  ringCPU:['CPU 使用率','CPU Usage'],ringMem:['内存占用','Memory'],ringQPS:['QPS 查询','QPS Reads'],ringTPS:['TPS 写入','TPS Writes'],ringDisk:['写入硬盘','Disk Writes'],
-  chTotalCmd:['总命令','Total commands'],chErr:['错误','Errors'],chTopCmd:['最热命令','Top command'],chUptime:['运行时长','Uptime'],chThreads:['协程 / 核','Goroutines / cores'],chDura:['持久化','Durability'],
-  trendDisk:['磁盘 MB/s','Disk MB/s'],trendTitle:['实时趋势（最近 60s）','Live trends (last 60s)'],infoTitle:['系统信息','System info'],cmdTitle:['命令明细','Command details'],stressTitle:['压力测试','Stress test'],
-  thCmd:['命令','Command'],thTotal:['累计','Total'],thDD:['QPS 增量','△ QPS'],
-  lblWorkers:['并发数','Workers'],lblDuration:['时长(秒)','Duration (s)'],lblMode:['负载模式','Load mode'],stressReady:['就绪','Ready'],
-  modeRW:['读写(7:3)','Read/Write(7:3)'],modeRead:['纯读取','Read-only'],modeWrite:['纯写入','Write-only'],modePoint:['点查询','Point query'],modeRange:['范围查询','Range query'],
-  adminTitle:['数据管理','Data Management'],adminSub:['浏览表结构与数据，执行 SQL 语句','Browse tables and run SQL'],
-  dbTables:['数据库表','Tables'],loading:['加载中…','Loading…'],tblData:['表数据','Table data'],
-  sqlTitle:['SQL 控制台','SQL Console'],sqlPlaceholder:['SELECT * FROM users WHERE id = 1;  或  SHOW TABLES;  或  INSERT INTO users (id,name,age) VALUES (10,Tom,20);','e.g. SELECT * FROM users WHERE id = 1;  SHOW TABLES;  INSERT INTO users (id,name,age) VALUES (10,Tom,20);'],
-  sqlCreate2:['暂无表，点右上角「新建表」开始','No tables yet — click "New table" to start'],
-  fieldLabel:['列名','Column name'],fieldLen:['长度','Length'],
-  createTitle:['新建表','New table'],lblTableName:['表名','Table name'],lblPkField:['主键字段','PK field'],lblColDef:['列定义','Columns'],
-  settingsTitle:['设置','Settings'],settingsSub:['服务与 MySQL 兼容参数配置','Server & MySQL compat settings'],
-  settingsCardSrv:['服务器','Server'],lblUser:['管理员用户名','Admin user'],lblPass:['管理员密码','Admin password'],lblPort:['二进制协议端口','Binary port'],lblMetrics:['监控端口','Metrics port'],
-  lblDura:['刷盘模式','Durability'],optBatch:['batch（批量，高性能）','batch (high throughput)'],optFsync:['fsync（每写立即落盘）','fsync (flush on every write)'],lblFlush:['持久化间隔 (ms)','Flush interval (ms)'],
-  settingsCardMysql:['MySQL 兼容','MySQL compat'],lblMysqlEnable:['启用 MySQL 协议服务','Enable MySQL service'],lblMysqlPort:['MySQL 端口','MySQL port'],lblMysqlVersion:['MySQL 版本','MySQL version'],
-  lblMysqlVars:['MySQL 变量','MySQL variables'],lblAddVar:['加变量','Add'],varName:['变量名','Key'],varVal:['值','Value'],lblSave:['保存设置','Save settings'],
-  curveTitle:['指标曲线','Metric curve'],mCur:['当前','Current'],mWait:['等待采样…','Sampling…'],mPeak:['峰值','Peak'],mAvg:['均值','Avg'],mMin:['最低','Min'],mSamples:['采样点','Samples'],
-  stressStarting:['启动中…','Starting…'],stressUnauth:['需要管理员登录','Admin login required'],stressRunning:['压测进行中 ({0} 并发 × {1}s)，请观察曲线','Stress running ({0} workers × {1}s), watch the charts'],stressFail:['失败: {0}','Failed: {0}'],
-  loginTitle:['登录数据管理','Sign in to Data Management'],loginSub:['需要管理员账号','Admin account required'],lblUName:['用户名','Username'],lblPsd:['密码','Password'],btnLogin:['登录','Sign in'],
-  loginVerifying:['验证中…','Verifying…'],loginOk:['登录成功','Signed in'],loginErr:['登录失败','Sign-in failed'],netErr:['网络错误','Network error'],
-  loadFail:['加载失败: {0}','Load failed: {0}'],connectFail:['连接失败: {0}','Connection failed: {0}'],
-  idxCount:['{0} 索引','{0} indexes'],
-  rowsTotal:['共 {0} 行','{0} rows'],pageText:[' · 第 {0} 页',' · page {0}'],paging:[' · 翻页中',' · paging'],
-  delConfirm:['确定删除表 {0} 中主键 {1} 的行？','Delete row with PK {1} from table {0}?'],deleted:['已删除','Deleted'],
-  enterSQL:['请输入 SQL','Enter SQL first'],rowsRet:['{0} 行返回','{0} rows returned'],
-  noTableName:['请输入表名','Enter a table name'],needCol:['请至少定义一列','At least one column required'],
-  tableCreated:['表 {0} 创建成功','Table {0} created'],saved:['已保存','Saved'],
-  cfgSaved:['设置已保存','Settings saved'],saveFail:['保存失败','Save failed'],
-  running:['运行中','Running'],mysqlOn:[' · MySQL :{0}',' · MySQL :{0}'],mySqlOff:['未开启','OFF'],
-  sysVer:['服务版本','Server Version'],sysPort:['二进制端口','Binary Port'],sysMysql:['MySQL 兼容','MySQL Compat'],sysTables:['数据库表','Tables'],sysRows:['总行数','Total rows'],
-  sysWal:['WAL 文件','WAL file'],sysFsync:['fsync','fsync'],sysFlush:['刷盘间隔','Flush interval'],sysCrc:['CRC 校验','CRC check'],on:['开启','ON'],off:['关闭','OFF'],
-  cpuSubT:['进程 CPU · {0} 核','CPU · {0} cores'],cores:['{0} 核','{0} cores'],uptime:['已运行','running'],
-  peak:['峰值','Peak'],
-  durBatch:['批量','batch'],flushFsync:['每写即落盘','flush each write'],flushBatch:['定时刷盘','scheduled flush'],
-  firstSample:['首次','first'],noCmd:['暂无命令','No commands yet'],
-  sysMetrics:['监控','Metrics'],times:['次',''],grpCommit:['组提交','group commit'],unitTables:['张',''],unitRows:['行',''],cumWrite:[' · 累计写入 {0} MB',' · {0} MB written'],
-  settingsCardStorage:['存储优化','Storage'],lblAutoCompact:['低峰期自动整理 WAL 文件','Auto-compact WAL during low peak'],lblCompactIdle:['检测间隔 (秒)','Check interval (s)'],lblCompactMin:['整理最小 WAL (MB)','Min WAL to compact (MB)'],lblCompactPeak:['低峰阈值 (QPS)','Low-peak threshold (QPS)'],
-  lblCompactNow:['立即整理 WAL','Compact WAL now'],lblRestart:['重启服务','Restart'],
-  compactConfirm:['确定立即整理 WAL 文件？（会将所有增删改合并为当前状态）','Compact WAL now? (merges inserts/updates/deletes into current state)'],
-  compactDone:['WAL 整理完成','WAL compacted'],compactFail:['整理失败','Compact failed'],
-  restartConfirm:['确定重启 Tsumugi 服务？','Restart the Tsumugi service?'],
-  restartFinal:['服务即将重启，页面会短暂断开。确定？','The service will restart; the page will briefly disconnect. Continue?'],
-  restarting:['正在重启服务…','Restarting…'],
-  docTitle:['Tsumugi · 控制台','Tsumugi · Console'],docTitleMonitor:['Tsumugi · 监控','Tsumugi · Monitor'],docTitleAdmin:['Tsumugi · 数据管理','Tsumugi · Data Management'],docTitleSettings:['Tsumugi · 设置','Tsumugi · Settings']};
+/*__I18N__*/
 
-function lang(){var v=localStorage.getItem('tsumugi_lang');if(v==='zh'||v==='en')return v==='en'?1:0;return (navigator.language||'zh').toLowerCase().indexOf('en')===0?1:0;}
-function t(k){var v=I18N_TEXT[k];var i=lang();var s=v?v[i]:('['+k+']');var args=Array.prototype.slice.call(arguments,1);return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});}
-// 带占位符的动态标签
-// 应用语言到静态界面：优先用元素 id 映射；其余用 data-t 属性（见 HTML）
-var LANG_ID_MAP={settingsTitle:'settingsTitle',settingsSub:'settingsSub',settingsCardSrv:'settingsCardSrv',lblUser:'lblUser',lblPass:'lblPass',lblPort:'lblPort',lblMetrics:'lblMetrics',lblDura:'lblDura',lblFlush:'lblFlush',settingsCardMysql:'settingsCardMysql',lblMysqlEnable:'lblMysqlEnable',lblMysqlPort:'lblMysqlPort',lblMysqlVersion:'lblMysqlVersion',lblMysqlVars:'lblMysqlVars',lblAddVar:'lblAddVar',lblSave:'lblSave'};
+var LANG_CODES=['zh','en','ja','ko','fr','de','es','pt','ru','vi'];
+function lang(){
+  var v=localStorage.getItem('tsumugi_lang');
+  if(v&&LANG_CODES.indexOf(v)>=0)return v;
+  var n=(navigator.language||'zh').toLowerCase().split('-')[0];
+  return LANG_CODES.indexOf(n)>=0?n:'zh';
+}
+function langName(c){for(var i=0;i<(I18N_LANGS||[]).length;i++){if(I18N_LANGS[i].code===c)return I18N_LANGS[i].name;}return c;}
+function t(k){
+  var v=I18N_TEXT[k];
+  var c=lang();
+  var s=v?(v[c]||v.en||v.zh||('['+k+']')):('['+k+']');
+  var args=Array.prototype.slice.call(arguments,1);
+  return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});
+}
 function applyLang(){
-  for(var kk in LANG_ID_MAP){var el=$(kk);if(el&&I18N_TEXT[LANG_ID_MAP[kk]])el.textContent=t(LANG_ID_MAP[kk]);}
-  // 含图标元素：替换其最后一个文本节点
+  var c=lang();
+  document.documentElement.lang=c;
   document.querySelectorAll('[data-t]').forEach(function(el){
-    var key=el.getAttribute('data-t');var i=lang();
-    var pair=I18N_TEXT[key];if(!pair||!pair[i])return;
-    var txt=pair[i];if(txt==='zh'||txt==='en')txt=pair[0]; // 防御：禁止裸语言码进入 UI
-    var kids=el.childNodes;for(var k=kids.length-1;k>=0;k--){if(kids[k].nodeType===3){kids[k].data=txt;break;}}
+    var key=el.getAttribute('data-t');
+    var v=I18N_TEXT[key];
+    if(!v)return;
+    var txt=v[c]||v.en||v.zh;
+    if(txt==null)return;
+    var kids=el.childNodes;
+    for(var k=kids.length-1;k>=0;k--){if(kids[k].nodeType===3){kids[k].data=txt;break;}}
   });
   document.querySelectorAll('[data-ph]').forEach(function(el){el.setAttribute('placeholder',t(el.getAttribute('data-ph')));});
-  var o=$('sDurability');if(o&&o.options&&o.options.length>1){o.options[0].text=t('optBatch');o.options[1].text=t('optFsync');}
+  var o=$('sDurability');
+  if(o&&o.options&&o.options.length>1){o.options[0].text=t('optBatch');o.options[1].text=t('optFsync');}
+  var sm=$('stressMode');
+  if(sm&&sm.options){
+    var mkeys=['modeRW','modeRead','modeWrite','modePoint','modeRange'];
+    for(var i=0;i<sm.options.length&&i<mkeys.length;i++){sm.options[i].text=t(mkeys[i]);}
+  }
+  var ls=$('langSelect');
+  if(ls){
+    var cur=ls.value||c;
+    ls.innerHTML='';
+    (I18N_LANGS||[]).forEach(function(l){
+      var op=document.createElement('option');
+      op.value=l.code;op.text=l.name+(l.name!==l.en?' · '+l.en:'');
+      if(l.code===cur)op.selected=true;
+      ls.appendChild(op);
+    });
+  }
   document.title=t('docTitle');
 }
-function switchLang(){localStorage.setItem('tsumugi_lang',lang()?'zh':'en');applyLang();refreshAll();}
+function setLang(code){
+  if(LANG_CODES.indexOf(code)<0)code='zh';
+  localStorage.setItem('tsumugi_lang',code);
+  applyLang();
+  refreshAll();
+}
 // 语言切换后刷新动态内容（重跑需要重新定位的文案）
 function refreshAll(){
   if(document.querySelector('#view-monitor.show')){fetchStats(true);}
@@ -605,7 +597,7 @@ function switchView(v){
   $('navAdmin').classList.toggle('active', v==='admin');
   $('navUsers').classList.toggle('active', v==='users');
   $('navSettings').classList.toggle('active', v==='settings');
-  document.title = v==='monitor' ? t('docTitleMonitor') : v==='settings' ? t('docTitleSettings') : v==='users' ? 'Tsumugi · 账号管理' : t('docTitleAdmin');
+  document.title = v==='monitor' ? t('docTitleMonitor') : v==='settings' ? t('docTitleSettings') : v==='users' ? t('docTitleUsers') : t('docTitleAdmin');
   if(v==='admin'){ if(!token){location.href='/';return;} refreshTables(); }
   if(v==='monitor'){ fetchStats(true); }
   if(v==='users'){ if(!token){location.href='/';return;} loadUsers(); }
@@ -784,7 +776,7 @@ function logout(){ token=''; localStorage.removeItem('tsumugi_token'); showLogin
 function api(url,opts){
   opts=opts||{}; opts.headers=opts.headers||{};
   opts.headers['Authorization']='Bearer '+token;
-  opts.headers['X-Lang']=lang()?'en':'zh';
+  opts.headers['X-Lang']=lang();
   return fetch(url,opts);
 }
 
@@ -1013,32 +1005,32 @@ async function loadUsers(){
 function renderUsers(){
   var h='';
   usersData.forEach(function(u){
-    var role=u.is_admin?'<span class="pk-badge" style="background:var(--md-primary-container);color:var(--md-on-primary-container)">管理员</span>':'普通用户';
+    var role=u.is_admin?'<span class="pk-badge" style="background:var(--md-primary-container);color:var(--md-on-primary-container)">'+esc(t('uRoleAdmin'))+'</span>':'<span>'+esc(t('uRoleNormal'))+'</span>';
     var perms=[];
-    if(u.can_stress)perms.push('<span class="field-chip" style="font-size:10px;padding:2px 8px">压测</span>');
-    if(u.can_manage)perms.push('<span class="field-chip" style="font-size:10px;padding:2px 8px;background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)">管理</span>');
+    if(u.can_stress)perms.push('<span class="field-chip" style="font-size:10px;padding:2px 8px">'+esc(t('uPermStress'))+'</span>');
+    if(u.can_manage)perms.push('<span class="field-chip" style="font-size:10px;padding:2px 8px;background:var(--md-tertiary-container);color:var(--md-on-tertiary-container)">'+esc(t('uPermManage'))+'</span>');
     var created=u.created_at?new Date(u.created_at*1000).toLocaleDateString():'-';
-    var lastLogin=u.last_login?new Date(u.last_login*1000).toLocaleDateString():'从未';
+    var lastLogin=u.last_login?new Date(u.last_login*1000).toLocaleDateString():t('uNever');
     h+='<tr><td><b>'+esc(u.username)+'</b></td><td>'+role+'</td><td>'+perms.join(' ')+'</td><td>'+created+'</td><td>'+lastLogin+'</td><td>';
     h+='<button class="icon-btn" style="width:32px;height:32px" onclick="editUser(\''+esc(u.username)+'\')"><span class="material-symbols-outlined" style="font-size:18px">edit</span></button> ';
     h+='<button class="icon-btn" style="width:32px;height:32px;background:var(--md-error-container);color:var(--md-on-error-container)" onclick="deleteUser(\''+esc(u.username)+'\')"><span class="material-symbols-outlined" style="font-size:18px">delete</span></button>';
     h+='</td></tr>';
   });
-  if(!h)h='<tr><td colspan="6" class="empty">暂无用户</td></tr>';
+  if(!h)h='<tr><td colspan="6" class="empty">'+t('uEmpty')+'</td></tr>';
   $('userTable').innerHTML=h;
 }
 function showAddUser(){$('addUserCard').style.display='';$('auErr').style.display='none';$('auName').focus();}
 async function createUser(){
   var u=$('auName').value.trim(),p=$('auPass').value;
   var err=$('auErr');
-  if(!u){err.textContent='请输入用户名';err.style.display='';return;}
-  if(p.length<6){err.textContent='密码至少 6 位';err.style.display='';return;}
+  if(!u){err.textContent=t('uNeedName');err.style.display='';return;}
+  if(p.length<6){err.textContent=t('uNeedPass');err.style.display='';return;}
   try{
     var r=await api('/api/admin/users/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,is_admin:$('auAdmin').checked,can_stress:$('auStress').checked})});
     var d=await r.json();
-    if(!d.ok){err.textContent=d.error||'创建失败';err.style.display='';return;}
-    $('addUserCard').style.display='none';toast('用户 '+u+' 创建成功');loadUsers();
-  }catch(e){err.textContent='网络错误';err.style.display='';}
+    if(!d.ok){err.textContent=d.error||t('uCreateFail');err.style.display='';return;}
+    $('addUserCard').style.display='none';toast(t('uCreated',u));loadUsers();
+  }catch(e){err.textContent=t('netErr');err.style.display='';}
 }
 function editUser(name){
   var u=usersData.find(function(x){return x.username===name;});
@@ -1054,23 +1046,23 @@ async function updateUser(){
   var u=$('euName').value,p=$('euPass').value;
   var body={username:u,is_admin:$('euAdmin').checked,can_stress:$('euStress').checked,can_manage:$('euManage').checked};
   if(p.length>0){
-    if(p.length<6){toast('密码至少 6 位',true);return;}
+    if(p.length<6){toast(t('uNeedPass'),true);return;}
     body.password=p;
   }
   try{
     var r=await api('/api/admin/users/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(!d.ok){toast(d.error,true);return;}
-    $('editUserCard').style.display='none';toast('已保存');loadUsers();
+    $('editUserCard').style.display='none';toast(t('uSaved'));loadUsers();
   }catch(e){toast(t('netErr'),true);}
 }
 async function deleteUser(name){
-  if(!confirm('确定删除用户 '+name+'？'))return;
+  if(!confirm(t('uDelConfirm',name)))return;
   try{
     var r=await api('/api/admin/users/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:name})});
     var d=await r.json();
     if(!d.ok){toast(d.error,true);return;}
-    toast('已删除');loadUsers();
+    toast(t('uDeleted'));loadUsers();
   }catch(e){toast(t('netErr'),true);}
 }
 

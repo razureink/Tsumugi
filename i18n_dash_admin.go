@@ -1,0 +1,31 @@
+package main
+
+// dashDictAdmin 数据管理视图文案。
+var dashDictAdmin = map[string]map[string]string{
+	"adminTitle":  {"zh":"数据管理","en":"Data Management","ja":"データ管理","ko":"데이터 관리","fr":"Gestion des données","de":"Datenverwaltung","es":"Gestión de datos","pt":"Gestão de dados","ru":"Управление данными","vi":"Quản lý dữ liệu"},
+	"adminSub":    {"zh":"浏览表结构与数据，执行 SQL","en":"Browse tables, data and run SQL","ja":"テーブルとデータ、SQL","ko":"테이블·데이터 및 SQL","fr":"Tables, données et SQL","de":"Tabellen, Daten und SQL","es":"Tablas, datos y SQL","pt":"Tabelas, dados e SQL","ru":"Таблицы, данные, SQL","vi":"Bảng, dữ liệu và SQL"},
+	"dbTables":    {"zh":"数据库表","en":"Tables","ja":"テーブル","ko":"테이블","fr":"Tables","de":"Tabellen","es":"Tablas","pt":"Tabelas","ru":"Таблицы","vi":"Bảng"},
+	"loading":     {"zh":"加载中…","en":"Loading…","ja":"読み込み中…","ko":"불러오는 중…","fr":"Chargement…","de":"Lädt…","es":"Cargando…","pt":"A carregar…","ru":"Загрузка…","vi":"Đang tải…"},
+	"tblData":     {"zh":"表数据","en":"Table data","ja":"テーブルデータ","ko":"테이블 데이터","fr":"Données","de":"Tabellendaten","es":"Datos","pt":"Dados","ru":"Данные таблицы","vi":"Dữ liệu bảng"},
+	"noTableSel":  {"zh":"← 选择左侧表查看数据","en":"← Select a table on the left","ja":"← 左のテーブルを選択","ko":"← 왼쪽 테이블 선택","fr":"← Sélectionnez une table","de":"← Tabelle links wählen","es":"← Elige una tabla","pt":"← Selecione uma tabela","ru":"← Выберите таблицу","vi":"← Chọn bảng bên trái"},
+	"sqlTitle":    {"zh":"SQL 控制台","en":"SQL Console","ja":"SQL コンソール","ko":"SQL 콘솔","fr":"Console SQL","de":"SQL-Konsole","es":"Consola SQL","pt":"Consola SQL","ru":"SQL-консоль","vi":"Bảng điều khiển SQL"},
+	"sqlPlaceholder": {"zh":"SELECT * FROM users WHERE id = 1;  SHOW TABLES;  INSERT INTO users (id,name,age) VALUES (10,'Tom',20);","en":"e.g. SELECT * FROM users WHERE id = 1;  SHOW TABLES;  INSERT INTO users (id,name,age) VALUES (10,'Tom',20);","ja":"例: SELECT * FROM users WHERE id=1; SHOW TABLES;","ko":"예: SELECT * FROM users WHERE id=1; SHOW TABLES;","fr":"ex. SELECT * FROM users WHERE id=1; SHOW TABLES;","de":"z.B. SELECT * FROM users WHERE id=1; SHOW TABLES;","es":"ej. SELECT * FROM users WHERE id=1; SHOW TABLES;","pt":"ex. SELECT * FROM users WHERE id=1; SHOW TABLES;","ru":"напр. SELECT * FROM users WHERE id=1; SHOW TABLES;","vi":"vd SELECT * FROM users WHERE id=1; SHOW TABLES;"},
+	"sqlCreate2":  {"zh":"暂无表，点「新建表」开始","en":"No tables yet — click “New table”","ja":"テーブルなし。「新規テーブル」から","ko":"테이블 없음. 「새 테이블」 클릭","fr":"Aucune table — « Nouvelle table »","de":"Noch keine Tabellen — „Neue Tabelle“","es":"Sin tablas — «Nueva tabla»","pt":"Sem tabelas — «Nova tabela»","ru":"Нет таблиц — «Новая таблица»","vi":"Chưa có bảng — «Bảng mới»"},
+	"fieldLabel":  {"zh":"列名","en":"Column name","ja":"列名","ko":"열 이름","fr":"Colonne","de":"Spaltenname","es":"Columna","pt":"Coluna","ru":"Столбец","vi":"Tên cột"},
+	"fieldLen":    {"zh":"长度","en":"Length","ja":"長さ","ko":"길이","fr":"Longueur","de":"Länge","es":"Longitud","pt":"Comprimento","ru":"Длина","vi":"Độ dài"},
+	"createTitle": {"zh":"新建表","en":"New table","ja":"テーブル作成","ko":"새 테이블","fr":"Nouvelle table","de":"Neue Tabelle","es":"Nueva tabla","pt":"Nova tabela","ru":"Новая таблица","vi":"Bảng mới"},
+	"lblTableName": {"zh":"表名","en":"Table name","ja":"テーブル名","ko":"테이블 이름","fr":"Nom de table","de":"Tabellenname","es":"Nombre","pt":"Nome","ru":"Имя таблицы","vi":"Tên bảng"},
+	"lblPkField":  {"zh":"主键字段","en":"PK field","ja":"主キー","ko":"기본 키","fr":"Clé primaire","de":"Primärschlüssel","es":"Clave primaria","pt":"Chave primária","ru":"ПК поле","vi":"Khóa chính"},
+	"lblColDef":   {"zh":"列定义","en":"Columns","ja":"列定義","ko":"열 정의","fr":"Colonnes","de":"Spalten","es":"Columnas","pt":"Colunas","ru":"Столбцы","vi":"Cột"},
+	"rowsTotal":   {"zh":"共 {0} 行","en":"{0} rows","ja":"計 {0} 行","ko":"총 {0}행","fr":"{0} lignes","de":"{0} Zeilen","es":"{0} filas","pt":"{0} linhas","ru":"{0} строк","vi":"{0} dòng"},
+	"pageText":    {"zh":" · 第 {0} 页","en":" · page {0}","ja":" · {0} ページ","ko":" · {0}페이지","fr":" · page {0}","de":" · Seite {0}","es":" · pág. {0}","pt":" · pág. {0}","ru":" · стр. {0}","vi":" · trang {0}"},
+	"paging":      {"zh":" · 翻页中","en":" · paging","ja":" · 送り中","ko":" · 이동 중","fr":" · pagination","de":" · blättern","es":" · paginando","pt":" · a paginar","ru":" · листание","vi":" · đang phân trang"},
+	"delConfirm":  {"zh":"确定删除表 {0} 中主键 {1} 这一行？","en":"Delete row with PK {1} from {0}?","ja":"テーブル {0} のキー {1} を削除しますか？","ko":"{0}의 키 {1} 행을 삭제할까요?","fr":"Supprimer la ligne {1} de {0} ?","de":"Zeile mit Schlüssel {1} aus {0} löschen?","es":"¿Borrar fila con clave {1} de {0}?","pt":"Apagar linha {1} de {0}?","ru":"Удалить строку с ключом {1} из {0}?","vi":"Xóa dòng khóa {1} của {0}?"},
+	"deleted":     {"zh":"已删除","en":"Deleted","ja":"削除しました","ko":"삭제됨","fr":"Supprimé","de":"Gelöscht","es":"Eliminado","pt":"Apagado","ru":"Удалено","vi":"Đã xóa"},
+	"enterSQL":    {"zh":"请输入 SQL","en":"Enter SQL first","ja":"SQLを入力","ko":"SQL을 입력","fr":"Entrez du SQL","de":"SQL eingeben","es":"Introduce SQL","pt":"Introduza SQL","ru":"Введите SQL","vi":"Nhập SQL"},
+	"rowsRet":     {"zh":"{0} 行返回","en":"{0} rows returned","ja":"{0} 行","ko":"{0}행 반환","fr":"{0} lignes","de":"{0} Zeilen","es":"{0} filas","pt":"{0} linhas","ru":"{0} строк","vi":"{0} dòng trả về"},
+	"noTableName": {"zh":"请输入表名","en":"Enter a table name","ja":"テーブル名を入力","ko":"테이블 이름 입력","fr":"Entrez un nom","de":"Namen eingeben","es":"Introduce el nombre","pt":"Introduza o nome","ru":"Введите имя","vi":"Nhập tên bảng"},
+	"needCol":     {"zh":"请至少定义一个列","en":"At least one column","ja":"列を1つ以上","ko":"1개 이상 열 필요","fr":"Au moins une colonne","de":"Mind. eine Spalte","es":"Mínimo una columna","pt":"Pelo menos uma coluna","ru":"Минимум столбец","vi":"Ít nhất một cột"},
+	"tableCreated": {"zh":"表 {0} 创建成功","en":"Table {0} created","ja":"テーブル {0} を作成","ko":"{0} 테이블 생성","fr":"Table {0} créée","de":"Tabelle {0} erstellt","es":"Tabla {0} creada","pt":"Tabela {0} criada","ru":"Таблица {0} создана","vi":"Bảng {0} đã tạo"},
+	"created":     {"zh":"已创建","en":"Created","ja":"作成しました","ko":"생성됨","fr":"Créée","de":"Erstellt","es":"Creada","pt":"Criada","ru":"Создано","vi":"Đã tạo"},
+}

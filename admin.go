@@ -301,9 +301,9 @@ func (db *DB) handleRootPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// 首次安装：显示向导；已安装：显示登录页
 	if globalUsers.Count() == 0 {
-		fmt.Fprint(w, setupWizardHTML)
+		fmt.Fprint(w, strings.Replace(setupWizardHTML, "/*__I18N__*/", wizDictJS, 1))
 	} else {
-		fmt.Fprint(w, loginPageHTML)
+		fmt.Fprint(w, strings.Replace(loginPageHTML, "/*__I18N__*/", dashDictJS, 1))
 	}
 }
 

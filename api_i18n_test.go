@@ -62,4 +62,36 @@ func TestAPIi18n(t *testing.T) {
 		t.Fatalf("en 401 = %v", j["error"])
 	}
 	t.Logf("en401: %v", j["error"])
+
+	// 未认证 - 日语（区域码归一化 zh-TW 之外的例子）
+	req = httptest.NewRequest("GET", "/api/admin/settings", nil)
+	req.Header.Set("X-Lang", "ja-JP")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	json.Unmarshal(rec.Body.Bytes(), &j)
+	if j["error"] != "未ログイン、またはセッションが期限切れです" {
+		t.Fatalf("ja 401 = %v", j["error"])
+	}
+	t.Logf("ja401: %v", j["error"])
+
+	// 未认证 - 俄语
+	req = httptest.NewRequest("GET", "/api/admin/settings", nil)
+	req.Header.Set("X-Lang", "ru")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	json.Unmarshal(rec.Body.Bytes(), &j)
+	if j["error"] != "не выполнен вход или сеанс истёк" {
+		t.Fatalf("ru 401 = %v", j["error"])
+	}
+	t.Logf("ru401: %v", j["error"])
+
+	// 未认证 - 未知语言回退中文
+	req = httptest.NewRequest("GET", "/api/admin/settings", nil)
+	req.Header.Set("X-Lang", "xx")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	json.Unmarshal(rec.Body.Bytes(), &j)
+	if j["error"] != "未登录或会话已过期" {
+		t.Fatalf("fallback 401 = %v", j["error"])
+	}
 }

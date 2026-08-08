@@ -14,31 +14,32 @@ const setupWizardHTML = `<!DOCTYPE html>
   --md-secondary:#625B71;--md-on-secondary:#FFFFFF;--md-secondary-container:#E8DEF8;--md-on-secondary-container:#1D192B;
   --md-tertiary:#7D5260;--md-on-tertiary:#FFFFFF;--md-tertiary-container:#FFD8E4;--md-on-tertiary-container:#31111D;
   --md-error:#B3261E;--md-on-error:#FFFFFF;--md-error-container:#F9DEDC;--md-on-error-container:#410E0B;
-  --md-surface:#FEF7FF;--md-on-surface:#1D1B20;--md-surface-dim:#DED8E1;--md-surface-bright:#FEF7FF;
+  --md-surface:#FEF7FF;--md-on-surface:#1D1B20;--md-surface-dim:#DED8E1;
   --md-surface-variant:#E7E0EC;--md-on-surface-variant:#49454F;
   --md-outline:#79747E;--md-outline-variant:#CAC4D0;
   --md-surface-container-lowest:#FFFFFF;--md-surface-container-low:#F7F2FA;--md-surface-container:#F3EDF7;
   --md-surface-container-high:#ECE6F0;--md-surface-container-highest:#E6E0E9;
   --md-inverse-surface:#322F35;--md-inverse-on-surface:#F5EFF7;--md-inverse-primary:#D0BCFF;
-  --md-primary-10:#21005D;--md-primary-20:#381E72;--md-primary-30:#4F378B;--md-primary-40:#6750A4;
-  --md-primary-80:#D0BCFF;--md-primary-90:#EADDFF;--md-primary-95:#F6EDFF;--md-primary-99:#FFFBFE;
-  --md-duration-medium2:300ms;--md-duration-short4:200ms;--md-duration-long4:600ms;
+  --md-primary-20:#381E72;--md-primary-40:#6750A4;--md-tertiary-40:#7D5260;
+  --md-primary-90:#EADDFF;--md-primary-99:#FFFBFE;
+  --md-duration-medium2:300ms;--md-duration-short4:200ms;
   --md-easing-emphasized:cubic-bezier(0.2,0,0,1);
   --md-easing-emphasized-decelerate:cubic-bezier(0.05,0.7,0.1,1);
-  --md-shape-xs:4px;--md-shape-sm:8px;--md-shape-md:12px;
-  --md-shape-lg:16px;--md-shape-xl:28px;--md-shape-full:9999px;
+  --md-shape-md:12px;--md-shape-lg:16px;--md-shape-xl:28px;--md-shape-full:9999px;
 }
 @media(prefers-color-scheme:dark){:root{
   --md-primary:#D0BCFF;--md-on-primary:#381E72;--md-primary-container:#4F378B;--md-on-primary-container:#EADDFF;
   --md-secondary:#CCC2DC;--md-on-secondary:#332D41;--md-secondary-container:#4A4458;--md-on-secondary-container:#E8DEF8;
   --md-tertiary:#EFB8C8;--md-on-tertiary:#492532;--md-tertiary-container:#633B48;--md-on-tertiary-container:#FFD8E4;
   --md-error:#F2B8B5;--md-on-error:#601410;--md-error-container:#8C1D18;--md-on-error-container:#F9DEDC;
-  --md-surface:#141218;--md-on-surface:#E6E0E9;--md-surface-dim:#141218;--md-surface-bright:#3B383E;
+  --md-surface:#141218;--md-on-surface:#E6E0E9;--md-surface-dim:#141218;
   --md-surface-variant:#49454F;--md-on-surface-variant:#CAC4D0;
   --md-outline:#938F99;--md-outline-variant:#49454F;
   --md-surface-container-lowest:#0F0D13;--md-surface-container-low:#1D1B20;--md-surface-container:#211F26;
   --md-surface-container-high:#2B2930;--md-surface-container-highest:#36343B;
   --md-inverse-surface:#E6E0E9;--md-inverse-on-surface:#322F35;--md-inverse-primary:#6750A4;
+  --md-primary-20:#381E72;--md-primary-40:#6750A4;--md-tertiary-40:#7D5260;
+  --md-primary-90:#EADDFF;--md-primary-99:#FFFBFE;
 }}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;background:var(--md-surface);color:var(--md-on-surface);min-height:100vh;display:flex;align-items:center;justify-content:center;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
@@ -67,7 +68,6 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 .btn-fill:active{transform:translateY(0);box-shadow:0 1px 2px rgba(0,0,0,.15)}
 .btn-fill:disabled{opacity:.38;cursor:not-allowed;transform:none;box-shadow:none}
 .btn-tonal{background:var(--md-secondary-container);color:var(--md-on-secondary-container);box-shadow:0 1px 2px rgba(0,0,0,.1)}
-.btn-tonal:hover{box-shadow:0 2px 6px rgba(0,0,0,.15);transform:translateY(-1px)}
 .progress{display:flex;gap:8px;justify-content:center;margin-bottom:36px}
 .progress .dot{width:8px;height:8px;border-radius:50%;background:var(--md-outline-variant);transition:all var(--md-duration-medium2) var(--md-easing-emphasized)}
 .progress .dot.done{background:var(--md-primary)}
@@ -85,6 +85,22 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 .feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0}
 .feature{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:var(--md-shape-md);background:var(--md-surface-container-low);font-size:13px;font-weight:500;color:var(--md-on-surface-variant)}
 .feature .mat{font-size:20px;color:var(--md-primary)}
+/* 语言选择圆球 */
+.lang-wrap{margin:28px 0}
+.lang-track{display:flex;gap:16px;overflow-x:auto;padding:24px 12px 16px;scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.lang-track::-webkit-scrollbar{display:none}
+.orb{flex:0 0 auto;width:120px;height:120px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;scroll-snap-align:center;text-align:center;position:relative;color:var(--md-on-surface);
+  background:radial-gradient(circle at 32% 26%, rgba(255,255,255,.5), rgba(216,180,254,.28) 48%, rgba(103,80,164,.18) 74%);
+  border:1px solid rgba(255,255,255,.5);box-shadow:0 6px 20px rgba(103,80,164,.16), inset 0 0 26px rgba(255,255,255,.12);
+  transition:all var(--md-duration-medium2) var(--md-easing-emphasized)}
+.orb:hover{transform:translateY(-3px) scale(1.04);box-shadow:0 10px 26px rgba(103,80,164,.24)}
+.orb:active{transform:translateY(0) scale(.98)}
+.orb .n{font-size:15px;font-weight:700;padding:0 8px;line-height:1.25}
+.orb .s{font-size:9px;text-transform:uppercase;letter-spacing:.6px;opacity:.6;font-weight:600}
+.orb .dot2{position:absolute;top:8px;left:50%;transform:translateX(-50%);width:16px;height:16px;border-radius:50%;background:var(--md-primary);box-shadow:0 0 0 4px var(--md-primary-container);opacity:0;transform:translateX(-50%) scale(.4);transition:all var(--md-duration-medium2) var(--md-easing-emphasized)}
+.orb.active{border-color:var(--md-primary)}
+.orb.active .dot2{opacity:1;transform:translateX(-50%) scale(1)}
+.lang-hint{text-align:center;color:var(--md-outline);font-size:12px;margin-top:4px;display:flex;align-items:center;justify-content:center;gap:6px}
 </style>
 </head>
 <body>
@@ -94,116 +110,154 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
     <div class="dot" id="pd2"></div>
     <div class="dot" id="pd3"></div>
     <div class="dot" id="pd4"></div>
+    <div class="dot" id="pd5"></div>
   </div>
 
-  <!-- Step 1: 欢迎 -->
+  <!-- Step 1: 选择语言 -->
   <div class="step active" id="step1">
-    <div class="hero"><span class="mat material-symbols-outlined">database</span></div>
-    <h1>欢迎使用 Tsumugi</h1>
-    <p class="sub">轻量级高性能内存数据库<br>支持原生二进制协议与 MySQL 兼容协议</p>
-    <div class="feature-grid">
-      <div class="feature"><span class="mat material-symbols-outlined">bolt</span>亚毫秒级延迟</div>
-      <div class="feature"><span class="mat material-symbols-outlined">save</span>WAL 持久化</div>
-      <div class="feature"><span class="mat material-symbols-outlined">dns</span>MySQL 兼容</div>
-      <div class="feature"><span class="mat material-symbols-outlined">security</span>多用户权限</div>
-    </div>
-    <button class="btn btn-fill" onclick="goStep(2)">开始设置 <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
+    <div class="hero"><span class="mat material-symbols-outlined">translate</span></div>
+    <h1 data-i18n="stepLangTitle">选择界面语言</h1>
+    <p class="sub" data-i18n="stepLangSub">向左或向右滑动浏览，点击圆形即选中</p>
+    <div class="lang-track" id="langTrack"></div>
+    <button class="btn btn-fill" id="btnLang" disabled onclick="goStep(2)"><span data-i18n="btnLang">继续</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
   </div>
 
-  <!-- Step 2: 设置管理员账号 -->
+  <!-- Step 2: 欢迎 -->
   <div class="step" id="step2">
-    <div class="hero"><span class="mat material-symbols-outlined">person_add</span></div>
-    <h1>创建管理员账号</h1>
-    <p class="sub">设置你的管理员用户名和密码<br>此账号将拥有全部管理权限</p>
-    <label class="label">用户名</label>
-    <input class="txt" id="newUser" placeholder="admin" style="margin-bottom:14px" autocomplete="off">
-    <label class="label">密码</label>
-    <input class="txt" id="newPass" type="password" placeholder="至少 6 位" style="margin-bottom:14px" autocomplete="new-password">
-    <label class="label">确认密码</label>
-    <input class="txt" id="newPass2" type="password" placeholder="再次输入密码" style="margin-bottom:20px" autocomplete="new-password">
-    <div id="step2Err" class="err-msg" style="display:none"></div>
-    <button class="btn btn-fill" onclick="doSetup()">创建账号并继续 <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
+    <div class="hero"><span class="mat material-symbols-outlined">database</span></div>
+    <h1 data-i18n="wizWelcome">欢迎使用 Tsumugi</h1>
+    <p class="sub" data-i18n="wizWelcomeSub">轻量级高性能内存数据库<br>支持原生二进制协议与 MySQL 兼容协议</p>
+    <div class="feature-grid">
+      <div class="feature"><span class="mat material-symbols-outlined">bolt</span><span data-i18n="fBolt">亚毫秒级延迟</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined">save</span><span data-i18n="fSave">WAL 持久化</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined">dns</span><span data-i18n="fDns">MySQL 兼容</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined">security</span><span data-i18n="fSec">多用户权限</span></div>
+    </div>
+    <button class="btn btn-fill" onclick="goStep(3)"><span data-i18n="btnStart">开始设置</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
   </div>
 
-  <!-- Step 3: 服务条款 -->
+  <!-- Step 3: 创建管理员账号 -->
   <div class="step" id="step3">
+    <div class="hero"><span class="mat material-symbols-outlined">person_add</span></div>
+    <h1 data-i18n="accTitle">创建管理员账号</h1>
+    <p class="sub" data-i18n="accSub">设置你的管理员用户名和密码<br>此账号将拥有全部管理权限</p>
+    <label class="label" data-i18n="lblUser">用户名</label>
+    <input class="txt" id="newUser" data-ph="phUser" placeholder="admin" style="margin-bottom:14px" autocomplete="off">
+    <label class="label" data-i18n="lblPass">密码</label>
+    <input class="txt" id="newPass" type="password" data-ph="phPass" placeholder="至少 6 位" style="margin-bottom:14px" autocomplete="new-password">
+    <label class="label" data-i18n="lblPass2">确认密码</label>
+    <input class="txt" id="newPass2" type="password" data-ph="phPass2" placeholder="再次输入密码" style="margin-bottom:20px" autocomplete="new-password">
+    <div id="step2Err" class="err-msg" style="display:none"></div>
+    <button class="btn btn-fill" onclick="doSetup()"><span data-i18n="btnCreateAcc">创建账号并继续</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
+  </div>
+
+  <!-- Step 4: 服务条款 -->
+  <div class="step" id="step4">
     <div class="hero"><span class="mat material-symbols-outlined">gavel</span></div>
-    <h1>服务条款</h1>
-    <p class="sub">使用前请阅读以下条款</p>
-    <div class="terms">
-      <h4>一、服务说明</h4>
-      <p>Tsumugi（つむぎ）是一款用 Go 标准库从零实现的轻量级内存数据库，提供原生二进制协议与 MySQL 兼容协议。本软件按"现状"提供，不附带任何明示或暗示的保证。</p>
-      <h4>二、开源协议</h4>
-      <p>本项目基于 <b>MIT License</b> 开源。你可以在遵守 MIT 许可条款的前提下自由使用、修改、复制、分发与商用。完整协议文本见项目根目录 LICENSE 文件。</p>
-      <h4>三、数据责任</h4>
-      <p>用户应自行负责数据的备份与安全。Tsumugi 提供 WAL（预写日志）持久化机制，但不承诺在极端场景（如断电、硬件故障、进程被强制终止）下数据的完整性。建议定期通过备份功能保留关键数据快照。</p>
-      <h4>四、安全义务</h4>
-      <p>用户应妥善保管账号密码，不得将管理权限授予未经授权的第三方。因用户自身密码泄露、弱口令或服务器暴露于公网等原因导致的安全问题，Tsumugi 及其开发者不承担责任。</p>
-      <h4>五、使用限制</h4>
-      <p>用户不得利用 Tsumugi 进行任何违反法律法规的活动，包括但不限于：存储非法内容、发起网络攻击、未经授权访问他人系统或数据。</p>
-      <h4>六、性能与限制</h4>
-      <p>Tsumugi 为内存数据库，数据主存于内存中，服务重启后从 WAL 日志恢复。请根据实际硬件资源合理规划数据规模与写入频率；fsync 模式下写入吞吐受磁盘同步速度影响。</p>
-      <h4>七、隐私保护</h4>
-      <p>Tsumugi 不会主动收集、上传或向第三方披露任何用户数据。所有数据均存储在用户自有服务器上，监控指标与日志仅包含运行状态与操作审计信息，不包含业务数据内容。</p>
-      <h4>八、免责条款</h4>
-      <p>在任何情况下，Tsumugi 的开发者均不对因使用或无法使用本软件而导致的任何直接、间接、附带、特殊、惩罚性或后果性损害承担责任，即使已被告知此类损害的可能性。</p>
-    </div>
+    <h1 data-i18n="termsTitle">服务条款</h1>
+    <p class="sub" data-i18n="termsSub">使用前请阅读以下条款</p>
+    <div class="terms" id="termsBody"></div>
     <div class="check-row">
       <input type="checkbox" id="agreeCheck" onchange="document.getElementById('agreeBtn').disabled=!this.checked">
-      <label for="agreeCheck">我已阅读并同意上述服务条款</label>
+      <label for="agreeCheck" data-i18n="agreeLabel">我已阅读并同意上述服务条款</label>
     </div>
-    <button class="btn btn-fill" id="agreeBtn" disabled onclick="goStep(4)">同意并继续 <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
+    <button class="btn btn-fill" id="agreeBtn" disabled onclick="goStep(5)"><span data-i18n="btnAgree">同意并继续</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
   </div>
 
-  <!-- Step 4: 完成 -->
-  <div class="step" id="step4">
+  <!-- Step 5: 完成 -->
+  <div class="step" id="step5">
     <div class="hero"><span class="mat material-symbols-outlined">celebration</span></div>
-    <h1>一切就绪！</h1>
-    <p class="sub">你可以开始使用 Tsumugi 管理数据了</p>
+    <h1 data-i18n="doneTitle">一切就绪！</h1>
+    <p class="sub" data-i18n="doneSub">你可以开始使用 Tsumugi 管理数据了</p>
     <div id="rootInfo" class="danger-box" style="display:none">
-      <b>请保存 root 备用账号密码</b>
+      <b data-i18n="rootTitle">请保存 root 备用账号密码</b>
       <span id="rootInfoPwd"></span>
     </div>
-    <button class="btn btn-fill" onclick="location.href='/dashboard'" style="margin-top:12px">进入控制台 <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
+    <button class="btn btn-fill" onclick="location.href='/dashboard'" style="margin-top:12px"><span data-i18n="btnDashboard">进入控制台</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
   </div>
 </div>
 <script>
+/*__I18N__*/
 function $(id){return document.getElementById(id);}
+var LANG_CODES=['zh','en','ja','ko','fr','de','es','pt','ru','vi'];
 var rootPassword='';
+function curLang(){var v=localStorage.getItem('tsumugi_lang');if(v&&LANG_CODES.indexOf(v)>=0)return v;var n=(navigator.language||'zh').toLowerCase().split('-')[0];return LANG_CODES.indexOf(n)>=0?n:'zh';}
+function langName(c){for(var i=0;i<(I18N_LANGS||[]).length;i++){if(I18N_LANGS[i].code===c)return I18N_LANGS[i].name;}return c;}
+function t(k){
+  var v=I18N_TEXT[k];var c=curLang();
+  var s=v?(v[c]||v.en||v.zh||('['+k+']')):('['+k+']');
+  var args=Array.prototype.slice.call(arguments,1);
+  return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});
+}
+function applyTexts(){
+  var c=curLang();
+  document.documentElement.lang=c;
+  document.title=t('wizPageTitle');
+  document.querySelectorAll('[data-i18n]').forEach(function(el){
+    var key=el.getAttribute('data-i18n');var v=I18N_TEXT[key];if(!v)return;
+    var txt=v[c]||v.en||v.zh;if(txt==null)return;
+    var kids=el.childNodes;for(var k=kids.length-1;k>=0;k--){if(kids[k].nodeType===3){kids[k].data=txt;break;}}
+  });
+  document.querySelectorAll('[data-ph]').forEach(function(el){el.setAttribute('placeholder',t(el.getAttribute('data-ph')));});
+  $('agreeBtn').disabled=!$('agreeCheck').checked;
+  renderOrbs();renderTerms();
+}
+function renderOrbs(){
+  var tr=$('langTrack');tr.innerHTML='';
+  var cur=curLang();
+  (I18N_LANGS||[]).forEach(function(l){
+    var o=document.createElement('div');
+    o.className='orb'+(l.code===cur?' active':'');
+    o.setAttribute('data-code',l.code);
+    o.innerHTML='<span class="dot2"></span><span class="n">'+langName(l.code)+'</span>'+(l.en?('<span class="s">'+l.en+'</span>'):'');
+    o.onclick=function(){selectLang(o.getAttribute('data-code'));};
+    tr.appendChild(o);
+  });
+  $('btnLang').disabled=false;
+  setTimeout(function(){var a=tr.querySelector('.orb.active');if(a&&a.scrollIntoView)a.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});},80);
+}
+function selectLang(code){
+  localStorage.setItem('tsumugi_lang',code);
+  applyTexts();
+}
+function renderTerms(){
+  var html='';
+  for(var i=1;i<=8;i++){html+='<h4>'+t('term'+i)+'</h4><p>'+t('term'+i+'_body')+'</p>';}
+  $('termsBody').innerHTML=html;
+}
 function goStep(n){
   document.querySelectorAll('.step').forEach(function(s){s.classList.remove('active');});
   $('step'+n).classList.add('active');
-  for(var i=1;i<=4;i++){
-    var dot=$('pd'+i);
-    dot.className='dot';
+  for(var i=1;i<=5;i++){
+    var dot=$('pd'+i);dot.className='dot';
     if(i<n)dot.classList.add('done');
     if(i===n)dot.classList.add('current');
   }
-  if(n===4&&rootPassword){
-    $('rootInfo').style.display='';
-    $('rootInfoPwd').textContent='root / '+rootPassword;
-  }
+  if(n===5&&rootPassword){$('rootInfo').style.display='';$('rootInfoPwd').textContent='root / '+rootPassword;}
+  window.scrollTo({top:0,behavior:'smooth'});
 }
 async function doSetup(){
   var u=$('newUser').value.trim(),p=$('newPass').value,p2=$('newPass2').value;
   var err=$('step2Err');
-  if(!u){err.textContent='请输入用户名';err.style.display='';return;}
-  if(p.length<6){err.textContent='密码至少 6 位';err.style.display='';return;}
-  if(p!==p2){err.textContent='两次密码不一致';err.style.display='';return;}
+  if(!u){err.textContent=t('eNeedUser');err.style.display='';return;}
+  if(p.length<6){err.textContent=t('ePass');err.style.display='';return;}
+  if(p!==p2){err.textContent=t('ePassMismatch');err.style.display='';return;}
   err.style.display='none';
   try{
     var r=await fetch('/api/setup/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     var d=await r.json();
-    if(!d.ok){err.textContent=d.error||'设置失败';err.style.display='';return;}
+    if(!d.ok){err.textContent=d.error||t('eSetupFail');err.style.display='';return;}
     localStorage.setItem('tsumugi_token',d.token);
     if(d.root_password)rootPassword=d.root_password;
-    goStep(3);
-  }catch(e){err.textContent='网络错误';err.style.display='';}
+    goStep(4);
+  }catch(e){err.textContent=t('eNetErr');err.style.display='';}
 }
+(document.getElementById('agreeCheck')).addEventListener('change',function(){document.getElementById('agreeBtn').disabled=!this.checked;});
+window.addEventListener('keydown',function(e){if(e.key==='Enter'&&document.getElementById('step3').classList.contains('active')){doSetup();}});
+applyTexts();
 </script>
 </body>
 </html>`
-
 
 const loginPageHTML = `<!DOCTYPE html>
 <html lang="zh">
@@ -216,39 +270,36 @@ const loginPageHTML = `<!DOCTYPE html>
 <style>
 :root{
   --md-primary:#6750A4;--md-on-primary:#FFFFFF;--md-primary-container:#EADDFF;--md-on-primary-container:#21005D;
-  --md-secondary:#625B71;--md-on-secondary:#FFFFFF;--md-secondary-container:#E8DEF8;--md-on-secondary-container:#1D192B;
-  --md-tertiary:#7D5260;--md-on-tertiary:#FFFFFF;--md-tertiary-container:#FFD8E4;--md-on-tertiary-container:#31111D;
-  --md-error:#B3261E;--md-on-error:#FFFFFF;--md-error-container:#F9DEDC;--md-on-error-container:#410E0B;
-  --md-surface:#FEF7FF;--md-on-surface:#1D1B20;--md-surface-dim:#DED8E1;--md-surface-bright:#FEF7FF;
+  --md-secondary-container:#E8DEF8;--md-on-secondary-container:#1D192B;
+  --md-tertiary:#7D5260;--md-tertiary-container:#FFD8E4;--md-on-tertiary-container:#31111D;
+  --md-error:#B3261E;--md-on-error:#FFFFFF;
+  --md-surface:#FEF7FF;--md-on-surface:#1D1B20;
   --md-surface-variant:#E7E0EC;--md-on-surface-variant:#49454F;
   --md-outline:#79747E;--md-outline-variant:#CAC4D0;
-  --md-surface-container-lowest:#FFFFFF;--md-surface-container-low:#F7F2FA;--md-surface-container:#F3EDF7;
-  --md-surface-container-high:#ECE6F0;--md-surface-container-highest:#E6E0E9;
+  --md-surface-container-lowest:#FFFFFF;--md-surface-container-low:#F7F2FA;
   --md-inverse-surface:#322F35;--md-inverse-on-surface:#F5EFF7;--md-inverse-primary:#D0BCFF;
-  --md-primary-10:#21005D;--md-primary-20:#381E72;--md-primary-30:#4F378B;--md-primary-40:#6750A4;
-  --md-primary-80:#D0BCFF;--md-primary-90:#EADDFF;--md-primary-95:#F6EDFF;--md-primary-99:#FFFBFE;
+  --md-primary-20:#381E72;--md-primary-40:#6750A4;--md-tertiary-40:#7D5260;--md-primary-90:#EADDFF;
   --md-duration-medium2:300ms;--md-duration-short4:200ms;
   --md-easing-emphasized:cubic-bezier(0.2,0,0,1);
   --md-easing-emphasized-decelerate:cubic-bezier(0.05,0.7,0.1,1);
-  --md-shape-xs:4px;--md-shape-sm:8px;--md-shape-md:12px;
-  --md-shape-lg:16px;--md-shape-xl:28px;--md-shape-full:9999px;
+  --md-shape-md:12px;--md-shape-lg:16px;--md-shape-xl:28px;--md-shape-full:9999px;
 }
 @media(prefers-color-scheme:dark){:root{
   --md-primary:#D0BCFF;--md-on-primary:#381E72;--md-primary-container:#4F378B;--md-on-primary-container:#EADDFF;
-  --md-secondary:#CCC2DC;--md-on-secondary:#332D41;--md-secondary-container:#4A4458;--md-on-secondary-container:#E8DEF8;
-  --md-tertiary:#EFB8C8;--md-on-tertiary:#492532;--md-tertiary-container:#633B48;--md-on-tertiary-container:#FFD8E4;
-  --md-error:#F2B8B5;--md-on-error:#601410;--md-error-container:#8C1D18;--md-on-error-container:#F9DEDC;
-  --md-surface:#141218;--md-on-surface:#E6E0E9;--md-surface-dim:#141218;--md-surface-bright:#3B383E;
+  --md-secondary-container:#4A4458;--md-on-secondary-container:#E8DEF8;
+  --md-tertiary:#EFB8C8;--md-tertiary-container:#633B48;--md-on-tertiary-container:#FFD8E4;
+  --md-error:#F2B8B5;--md-on-error:#601410;
+  --md-surface:#141218;--md-on-surface:#E6E0E9;
   --md-surface-variant:#49454F;--md-on-surface-variant:#CAC4D0;
   --md-outline:#938F99;--md-outline-variant:#49454F;
-  --md-surface-container-lowest:#0F0D13;--md-surface-container-low:#1D1B20;--md-surface-container:#211F26;
-  --md-surface-container-high:#2B2930;--md-surface-container-highest:#36343B;
+  --md-surface-container-lowest:#0F0D13;--md-surface-container-low:#1D1B20;
   --md-inverse-surface:#E6E0E9;--md-inverse-on-surface:#322F35;--md-inverse-primary:#6750A4;
+  --md-primary-20:#381E72;--md-primary-40:#6750A4;--md-tertiary-40:#7D5260;--md-primary-90:#EADDFF;
 }}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;background:var(--md-surface);color:var(--md-on-surface);min-height:100vh;display:flex;align-items:center;justify-content:center;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
 .login{width:min(420px,92vw);padding:40px}
-.hero{width:88px;height:88px;border-radius:var(--md-shape-xl);display:grid;place-items:center;background:linear-gradient(135deg,var(--md-primary-20),var(--md-primary) 50%,var(--md-tertiary));color:var(--md-on-primary);margin:0 auto 28px;box-shadow:0 4px 16px rgba(103,80,164,.3),0 8px 32px rgba(103,80,164,.15);transition:transform var(--md-duration-medium2) var(--md-easing-emphasized)}
+.hero{width:88px;height:88px;border-radius:var(--md-shape-xl);display:grid;place-items:center;background:linear-gradient(135deg,var(--md-primary-20),var(--md-primary) 50%,var(--md-tertiary-40));color:var(--md-on-primary);margin:0 auto 28px;box-shadow:0 4px 16px rgba(103,80,164,.3),0 8px 32px rgba(103,80,164,.15);transition:transform var(--md-duration-medium2) var(--md-easing-emphasized)}
 .hero:hover{transform:scale(1.06) rotate(-3deg)}
 .hero .mat{font-size:40px}
 h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spacing:-.5px;font-variation-settings:'wght' 800,'wdth' 100}
@@ -269,29 +320,50 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 <body>
 <div class="login">
   <div class="hero"><span class="mat material-symbols-outlined">database</span></div>
-  <h1>Tsumugi 控制台</h1>
-  <p class="sub">请输入账号密码以继续</p>
-  <label class="label">用户名</label>
+  <h1 data-i18n="loginPageTitle">Tsumugi 控制台</h1>
+  <p class="sub" data-i18n="loginPageSub">请输入账号密码以继续</p>
+  <label class="label" data-i18n="lblUName">用户名</label>
   <input class="txt" id="user" value="" style="margin-bottom:14px" autocomplete="username" placeholder="用户名">
-  <label class="label">密码</label>
+  <label class="label" data-i18n="lblPsd">密码</label>
   <input class="txt" id="pass" type="password" style="margin-bottom:24px" autocomplete="current-password" placeholder="密码">
-  <button class="btn" onclick="doLogin()" id="loginBtn"><span class="material-symbols-outlined" style="font-size:18px">login</span>登录</button>
+  <button class="btn" onclick="doLogin()" id="loginBtn"><span class="material-symbols-outlined" style="font-size:18px">login</span><span data-i18n="btnLogin">登录</span></button>
   <div id="msg" class="err"></div>
   <p class="footer">Tsumugi In-memory Database</p>
 </div>
 <script>
+/*__I18N__*/
 function $(id){return document.getElementById(id);}
+var LANG_CODES=['zh','en','ja','ko','fr','de','es','pt','ru','vi'];
+function curLang(){var v=localStorage.getItem('tsumugi_lang');if(v&&LANG_CODES.indexOf(v)>=0)return v;var n=(navigator.language||'zh').toLowerCase().split('-')[0];return LANG_CODES.indexOf(n)>=0?n:'zh';}
+function t(k){
+  var v=I18N_TEXT[k];var c=curLang();
+  var s=v?(v[c]||v.en||v.zh||('['+k+']')):('['+k+']');
+  var args=Array.prototype.slice.call(arguments,1);
+  return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});
+}
+(function(){
+  var c=curLang();
+  document.documentElement.lang=c;
+  document.title=t('loginPageTitle');
+  document.querySelectorAll('[data-i18n]').forEach(function(el){
+    var key=el.getAttribute('data-i18n');var v=I18N_TEXT[key];if(!v)return;
+    var txt=v[c]||v.en||v.zh;if(txt==null)return;
+    var kids=el.childNodes;for(var k=kids.length-1;k>=0;k--){if(kids[k].nodeType===3){kids[k].data=txt;break;}}
+  });
+  $('user').placeholder=t('lblUName');
+  $('pass').placeholder=t('lblPsd');
+})();
 async function doLogin(){
   var u=$('user').value.trim(),p=$('pass').value;
   $('msg').textContent='';
-  if(!u||!p){$('msg').textContent='请输入用户名和密码';return;}
+  if(!u||!p){$('msg').textContent=t('eNeedBoth');return;}
   $('loginBtn').disabled=true;
   try{
     var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p})});
     var d=await r.json();
     if(d.ok){localStorage.setItem('tsumugi_token',d.token);location.href='/dashboard';}
-    else{$('msg').textContent=d.error||'登录失败';}
-  }catch(e){$('msg').textContent='网络错误';}
+    else{$('msg').textContent=d.error||t('loginErr');}
+  }catch(e){$('msg').textContent=t('netErr');}
   $('loginBtn').disabled=false;
 }
 document.getElementById('pass').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
