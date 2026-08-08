@@ -74,7 +74,10 @@ func parseArgs() options {
 			return ""
 		}
 		switch a {
-		case "-h", "--host":
+		case "-h", "--help", "-help":
+			printUsage()
+			os.Exit(0)
+		case "-host", "--host":
 			o.host = next()
 		case "-p", "--port":
 			o.port = atoiOr(next(), 9999)
@@ -89,6 +92,26 @@ func parseArgs() options {
 		}
 	}
 	return o
+}
+
+func printUsage() {
+	fmt.Println("Tsumugi CLI - Tsumugi 命令行管理工具")
+	fmt.Println()
+	fmt.Println("用法:")
+	fmt.Println("  tsumugi-cli [-host HOST] [-port PORT] [-user USER] [-pass PASS] [-e SQL] [-f FILE]")
+	fmt.Println()
+	fmt.Println("参数:")
+	fmt.Println("  -host, --host  <addr>   服务器地址（默认 127.0.0.1，环境变量 TSUMUGI_HOST）")
+	fmt.Println("  -port, --port   <port>  二进制协议端口（默认 9999，环境变量 TSUMUGI_PORT）")
+	fmt.Println("  -user, --user   <name>  用户名（默认 root，环境变量 TSUMUGI_USER）")
+	fmt.Println("  -pass, --pass   <pwd>   密码（默认 password，环境变量 TSUMUGI_PASS）")
+	fmt.Println("  -e, --exec      <sql>   执行单条 SQL 后退出（支持分号分隔多条）")
+	fmt.Println("  -f, --file      <file>  执行 SQL 脚本文件后退出")
+	fmt.Println("  -h, --help              显示帮助")
+	fmt.Println()
+	fmt.Println("交互模式内建命令：help / exit / status / compact / backup /")
+	fmt.Println("  set durability <batch|fsync> / import --table T --file F.csv [--db D]")
+	fmt.Println("数据库管理：SHOW DATABASES / CREATE DATABASE / DROP DATABASE / USE <db>")
 }
 
 func main() {
