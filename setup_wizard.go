@@ -44,9 +44,9 @@ const setupWizardHTML = `<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;background:var(--md-surface);color:var(--md-on-surface);min-height:100vh;display:flex;align-items:center;justify-content:center;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
 .wizard{width:min(560px,92vw);padding:48px 40px}
-.step{display:none;animation:stepIn var(--md-duration-medium2) var(--md-easing-emphasized-decelerate)}
+.step{display:none;animation:stepIn .5s cubic-bezier(.22,1,.36,1) both}
 .step.active{display:block}
-@keyframes stepIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+@keyframes stepIn{from{opacity:0;transform:translateY(14px) scale(.99)}to{opacity:1;transform:translateY(0) scale(1)}}
 .hero{width:96px;height:96px;border-radius:var(--md-shape-xl);display:grid;place-items:center;background:linear-gradient(135deg,var(--md-primary-20),var(--md-primary) 50%,var(--md-tertiary));color:var(--md-on-primary);margin:0 auto 28px;box-shadow:0 4px 16px rgba(103,80,164,.3),0 8px 32px rgba(103,80,164,.15);transition:transform var(--md-duration-medium2) var(--md-easing-emphasized)}
 .hero:hover{transform:scale(1.06) rotate(-3deg)}
 .hero .mat{font-size:44px}
@@ -85,22 +85,20 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 .feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0}
 .feature{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:var(--md-shape-md);background:var(--md-surface-container-low);font-size:13px;font-weight:500;color:var(--md-on-surface-variant)}
 .feature .mat{font-size:20px;color:var(--md-primary)}
-/* 语言选择圆球 */
-.lang-wrap{margin:28px 0}
-.lang-track{display:flex;gap:16px;overflow-x:auto;padding:24px 12px 16px;scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch;scrollbar-width:none}
-.lang-track::-webkit-scrollbar{display:none}
-.orb{flex:0 0 auto;width:120px;height:120px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;scroll-snap-align:center;text-align:center;position:relative;color:var(--md-on-surface);
-  background:radial-gradient(circle at 32% 26%, rgba(255,255,255,.5), rgba(216,180,254,.28) 48%, rgba(103,80,164,.18) 74%);
-  border:1px solid rgba(255,255,255,.5);box-shadow:0 6px 20px rgba(103,80,164,.16), inset 0 0 26px rgba(255,255,255,.12);
-  transition:all var(--md-duration-medium2) var(--md-easing-emphasized)}
-.orb:hover{transform:translateY(-3px) scale(1.04);box-shadow:0 10px 26px rgba(103,80,164,.24)}
-.orb:active{transform:translateY(0) scale(.98)}
-.orb .n{font-size:15px;font-weight:700;padding:0 8px;line-height:1.25}
-.orb .s{font-size:9px;text-transform:uppercase;letter-spacing:.6px;opacity:.6;font-weight:600}
-.orb .dot2{position:absolute;top:8px;left:50%;transform:translateX(-50%);width:16px;height:16px;border-radius:50%;background:var(--md-primary);box-shadow:0 0 0 4px var(--md-primary-container);opacity:0;transform:translateX(-50%) scale(.4);transition:all var(--md-duration-medium2) var(--md-easing-emphasized)}
-.orb.active{border-color:var(--md-primary)}
-.orb.active .dot2{opacity:1;transform:translateX(-50%) scale(1)}
-.lang-hint{text-align:center;color:var(--md-outline);font-size:12px;margin-top:4px;display:flex;align-items:center;justify-content:center;gap:6px}
+/* 语言选择：苹果风格大球+小球环形 */
+.apple-ring{position:relative;height:236px;margin:24px 0 8px;user-select:none;-webkit-user-select:none;touch-action:pan-y}
+.apple-ring::before{content:'';position:absolute;left:50%;top:54%;width:176px;height:176px;transform:translate(-50%,-50%);border-radius:50%;background:radial-gradient(circle at 50% 34%, rgba(124,92,255,.16), rgba(124,92,255,0) 72%);pointer-events:none}
+.apple-orb{position:absolute;left:50%;top:60%;width:112px;height:112px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;text-align:center;will-change:transform,opacity;
+  background:radial-gradient(circle at 32% 22%, #B89AFF, #7C5CFF 38%, #4C2FBE 82%);
+  box-shadow:0 14px 34px rgba(76,47,190,.4), inset 0 1px 0 rgba(255,255,255,.35);
+  transition:transform .58s cubic-bezier(.34,1.45,.64,1), opacity .42s var(--md-easing-emphasized)}
+.apple-orb::after{content:'';position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle at 30% 22%, rgba(255,255,255,.55), rgba(255,255,255,0) 46%)}
+.apple-orb .n{position:relative;z-index:2;font-size:19px;font-weight:800;color:#FFFFFF;text-shadow:0 1px 8px rgba(0,0,0,.35);padding:0 8px;line-height:1.2;max-width:96px;font-variation-settings:'wght' 800}
+.apple-orb .s{position:relative;z-index:2;font-size:8.5px;text-transform:uppercase;letter-spacing:.7px;opacity:.9;font-weight:700;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.25)}
+.apple-orb.active{box-shadow:0 18px 44px rgba(76,47,190,.52), 0 0 0 4px rgba(255,255,255,.18), inset 0 1px 0 rgba(255,255,255,.4)}
+.apple-orb.min{box-shadow:0 10px 22px rgba(76,47,190,.3), inset 0 1px 0 rgba(255,255,255,.3)}
+.apple-orb.hidden{opacity:0;pointer-events:none}
+.lang-hint{text-align:center;color:var(--md-outline);font-size:12px;margin:8px 0 10px;display:flex;align-items:center;justify-content:center;gap:6px}
 </style>
 </head>
 <body>
@@ -118,7 +116,7 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
     <div class="hero"><span class="mat material-symbols-outlined">translate</span></div>
     <h1 data-i18n="stepLangTitle">选择界面语言</h1>
     <p class="sub" data-i18n="stepLangSub">向左或向右滑动浏览，点击圆形即选中</p>
-    <div class="lang-track" id="langTrack"></div>
+    <div class="apple-ring" id="langRing"></div>
     <button class="btn btn-fill" id="btnLang" disabled onclick="goStep(2)"><span data-i18n="btnLang">继续</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
   </div>
 
@@ -200,24 +198,50 @@ function applyTexts(){
   });
   document.querySelectorAll('[data-ph]').forEach(function(el){el.setAttribute('placeholder',t(el.getAttribute('data-ph')));});
   $('agreeBtn').disabled=!$('agreeCheck').checked;
-  renderOrbs();renderTerms();
+  renderLangRing();renderTerms();
 }
-function renderOrbs(){
-  var tr=$('langTrack');tr.innerHTML='';
-  var cur=curLang();
-  (I18N_LANGS||[]).forEach(function(l){
+var ringCur=0;
+function renderLangRing(){
+  var stage=$('langRing');if(!stage)return;
+  var cur=curLang();ringCur=0;
+  for(var i=0;i<(I18N_LANGS||[]).length;i++){if(I18N_LANGS[i].code===cur){ringCur=i;break;}}
+  stage.innerHTML='';
+  I18N_LANGS.forEach(function(l,idx){
     var o=document.createElement('div');
-    o.className='orb'+(l.code===cur?' active':'');
-    o.setAttribute('data-code',l.code);
-    o.innerHTML='<span class="dot2"></span><span class="n">'+langName(l.code)+'</span>'+(l.en?('<span class="s">'+l.en+'</span>'):'');
-    o.onclick=function(){selectLang(o.getAttribute('data-code'));};
-    tr.appendChild(o);
+    o.className='apple-orb';
+    o.id='orb'+idx;
+    o.innerHTML='<span class="n"></span><span class="s">'+l.en+'</span>';
+    o.querySelector('.n').textContent=l.name;
+    o.addEventListener('click',function(){selectLang(l.code);});
+    stage.appendChild(o);
   });
+  appleLayout();
+  setTimeout(appleLayout,80);
+}
+function appleLayout(){
+  if(!(I18N_LANGS&&I18N_LANGS.length))return;
+  var n=I18N_LANGS.length;
+  for(var i=0;i<n;i++){
+    var el=document.getElementById('orb'+i);
+    if(!el)continue;
+    var d=i-ringCur;if(d> n/2)d-=n;if(d< -n/2)d+=n;
+    var ad=Math.abs(d);
+    var size=ad===0?112:ad===1?56:ad===2?38:8;
+    var scale=size/112;
+    var x=d*72;
+    var y=-(ad*ad)*4;
+    el.style.transform='translate('+x+'px,'+y+'px) translate(-50%,-50%) scale('+scale+')';
+    el.style.opacity=ad>3?0:1-(ad*0.24);
+    el.classList.toggle('hidden',ad>3);
+    el.classList.toggle('active',ad===0);
+    el.classList.toggle('min',ad>0&&ad<=2);
+  }
   $('btnLang').disabled=false;
-  setTimeout(function(){var a=tr.querySelector('.orb.active');if(a&&a.scrollIntoView)a.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});},80);
 }
 function selectLang(code){
   localStorage.setItem('tsumugi_lang',code);
+  for(var i=0;i<(I18N_LANGS||[]).length;i++){if(I18N_LANGS[i].code===code){ringCur=i;break;}}
+  appleLayout();
   applyTexts();
 }
 function renderTerms(){

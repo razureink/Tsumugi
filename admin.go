@@ -186,6 +186,82 @@ func (db *DB) handleAdminTables(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validDBName 校验数据库名（标识符规则，避开注入风险）。
+func validDBName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 && !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+			return false
+		}
+		if i > 0 && !(r == '_' || r == '.' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// handleAdminDBCreate 新建数据库：写入 mysqlCfg.Databases（持久化），
+// 与 SQL 控制台 CREATE DATABASE 走同一引擎路径，保证各处列表同步。
+func (db *DB) handleAdminDBCreate(w http.ResponseWriter, r *http.Request) {
+	var req dbManageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if !validDBName(name) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid database name"})
+		return
+	}
+	_, _, _, rawMsg, err := db.runSQL("CREATE DATABASE " + name)
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok":        true,
+		"message":   rawMsg,
+		"databases": mysqlCfg.get().Databases,
+	})
+}
+
+// handleAdminDBDrop 删除数据库（连同库下所有表）。系统内置库受保护。
+func (db *DB) handleAdminDBDrop(w http.ResponseWriter, r *http.Request) {
+	var req dbManageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	for _, sys := range []string{"information_schema", "mysql", "performance_schema", "sys"} {
+		if strings.EqualFold(name, sys) {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "system database cannot be dropped"})
+			return
+		}
+	}
+	if !validDBName(name) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid database name"})
+		return
+	}
+	_, _, _, _, err := db.runSQL("DROP DATABASE " + name)
+	if err != nil {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"ok":        true,
+		"message":   "database dropped",
+		"databases": mysqlCfg.get().Databases,
+		"cur_db":    db.getCurDB(),
+	})
+}
+
+type dbManageRequest struct {
+	Name string `json:"name"`
+}
+
 func (db *DB) handleAdminRows(w http.ResponseWriter, r *http.Request) {
 	table := r.URL.Query().Get("table")
 	afterPK := int64(-1)
@@ -301,9 +377,9 @@ func (db *DB) handleRootPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// 首次安装：显示向导；已安装：显示登录页
 	if globalUsers.Count() == 0 {
-		fmt.Fprint(w, strings.Replace(setupWizardHTML, "/*__I18N__*/", wizDictJS, 1))
+		fmt.Fprint(w, strings.Replace(setupWizardHTML, "/*__I18N__*/", cachedWizDictJS(), 1))
 	} else {
-		fmt.Fprint(w, strings.Replace(loginPageHTML, "/*__I18N__*/", dashDictJS, 1))
+		fmt.Fprint(w, strings.Replace(loginPageHTML, "/*__I18N__*/", cachedDashDictJS(), 1))
 	}
 }
 

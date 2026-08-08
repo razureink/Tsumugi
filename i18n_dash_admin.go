@@ -28,4 +28,18 @@ var dashDictAdmin = map[string]map[string]string{
 	"needCol":     {"zh":"请至少定义一个列","en":"At least one column","ja":"列を1つ以上","ko":"1개 이상 열 필요","fr":"Au moins une colonne","de":"Mind. eine Spalte","es":"Mínimo una columna","pt":"Pelo menos uma coluna","ru":"Минимум столбец","vi":"Ít nhất một cột"},
 	"tableCreated": {"zh":"表 {0} 创建成功","en":"Table {0} created","ja":"テーブル {0} を作成","ko":"{0} 테이블 생성","fr":"Table {0} créée","de":"Tabelle {0} erstellt","es":"Tabla {0} creada","pt":"Tabela {0} criada","ru":"Таблица {0} создана","vi":"Bảng {0} đã tạo"},
 	"created":     {"zh":"已创建","en":"Created","ja":"作成しました","ko":"생성됨","fr":"Créée","de":"Erstellt","es":"Creada","pt":"Criada","ru":"Создано","vi":"Đã tạo"},
+	// 数据库管理（默认语言 zh，其余回退 en）
+	"dbBtnManage":{"zh":"数据库管理","en":"Databases"},
+	"dbTitle":{"zh":"数据库管理","en":"Manage databases"},
+	"dbNewPh":{"zh":"数据库名（如 my_app）","en":"Database name (e.g. my_app)"},
+	"dbCreate":{"zh":"新建","en":"Create"},
+	"dbEmpty":{"zh":"暂无数据库","en":"No databases yet"},
+	"dbUsing":{"zh":"当前","en":"Current"},
+	"dbUse":{"zh":"使用","en":"Use"},
+	"dbUsed":{"zh":"已切换到 {0}","en":"Now using {0}"},
+	"dbNeedName":{"zh":"请输入数据库名","en":"Enter a database name"},
+	"dbCreated":{"zh":"数据库 {0} 已创建","en":"Database {0} created"},
+	"dbDropped":{"zh":"数据库 {0} 已删除","en":"Database {0} dropped"},
+	"dbDropConfirm":{"zh":"删除数据库 {0} 将连同其下所有表一并清除，确定？","en":"Dropping {0} removes all of its tables. Continue?"},
+	"dbUsePh":{"zh":"使用","en":"Use"},
 }

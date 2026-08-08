@@ -362,6 +362,8 @@ func (db *DB) startMetricsServer() {
 	mux.HandleFunc("/api/current-user", db.handleCurrentUser)
 	// 写接口与数据读取需认证；登录接口公开
 	mux.HandleFunc("/api/admin/tables", adminAuthRequired(db.handleAdminTables))
+	mux.HandleFunc("/api/admin/db/create", adminAuthRequired(db.handleAdminDBCreate))
+	mux.HandleFunc("/api/admin/db/drop", adminAuthRequired(db.handleAdminDBDrop))
 	mux.HandleFunc("/api/admin/rows", adminAuthRequired(db.handleAdminRows))
 	mux.HandleFunc("/api/admin/query", adminAuthRequired(db.handleAdminQuery))
 	mux.HandleFunc("/api/admin/insert", adminAuthRequired(db.handleAdminInsert))
