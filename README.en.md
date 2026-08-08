@@ -84,6 +84,31 @@ docker compose down -v           # stop and wipe data
 
 MySQL protocol is enabled by default in `docker-compose.yml` (`TSUMUGI_MYSQL=true`), with a health check configured.
 
+**Install `tsumugi` / `tsumugi-cli` as host-wide commands**
+
+Both binaries ship inside the image (at `/usr/local/bin`). To call them from any directory on the host, run the bundled script:
+
+```bash
+sudo ./build.sh
+```
+
+It extracts the binaries via the multi-stage `binaries` export stage and installs them to `/usr/local/bin`. After that they are available globally:
+
+```bash
+tsumugi --help        # server
+tsumugi-cli --help    # command-line client
+```
+
+Manual equivalent (when not using the script):
+
+```bash
+docker compose build
+id=$(docker create tsumugi-tsumugi:latest)
+docker cp "$id:/usr/local/bin/tsumugi" /usr/local/bin/tsumugi
+docker cp "$id:/usr/local/bin/tsumugi-cli" /usr/local/bin/tsumugi-cli
+docker rm "$id"
+```
+
 ### Option 2: Build and run directly
 
 Requires Go 1.21+:

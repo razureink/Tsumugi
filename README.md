@@ -56,6 +56,31 @@ docker compose down -v           # 停止并清空数据
 
 `docker-compose.yml` 里已默认开启 MySQL 协议（`TSUMUGI_MYSQL=true`）并设置健康检查。
 
+**把 `tsumugi` / `tsumugi-cli` 装成宿主机全局命令**
+
+镜像里已内置这两个二进制（`/usr/local/bin`）。想在宿主机任意目录直接调用，运行仓库自带的脚本：
+
+```bash
+sudo ./build.sh
+```
+
+它会通过多阶段构建的 `binaries` 导出阶段取出二进制并安装到 `/usr/local/bin`，之后全局可用：
+
+```bash
+tsumugi --help        # 服务端
+tsumugi-cli --help    # 命令行客户端
+```
+
+等价的手动做法（不使用脚本时）：
+
+```bash
+docker compose build
+id=$(docker create tsumugi-tsumugi:latest)
+docker cp "$id:/usr/local/bin/tsumugi" /usr/local/bin/tsumugi
+docker cp "$id:/usr/local/bin/tsumugi-cli" /usr/local/bin/tsumugi-cli
+docker rm "$id"
+```
+
 ### 方式二：直接编译运行
 
 需要 Go 1.21+：
