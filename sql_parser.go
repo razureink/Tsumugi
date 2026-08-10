@@ -329,22 +329,22 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		}
 		// SHOW ENGINES
 		if p.matchKeyword("ENGINES") {
-			columns, rows, err = db.queryInfoSchema("ENGINES", nil, nil)
+			columns, rows, err = db.queryInfoSchema("ENGINES", nil, nil, nil)
 			return
 		}
 		// SHOW PLUGINS
 		if p.matchKeyword("PLUGINS") {
-			columns, rows, err = db.queryInfoSchema("PLUGINS", nil, nil)
+			columns, rows, err = db.queryInfoSchema("PLUGINS", nil, nil, nil)
 			return
 		}
 		// SHOW CHARACTER SET / SHOW CHARSET
 		if p.matchKeyword("CHARACTER") {
 			p.matchKeyword("SET")
-			columns, rows, err = db.queryInfoSchema("CHARACTER_SETS", nil, nil)
+			columns, rows, err = db.queryInfoSchema("CHARACTER_SETS", nil, nil, nil)
 			return
 		}
 		if p.matchKeyword("CHARSET") {
-			columns, rows, err = db.queryInfoSchema("CHARACTER_SETS", nil, nil)
+			columns, rows, err = db.queryInfoSchema("CHARACTER_SETS", nil, nil, nil)
 			return
 		}
 		// SHOW COLLATION [LIKE '..']
@@ -352,7 +352,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 			if p.matchKeyword("LIKE") {
 				p.next()
 			}
-			columns, rows, err = db.queryInfoSchema("COLLATIONS", nil, nil)
+			columns, rows, err = db.queryInfoSchema("COLLATIONS", nil, nil, nil)
 			return
 		}
 		// SHOW STATUS / SHOW GLOBAL STATUS / SHOW SESSION STATUS
@@ -651,20 +651,52 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	var selectCols []string
-	if t := p.next(); t.kind == "sym" && t.val == "*" {
+	colSrc := map[string]string{} // 输出列名 -> 源列名（AS 别名映射）
+	if pt := p.peek(); pt.kind == "sym" && pt.val == "*" {
+		p.next()
 		selectCols = nil // 表示所有列
+		colSrc = nil
 	} else {
-		firstTok := t
+		readCol := func() (string, error) {
+			ct := p.peek()
+			if ct.kind != "ident" && ct.kind != "kw" && ct.kind != "str" {
+				return "", fmt.Errorf("expected column name, got %q", ct.val)
+			}
+			p.next()
+			return ct.val, nil
+		}
 		for {
-			if firstTok.kind != "ident" && firstTok.kind != "kw" {
-				err = fmt.Errorf("expected column name, got %q", firstTok.val)
+			field, e := readCol()
+			if e != nil {
+				err = e
 				return
 			}
-			selectCols = append(selectCols, firstTok.val)
+			src := field
+			colName := field
+			if p.peek().kind == "sym" && p.peek().val == "." {
+				p.next()
+				part, pe := readCol()
+				if pe != nil {
+					err = pe
+					return
+				}
+				src = field + "." + part
+				colName = src
+			}
+			// phpMyAdmin 常用 SELECT col AS alias 形式
+			if p.matchKeyword("AS") {
+				alias, ae := readCol()
+				if ae != nil {
+					err = ae
+					return
+				}
+				colName = alias
+			}
+			selectCols = append(selectCols, colName)
+			colSrc[strings.ToLower(colName)] = src
 			if !p.matchSym(",") {
 				break
 			}
-			firstTok = p.next()
 		}
 	}
 	if !p.matchKeyword("FROM") {
@@ -820,7 +852,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 				conds[c.field] = c.val
 			}
 		}
-		return db.queryMysqlTable(mt, conds, selectCols)
+		return db.queryMysqlTable(mt, conds, selectCols, colSrc)
 	}
 	// information_schema.* 虚拟系统表
 	if strings.HasPrefix(strings.ToLower(tableName), "information_schema.") {
@@ -830,7 +862,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 				conds[c.field] = c.val
 			}
 		}
-		columns, rows, err = db.queryInfoSchema(it, conds, selectCols)
+		columns, rows, err = db.queryInfoSchema(it, conds, selectCols, colSrc)
 		return
 	}
 	t := db.getTable(tableName)
@@ -897,14 +929,22 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		}
 		filters = append(filters, RangeCond{Field: c.field, Op: rangeOp(c.op), Val: c.val, Val2: c.val2})
 	}
-	// 列投影：SELECT * 返回全部列；否则只返回指定的列
+	// 列投影：SELECT * 返回全部列；否则只返回指定的列（AS 别名映射到源列）
 	cols := t.meta.Fields
+	outNames := []string(nil)
 	if selectCols != nil {
 		cols = nil
 		for _, sc := range selectCols {
+			src := sc
+			if colSrc != nil {
+				if s, ok := colSrc[strings.ToLower(sc)]; ok {
+					src = s
+				}
+			}
 			for _, f := range t.meta.Fields {
-				if strings.EqualFold(sc, f.Name) {
+				if strings.EqualFold(src, f.Name) {
 					cols = append(cols, f)
+					outNames = append(outNames, sc)
 					break
 				}
 			}
@@ -914,10 +954,13 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			return
 		}
 	}
-	columns = make([]string, 0, len(cols))
-	for _, f := range cols {
-		columns = append(columns, f.Name)
+	if outNames == nil {
+		outNames = make([]string, 0, len(cols))
+		for _, f := range cols {
+			outNames = append(outNames, f.Name)
+		}
 	}
+	columns = outNames
 	// 无 WHERE 条件的快速路径：直接解码为 []interface{}，跳过每行 map 分配
 	if len(conds) == 0 && len(filters) == 0 {
 		flat := t.selectRowsFlat(minKey, maxKey, limit)
@@ -999,8 +1042,16 @@ func rangeOp(op string) string {
 }
 
 // queryMysqlTable 处理 SELECT ... FROM mysql.<table> 虚拟系统表。
-func (db *DB) queryMysqlTable(name string, conds map[string]interface{}, selectCols []string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+func (db *DB) queryMysqlTable(name string, conds map[string]interface{}, selectCols []string, colSrc map[string]string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	mc := mysqlCfg.get()
+	srcOf := func(c string) string {
+		if colSrc != nil {
+			if s, ok := colSrc[strings.ToLower(c)]; ok {
+				return s
+			}
+		}
+		return c
+	}
 	project := func(rec map[string]interface{}) []interface{} {
 		if selectCols == nil {
 			row := make([]interface{}, 0, len(rec))
@@ -1011,7 +1062,7 @@ func (db *DB) queryMysqlTable(name string, conds map[string]interface{}, selectC
 		}
 		row := make([]interface{}, 0, len(selectCols))
 		for _, c := range selectCols {
-			row = append(row, rec[strings.ToLower(c)])
+			row = append(row, rec[strings.ToLower(srcOf(c))])
 		}
 		return row
 	}

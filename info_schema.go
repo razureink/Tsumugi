@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -108,7 +110,7 @@ var emptyInfoTables = map[string]bool{
 }
 
 // queryInfoSchema 处理 SELECT ... FROM information_schema.<table>。
-func (db *DB) queryInfoSchema(name string, conds map[string]interface{}, selectCols []string) (columns []string, rows [][]interface{}, err error) {
+func (db *DB) queryInfoSchema(name string, conds map[string]interface{}, selectCols []string, colSrc map[string]string) (columns []string, rows [][]interface{}, err error) {
 	upper := strings.ToUpper(name)
 	allCols := infoSchemaCols[upper]
 	if allCols == nil {
@@ -132,12 +134,12 @@ func (db *DB) queryInfoSchema(name string, conds map[string]interface{}, selectC
 			out = append(out, rec)
 		}
 	}
-	columns, rows = projectInfoRows(allCols, out, selectCols)
+	columns, rows = projectInfoRows(allCols, out, selectCols, colSrc)
 	return
 }
 
-// projectInfoRows 按 selectCols 投影（nil=全部列）。
-func projectInfoRows(allCols []string, recs []map[string]interface{}, selectCols []string) ([]string, [][]interface{}) {
+// projectInfoRows 按 selectCols 投影（nil=全部列）。colSrc 提供 输出列名->源列名 别名映射。
+func projectInfoRows(allCols []string, recs []map[string]interface{}, selectCols []string, colSrc map[string]string) ([]string, [][]interface{}) {
 	if selectCols == nil {
 		cols := make([]string, len(allCols))
 		for i, c := range allCols {
@@ -156,10 +158,16 @@ func projectInfoRows(allCols []string, recs []map[string]interface{}, selectCols
 	idx := make([]int, 0, len(selectCols))
 	cols := make([]string, 0, len(selectCols))
 	for _, sc := range selectCols {
+		src := sc
+		if colSrc != nil {
+			if s, ok := colSrc[strings.ToLower(sc)]; ok {
+				src = s
+			}
+		}
 		for i, c := range allCols {
-			if strings.EqualFold(sc, c) {
+			if strings.EqualFold(src, c) {
 				idx = append(idx, i)
-				cols = append(cols, strings.ToLower(c))
+				cols = append(cols, strings.ToLower(sc))
 				break
 			}
 		}
@@ -576,7 +584,7 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			}
 		}
 		it := strings.ToLower(strings.TrimPrefix(tableName, "information_schema."))
-		_, recs, e := db.queryInfoSchema(it, conds, nil)
+		_, recs, e := db.queryInfoSchema(it, conds, nil, nil)
 		if e != nil {
 			err = e
 			return
@@ -646,100 +654,214 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 }
 
 // queryScalarSelect 处理无 FROM 的标量查询（@@vars / 函数），phpMyAdmin 连接期高频使用。
+// 支持多列：SELECT @@session.sql_mode, @@character_set_client AS csc, VERSION(), NOW() 等。
+// 仅当整条查询都是标量项时才命中；否则返回 rows=nil 交由常规 SELECT 路径处理。
 func (db *DB) queryScalarSelect(p *sqlParser) (columns []string, rows [][]interface{}, err error) {
-	// SELECT @@session.sql_mode / @@version_comment / @@character_set_server 等
-	if p.peek().kind == "sym" && p.peek().val == "@" {
+	save := p.i
+	var cols []string
+	var vals []interface{}
+	for {
+		name, val, ok := db.parseScalarExpr(p)
+		if !ok {
+			p.i = save
+			return nil, nil, nil
+		}
+		cols = append(cols, name)
+		vals = append(vals, val)
+		// 可选的 AS 别名
+		if p.matchKeyword("AS") {
+			if t := p.peek(); t.kind == "ident" || t.kind == "kw" {
+				cols[len(cols)-1] = t.val
+				p.next()
+			}
+		}
+		if p.peek().kind == "sym" && p.peek().val == "," {
+			p.next()
+			continue
+		}
+		break
+	}
+	// 尾部可选 LIMIT 1 / 分号
+	p.matchKeyword("LIMIT")
+	if t := p.peek(); t.kind == "num" {
 		p.next()
+	}
+	// 必须是语句结尾（无 FROM），否则交给常规 SELECT 解析
+	if t := p.peek(); t.kind != "eof" && !(t.kind == "sym" && t.val == ";") {
+		p.i = save
+		return nil, nil, nil
+	}
+	columns = cols
+	rows = [][]interface{}{vals}
+	return
+}
+
+// parseScalarExpr 解析单个标量表达式：@@var、函数调用、字符串或数字。
+func (db *DB) parseScalarExpr(p *sqlParser) (name string, val interface{}, ok bool) {
+	t := p.peek()
+	// @@变量：tokenizer 将 @@ 拆为两个 @ 符号，后接 [session.|global.]ident[.ident]
+	if t.kind == "sym" && t.val == "@" {
+		p.next()
+		if p.peek().kind == "sym" && p.peek().val == "@" {
+			p.next()
+		}
 		var sb strings.Builder
-		sb.WriteString("@@")
-		first := true
 		for {
-			t := p.peek()
-			if t.kind == "ident" || t.kind == "kw" || (t.kind == "sym" && t.val == ".") {
-				if !first && t.kind == "sym" {
-					sb.WriteString(t.val)
-					p.next()
-					continue
-				}
-				sb.WriteString(t.val)
-				first = false
+			nt := p.peek()
+			if nt.kind == "ident" || nt.kind == "kw" {
+				sb.WriteString(nt.val)
+				p.next()
+				continue
+			}
+			if nt.kind == "sym" && nt.val == "." {
+				sb.WriteString(".")
 				p.next()
 				continue
 			}
 			break
 		}
-		name := strings.ToLower(strings.TrimPrefix(sb.String(), "@"))
-		name = strings.TrimPrefix(name, "session.")
-		name = strings.TrimPrefix(name, "global.")
-		val := mysqlCfg.get().Variables[name]
-		if val == "" {
-			switch name {
-			case "version_comment":
-				val = "tsumugi"
-			case "character_set_server", "character_set_database", "character_set_connection", "character_set_results":
-				val = "utf8mb4"
-			case "collation_server", "collation_database", "collation_connection":
-				val = "utf8mb4_unicode_ci"
-			case "lower_case_table_names":
-				val = "0"
-			case "max_allowed_packet":
-				val = "67108864"
-			case "time_zone":
-				val = "SYSTEM"
-			case "version":
-				val = mysqlCfg.get().Version
-			case "have_ssl":
-				val = "DISABLED"
-			}
+		if sb.Len() == 0 {
+			return "", nil, false
 		}
-		columns = []string{"@" + strings.TrimPrefix(name, "@")}
-		rows = [][]interface{}{{val}}
-		return
+		name = sb.String()
+		// 列名必须带 @@ 前缀（phpMyAdmin 按 $row['@@version'] 等读取）
+		colName := "@@" + name
+		return colName, db.systemVar(name), true
 	}
-	// 函数调用：SELECT VERSION(), NOW(), DATABASE(), CURRENT_USER(), CONNECTION_ID() 等
-	if t := p.peek(); t.kind == "ident" {
+	// 函数调用：IDENT( 形式
+	if t.kind == "ident" {
 		fn := strings.ToUpper(t.val)
-		// 需要紧跟 (
 		save := p.i
 		p.next()
-		// COUNT 聚合交给 parseSelect 的 countSelect 专门路径处理
-		if fn == "COUNT" {
-			p.i = save
-			return
-		}
 		if p.peek().kind == "sym" && p.peek().val == "(" {
-			p.next()
-			p.matchSym(")") // 可选参数，忽略内容
-			for p.matchSym(",") {
-				p.next()
-				p.matchSym(")")
+			// 跳过括号内内容（含嵌套括号/字符串），仅消费 token
+			depth := 1
+			p.next() // 消费 (
+			for depth > 0 {
+				tok := p.next()
+				if tok.kind == "eof" {
+					p.i = save
+					return "", nil, false
+				}
+				if tok.kind == "sym" {
+					if tok.val == "(" {
+						depth++
+					} else if tok.val == ")" {
+						depth--
+					}
+				}
 			}
-			columns = []string{strings.ToLower(fn)}
 			switch fn {
 			case "VERSION":
-				rows = [][]interface{}{{mysqlCfg.get().Version}}
-			case "NOW", "CURRENT_TIMESTAMP", "CURRENT_TIME":
-				rows = [][]interface{}{{time.Now().Format("2006-01-02 15:04:05")}}
+				val = mysqlCfg.get().Version
+			case "NOW", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP":
+				val = time.Now().Format("2006-01-02 15:04:05")
 			case "DATABASE", "SCHEMA":
-				rows = [][]interface{}{{db.getCurDB()}}
-			case "CURRENT_USER", "USER", "SESSION_USER":
+				val = db.getCurDB()
+			case "CURRENT_USER", "USER", "SESSION_USER", "SYSTEM_USER":
 				usr := ""
 				if len(mysqlCfg.get().Users) > 0 {
 					usr = mysqlCfg.get().Users[0].User + "@" + mysqlCfg.get().Users[0].Host
 				}
-				rows = [][]interface{}{{usr}}
+				val = usr
 			case "CONNECTION_ID":
-				rows = [][]interface{}{{int64(1)}}
+				val = int64(1)
 			case "COLLATION":
-				rows = [][]interface{}{{"utf8mb4_unicode_ci"}}
+				val = "utf8mb4_unicode_ci"
 			case "CHARSET":
-				rows = [][]interface{}{{"utf8mb4"}}
+				val = "utf8mb4"
+			case "FOUND_ROWS":
+				val = int64(0)
+			case "ROW_COUNT":
+				val = int64(0)
+			case "LAST_INSERT_ID":
+				val = int64(0)
+			case "CURRENT_DATE", "CURDATE":
+				val = time.Now().Format("2006-01-02")
+			case "CURTIME":
+				val = time.Now().Format("15:04:05")
+			case "UUID":
+				val = newUUID()
 			default:
-				rows = [][]interface{}{{""}}
+				val = ""
 			}
-			return
+			return strings.ToLower(fn), val, true
 		}
 		p.i = save
+		return "", nil, false
 	}
-	return
+	// 字符串或数字字面量
+	if t.kind == "str" {
+		p.next()
+		return t.val, t.val, true
+	}
+	if t.kind == "num" {
+		p.next()
+		if n, e := strconv.ParseInt(t.val, 10, 64); e == nil {
+			return t.val, n, true
+		}
+		return t.val, t.val, true
+	}
+	return "", nil, false
+}
+
+// systemVar 返回 @@ 系统变量值（含常用兜底，避免 phpMyAdmin 拿空值导致白屏）。
+func (db *DB) systemVar(name string) string {
+	lower := strings.ToLower(name)
+	lower = strings.TrimPrefix(lower, "session.")
+	lower = strings.TrimPrefix(lower, "global.")
+	if v, ok := mysqlCfg.get().Variables[lower]; ok && v != "" {
+		return v
+	}
+	switch lower {
+	case "version_comment":
+		return "tsumugi"
+	case "character_set_server", "character_set_database", "character_set_connection", "character_set_results", "character_set_client":
+		return "utf8mb4"
+	case "collation_server", "collation_database", "collation_connection":
+		return "utf8mb4_unicode_ci"
+	case "lower_case_table_names":
+		return "0"
+	case "max_allowed_packet":
+		return "67108864"
+	case "time_zone", "system_time_zone":
+		return "SYSTEM"
+	case "version":
+		return mysqlCfg.get().Version
+	case "have_ssl":
+		return "DISABLED"
+	case "sql_mode":
+		return "NO_ENGINE_SUBSTITUTION"
+	case "auto_increment_increment":
+		return "1"
+	case "init_connect", "license":
+		return ""
+	case "interactive_timeout", "wait_timeout":
+		return "28800"
+	case "net_buffer_length":
+		return "16384"
+	case "net_write_timeout":
+		return "60"
+	case "performance_schema":
+		return "0"
+	case "query_cache_size", "query_cache_type":
+		return "0"
+	case "transaction_isolation":
+		return "REPEATABLE-READ"
+	case "character_set_system":
+		return "utf8mb3"
+	}
+	return ""
+}
+
+// newUUID 生成一个 v4 UUID 字符串（标准库无 UUID，直接按 RFC 4122 生成）。
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
