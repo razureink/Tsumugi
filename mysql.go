@@ -22,10 +22,10 @@ import (
 // 支持语句由 runSQL 解析器决定（SELECT/SHOW/DESCRIBE/INSERT/UPDATE/DELETE/CREATE/DROP + 事务）。
 
 const (
-	protocolVersion   = 10
-	defaultCollation  = 45 // utf8mb4_general_ci
-	statusAutocommit  = 0x0002
-	longFlagOpened    = 0x0080
+	protocolVersion  = 10
+	defaultCollation = 45 // utf8mb4_general_ci
+	statusAutocommit = 0x0002
+	longFlagOpened   = 0x0080
 
 	comQuit         = 0x01
 	comInitDB       = 0x02
@@ -77,7 +77,7 @@ type mysqlConn struct {
 	seq      uint8
 	user     string
 	scramble []byte
-	nextStmt uint32           // 下一个可用的 prepared 语句 ID
+	nextStmt uint32 // 下一个可用的 prepared 语句 ID
 	prepared map[uint32]*mysqlPreparedStmt
 	longData map[uint32][]byte // COM_STMT_SEND_LONG_DATA 累积缓冲
 	inTxn    bool
@@ -540,12 +540,12 @@ func (mc *mysqlConn) handlePrepare(sql string) {
 	mc.prepared[id] = &mysqlPreparedStmt{id: id, sql: sql, paramCount: n, toks: toks}
 
 	var buf []byte
-	buf = append(buf, 0x00)                  // status OK
-	buf = appendU32LE(buf, id)               // statement id
-	buf = appendU16LE(buf, 0)                // column count（EXECUTE 时下发真实列定义）
-	buf = appendU16LE(buf, uint16(n))        // parameter count
-	buf = append(buf, 0x00)                  // filler
-	buf = appendU16LE(buf, 0)                // warning count
+	buf = append(buf, 0x00)           // status OK
+	buf = appendU32LE(buf, id)        // statement id
+	buf = appendU16LE(buf, 0)         // column count（EXECUTE 时下发真实列定义）
+	buf = appendU16LE(buf, uint16(n)) // parameter count
+	buf = append(buf, 0x00)           // filler
+	buf = appendU16LE(buf, 0)         // warning count
 	mc.writePacket(buf)
 
 	// 参数定义包（每参数一个，之后 EOF）
@@ -906,19 +906,19 @@ func (mc *mysqlConn) sendResultSet(columns []string, rows [][]interface{}) {
 	// 每个列定义一个独立包（客户端按列数读取）
 	for i := range columns {
 		buf = buf[:0]
-		buf = appendLenEncStr(buf, "def")          // catalog
-		buf = appendLenEncStr(buf, schema)         // schema
-		buf = appendLenEncStr(buf, "")             // table
-		buf = appendLenEncStr(buf, "")             // org_table
-		buf = appendLenEncStr(buf, columns[i])     // name
-		buf = appendLenEncStr(buf, columns[i])     // org_name
-		buf = appendLenEncInt(buf, 0x0c)           // fixed length field count
-		buf = appendU16LE(buf, defaultCollation)   // charset/transformation
+		buf = appendLenEncStr(buf, "def")        // catalog
+		buf = appendLenEncStr(buf, schema)       // schema
+		buf = appendLenEncStr(buf, "")           // table
+		buf = appendLenEncStr(buf, "")           // org_table
+		buf = appendLenEncStr(buf, columns[i])   // name
+		buf = appendLenEncStr(buf, columns[i])   // org_name
+		buf = appendLenEncInt(buf, 0x0c)         // fixed length field count
+		buf = appendU16LE(buf, defaultCollation) // charset/transformation
 		buf = appendU32LE(buf, mysqlColLen(types[i]))
 		buf = append(buf, types[i])
-		buf = appendU16LE(buf, 0)                  // flags
-		buf = append(buf, 0)                       // decimals
-		buf = appendU16LE(buf, 0)                  // filler
+		buf = appendU16LE(buf, 0) // flags
+		buf = append(buf, 0)      // decimals
+		buf = appendU16LE(buf, 0) // filler
 		mc.writePacket(buf)
 	}
 	buf = buf[:0]

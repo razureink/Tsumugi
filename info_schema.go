@@ -158,12 +158,7 @@ func projectInfoRows(allCols []string, recs []map[string]interface{}, selectCols
 	idx := make([]int, 0, len(selectCols))
 	cols := make([]string, 0, len(selectCols))
 	for _, sc := range selectCols {
-		src := sc
-		if colSrc != nil {
-			if s, ok := colSrc[strings.ToLower(sc)]; ok {
-				src = s
-			}
-		}
+		src := srcColumn(colSrc, sc)
 		for i, c := range allCols {
 			if strings.EqualFold(src, c) {
 				idx = append(idx, i)
@@ -402,12 +397,19 @@ func (db *DB) infoSchemaRecords(name string) []map[string]interface{} {
 	return nil
 }
 
+// tableRef 标识一个（库, 表）引用；Table 为空表示库级操作。
+type tableRef struct {
+	DB    string
+	Table string
+}
+
 // splitQualifiedTable 拆 "schema.table" 物理表名为 (schema, table)；无前缀视为 tsumugi 库。
 func splitQualifiedTable(name string) (string, string) {
+	schema := dbOfTable(name)
 	if i := strings.IndexByte(name, '.'); i >= 0 {
-		return name[:i], name[i+1:]
+		return schema, name[i+1:]
 	}
-	return "tsumugi", name
+	return schema, name
 }
 
 // infoSchemaTableExists 判断是否存在的 information_schema 虚拟表。
@@ -417,21 +419,21 @@ func infoSchemaTableExists(name string) bool {
 }
 
 // qualifyForDB 解析 "表名" 为当前库内的物理表名（用于 SHOW COLUMNS 等无逗号场景）。
-func (db *DB) qualifyForDB(dbName, table string) string {
-	if strings.Contains(table, ".") {
-		return table
+func (db *DB) qualifyForDB(ref tableRef) string {
+	if strings.Contains(ref.Table, ".") {
+		return ref.Table
 	}
-	if dbName == "" || dbName == "tsumugi" {
-		return table
+	if ref.DB == "" || ref.DB == "tsumugi" {
+		return ref.Table
 	}
-	return dbName + "." + table
+	return ref.DB + "." + ref.Table
 }
 
 // describeTable 实现 SHOW [FULL] COLUMNS FROM tbl [FROM db]。
-func (db *DB) describeTable(dbName, table string) (columns []string, rows [][]interface{}, err error) {
-	t := db.getTable(db.qualifyForDB(dbName, table))
+func (db *DB) describeTable(ref tableRef) (columns []string, rows [][]interface{}, err error) {
+	t := db.getTable(db.qualifyForDB(ref))
 	if t == nil {
-		err = fmt.Errorf("table not found: %s", table)
+		err = fmt.Errorf("table not found: %s", ref.Table)
 		return
 	}
 	columns = []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
@@ -482,10 +484,10 @@ func (db *DB) tableStatus(dbName string) (columns []string, rows [][]interface{}
 }
 
 // showIndex 实现 SHOW INDEX FROM tbl [FROM db]。
-func (db *DB) showIndex(dbName, table string) (columns []string, rows [][]interface{}, err error) {
-	t := db.getTable(db.qualifyForDB(dbName, table))
+func (db *DB) showIndex(ref tableRef) (columns []string, rows [][]interface{}, err error) {
+	t := db.getTable(db.qualifyForDB(ref))
 	if t == nil {
-		err = fmt.Errorf("table not found: %s", table)
+		err = fmt.Errorf("table not found: %s", ref.Table)
 		return
 	}
 	columns = []string{
@@ -493,11 +495,11 @@ func (db *DB) showIndex(dbName, table string) (columns []string, rows [][]interf
 		"Collation", "Cardinality", "Sub_part", "Packed", "Null", "Index_type",
 		"Comment", "Index_comment", "Visible",
 	}
-	show := strings.TrimPrefix(t.meta.Name, dbName+".")
-	if dbName == "" || dbName == "tsumugi" {
+	show := strings.TrimPrefix(t.meta.Name, ref.DB+".")
+	if ref.DB == "" || ref.DB == "tsumugi" {
 		show = strings.TrimPrefix(t.meta.Name, "tsumugi.")
 	}
-	if i := strings.LastIndexByte(show, '.'); i >= 0 && dbName == "" {
+	if i := strings.LastIndexByte(show, '.'); i >= 0 && ref.DB == "" {
 		show = show[i+1:]
 	}
 	seq := 0
@@ -544,44 +546,16 @@ func (db *DB) createTableStmt(tblName string) string {
 // countSelect 处理 SELECT COUNT(*) FROM tbl [WHERE ..]。
 // 目前仅支持纯等值 WHERE（phpMyAdmin 惯例即如此）。
 func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
-	tableName, e := p.readTableIdent()
+	tableName, e := p.readQualifiedTable()
 	if e != nil {
 		err = e
 		return
 	}
-	for p.peek().kind == "sym" && p.peek().val == "." {
-		p.next()
-		part, pe := p.readTableIdent()
-		if pe != nil {
-			err = pe
-			return
-		}
-		tableName += "." + part
-	}
-	conds := map[string]interface{}{}
 	if strings.HasPrefix(strings.ToLower(tableName), "information_schema.") {
-		if p.matchKeyword("WHERE") {
-			for {
-				f, e := p.parseIdent()
-				if e != nil {
-					err = e
-					return
-				}
-				op := p.next()
-				if op.kind != "sym" || op.val != "=" {
-					err = fmt.Errorf("unsupported condition in COUNT")
-					return
-				}
-				v, e := p.parseValue()
-				if e != nil {
-					err = e
-					return
-				}
-				conds[f] = v
-				if !p.matchKeyword("AND") {
-					break
-				}
-			}
+		conds, ce := p.parseEqConds()
+		if ce != nil {
+			err = ce
+			return
 		}
 		it := strings.ToLower(strings.TrimPrefix(tableName, "information_schema."))
 		_, recs, e := db.queryInfoSchema(it, conds, nil, nil)
@@ -603,32 +577,10 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		err = fmt.Errorf("table not found: %s", tableName)
 		return
 	}
-	if p.matchKeyword("WHERE") {
-		for {
-			f, e := p.parseIdent()
-			if e != nil {
-				err = e
-				return
-			}
-			op := p.next()
-			if op.kind != "sym" {
-				err = fmt.Errorf("unsupported condition in COUNT")
-				return
-			}
-			if op.val != "=" {
-				err = fmt.Errorf("unsupported condition in COUNT")
-				return
-			}
-			v, e := p.parseValue()
-			if e != nil {
-				err = e
-				return
-			}
-			conds[f] = v
-			if !p.matchKeyword("AND") {
-				break
-			}
-		}
+	conds, ce := p.parseEqConds()
+	if ce != nil {
+		err = ce
+		return
 	}
 	// 物理表计数：遍历计数而非大 limit 预分配（避免 OOM）
 	var count int64
@@ -759,11 +711,7 @@ func (db *DB) parseScalarExpr(p *sqlParser) (name string, val interface{}, ok bo
 			case "DATABASE", "SCHEMA":
 				val = db.getCurDB()
 			case "CURRENT_USER", "USER", "SESSION_USER", "SYSTEM_USER":
-				usr := ""
-				if len(mysqlCfg.get().Users) > 0 {
-					usr = mysqlCfg.get().Users[0].User + "@" + mysqlCfg.get().Users[0].Host
-				}
-				val = usr
+				val = mysqlCfg.defaultUser()
 			case "CONNECTION_ID":
 				val = int64(1)
 			case "COLLATION":

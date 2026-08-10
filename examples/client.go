@@ -1,7 +1,8 @@
 // 示例客户端：演示如何通过二进制 TCP 协议与 Tsumugi 服务器交互。
 //
 // 运行方式（先启动服务端：go run .）：
-//   go run ./examples
+//
+//	go run ./examples
 package main
 
 import (
@@ -146,8 +147,8 @@ func selectAll(c net.Conn) error {
 	buf.WriteByte(CMD_SELECT)
 	writeStr(&buf, "users")
 	binary.Write(&buf, binary.BigEndian, uint16(0)) // 无条件
-	buf.WriteByte(0)                                 // hasMin
-	buf.WriteByte(0)                                 // hasMax
+	buf.WriteByte(0)                                // hasMin
+	buf.WriteByte(0)                                // hasMax
 	if _, err := c.Write(buf.Bytes()); err != nil {
 		return err
 	}

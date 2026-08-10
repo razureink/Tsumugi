@@ -22,7 +22,7 @@ func TestAdminDBManage(t *testing.T) {
 	if j["ok"] != true {
 		t.Fatalf("create db: %v", rec.Body.String())
 	}
-	if !contains(falsyDatabases(j["databases"]), "my_db") {
+	if !contains(asDBList(j["databases"]), "my_db") {
 		t.Fatalf("databases list should include my_db, got %v", j["databases"])
 	}
 
@@ -54,7 +54,8 @@ func TestAdminDBManage(t *testing.T) {
 	}
 }
 
-func falsyDatabases(v interface{}) []interface{} {
+// asDBList 把 JSON 解码后的 databases 数组断言为 []interface{}，失败返回 nil。
+func asDBList(v interface{}) []interface{} {
 	if a, ok := v.([]interface{}); ok {
 		return a
 	}

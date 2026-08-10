@@ -145,9 +145,9 @@ func isKeyword(u string) bool {
 type sqlParser struct {
 	toks     []sqlToken
 	i        int
-	params   []interface{}   // 非 nil 时表示处于参数绑定模式（prepared execute）
-	paramIdx int            // 已消费的参数下标
-	txnID    uint64         // 当前事务 ID（0 表示自动提交）
+	params   []interface{} // 非 nil 时表示处于参数绑定模式（prepared execute）
+	paramIdx int           // 已消费的参数下标
+	txnID    uint64        // 当前事务 ID（0 表示自动提交）
 }
 
 // hasParams 报告解析器是否处于参数绑定模式。
@@ -244,23 +244,12 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 				err = e
 				return
 			}
-			dbName := db.getCurDB()
-			if p.matchKeyword("FROM") {
-				if t := p.next(); t.kind == "ident" || t.kind == "str" {
-					dbName = t.val
-				}
-			}
-			columns, rows, err = db.describeTable(dbName, tbl)
+			columns, rows, err = db.describeTable(tableRef{p.readOptionalDBName(db.getCurDB()), tbl})
 			return
 		}
 		// SHOW TABLE STATUS FROM db [LIKE '..']
 		if p.matchKeyword("TABLE") && p.matchKeyword("STATUS") {
-			dbName := db.getCurDB()
-			if p.matchKeyword("FROM") {
-				if d := p.next(); d.kind == "ident" || d.kind == "str" {
-					dbName = d.val
-				}
-			}
+			dbName := p.readOptionalDBName(db.getCurDB())
 			for p.matchKeyword("LIKE") {
 				p.next()
 			}
@@ -278,13 +267,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 				err = e
 				return
 			}
-			dbName := db.getCurDB()
-			if p.matchKeyword("FROM") {
-				if d := p.next(); d.kind == "ident" || d.kind == "str" {
-					dbName = d.val
-				}
-			}
-			columns, rows, err = db.showIndex(dbName, tbl)
+			columns, rows, err = db.showIndex(tableRef{p.readOptionalDBName(db.getCurDB()), tbl})
 			return
 		}
 		// SHOW CREATE TABLE / CREATE DATABASE / CREATE VIEW
@@ -318,8 +301,8 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		// SHOW GRANTS [FOR user@host]
 		if p.matchKeyword("GRANTS") {
 			grantees := "CURRENT_USER"
-			if len(mysqlCfg.get().Users) > 0 {
-				grantees = mysqlCfg.get().Users[0].User + "@" + mysqlCfg.get().Users[0].Host
+			if g := mysqlCfg.defaultUser(); g != "" {
+				grantees = g
 			}
 			columns = []string{"Grants for " + grantees}
 			for _, u := range mysqlCfg.get().Users {
@@ -534,7 +517,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		}
 		err = fmt.Errorf("table not found: %s", nameTok.val)
 		return
-case "SELECT":
+	case "SELECT":
 		return db.parseSelect(p)
 	case "INSERT":
 		return db.parseInsert(p)
@@ -573,20 +556,88 @@ func countSQLParams(sql string) int {
 }
 
 func (p *sqlParser) parseIdent() (string, error) {
+	return p.readName(false)
+}
+
+// readTableIdent 读取表名/库表名标识符；关键字也可作表名（如 information_schema.TABLES、mysql.KILL）。
+func (p *sqlParser) readTableIdent() (string, error) {
+	return p.readName(true)
+}
+
+// readName 读取标识符（allowKeyword 时允许关键字）；字符串字面量始终允许。
+func (p *sqlParser) readName(allowKeyword bool) (string, error) {
 	t := p.next()
-	if t.kind != "ident" && t.kind != "str" {
+	ok := t.kind == "ident" || t.kind == "str" || (allowKeyword && t.kind == "kw")
+	if !ok {
 		return "", fmt.Errorf("expected identifier, got %q", t.val)
 	}
 	return t.val, nil
 }
 
-// readTableIdent 读取表名/库表名标识符；关键字也可作表名（如 information_schema.TABLES、mysql.KILL）。
-func (p *sqlParser) readTableIdent() (string, error) {
-	t := p.next()
-	if t.kind != "ident" && t.kind != "kw" && t.kind != "str" {
-		return "", fmt.Errorf("expected identifier, got %q", t.val)
+// readQualifiedTable 读取表名并消费 "db.table" 形式的点号拼接。
+func (p *sqlParser) readQualifiedTable() (string, error) {
+	name, e := p.readTableIdent()
+	if e != nil {
+		return "", e
 	}
-	return t.val, nil
+	for p.peek().kind == "sym" && p.peek().val == "." {
+		p.next()
+		part, pe := p.readTableIdent()
+		if pe != nil {
+			return "", pe
+		}
+		name += "." + part
+	}
+	return name, nil
+}
+
+// readOptionalDBName 读取可选的 "FROM db" 子句；缺省或后续非名称时返回 cur。
+func (p *sqlParser) readOptionalDBName(cur string) string {
+	if !p.matchKeyword("FROM") {
+		return cur
+	}
+	if d := p.next(); d.kind == "ident" || d.kind == "str" {
+		return d.val
+	}
+	return cur
+}
+
+// parseEqConds 解析纯等值 WHERE（仅支持 "=" 与 AND，phpMyAdmin 惯例），
+// 返回字段名 -> 值映射；无 WHERE 时返回空映射。
+func (p *sqlParser) parseEqConds() (map[string]interface{}, error) {
+	conds := map[string]interface{}{}
+	if !p.matchKeyword("WHERE") {
+		return conds, nil
+	}
+	for {
+		f, e := p.parseIdent()
+		if e != nil {
+			return nil, e
+		}
+		op := p.next()
+		if op.kind != "sym" || op.val != "=" {
+			return nil, fmt.Errorf("unsupported condition in COUNT")
+		}
+		v, e := p.parseValue()
+		if e != nil {
+			return nil, e
+		}
+		conds[f] = v
+		if !p.matchKeyword("AND") {
+			break
+		}
+	}
+	return conds, nil
+}
+
+// srcColumn 按 colSrc 别名映射返回输出列名对应的源列名；无映射时原样返回。
+func srcColumn(colSrc map[string]string, colName string) string {
+	if colSrc != nil {
+		if s, ok := colSrc[strings.ToLower(colName)]; ok {
+			return s
+		}
+	}
+	return colName
 }
 
 func (p *sqlParser) parseValue() (interface{}, error) {
@@ -628,7 +679,6 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	if isCount {
 		p.next() // COUNT
 		p.next() // (
-		inExpr := false
 		for {
 			t := p.next()
 			if t.kind == "sym" && t.val == ")" {
@@ -638,15 +688,11 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 				err = fmt.Errorf("expected ) in COUNT")
 				return
 			}
-			if t.kind == "ident" {
-				inExpr = true
-			}
 		}
 		if !p.matchKeyword("FROM") {
 			err = fmt.Errorf("expected FROM")
 			return
 		}
-		_ = inExpr
 		columns, rows, affected, rawMsg, err = db.countSelect(p)
 		return
 	}
@@ -703,20 +749,10 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		err = fmt.Errorf("expected FROM")
 		return
 	}
-	tableName, e := p.readTableIdent()
+	tableName, e := p.readQualifiedTable()
 	if e != nil {
 		err = e
 		return
-	}
-	// 支持 mysql.user 形式（tokenizer 拆成 mysql . user）
-	for p.peek().kind == "sym" && p.peek().val == "." {
-		p.next()
-		part, pe := p.readTableIdent()
-		if pe != nil {
-			err = pe
-			return
-		}
-		tableName += "." + part
 	}
 	// 非 mysql.* 且无前缀时按当前数据库解析（仅非默认库加前缀）
 	if !strings.HasPrefix(strings.ToLower(tableName), "mysql.") {
@@ -1044,14 +1080,6 @@ func rangeOp(op string) string {
 // queryMysqlTable 处理 SELECT ... FROM mysql.<table> 虚拟系统表。
 func (db *DB) queryMysqlTable(name string, conds map[string]interface{}, selectCols []string, colSrc map[string]string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	mc := mysqlCfg.get()
-	srcOf := func(c string) string {
-		if colSrc != nil {
-			if s, ok := colSrc[strings.ToLower(c)]; ok {
-				return s
-			}
-		}
-		return c
-	}
 	project := func(rec map[string]interface{}) []interface{} {
 		if selectCols == nil {
 			row := make([]interface{}, 0, len(rec))
@@ -1062,7 +1090,7 @@ func (db *DB) queryMysqlTable(name string, conds map[string]interface{}, selectC
 		}
 		row := make([]interface{}, 0, len(selectCols))
 		for _, c := range selectCols {
-			row = append(row, rec[strings.ToLower(srcOf(c))])
+			row = append(row, rec[strings.ToLower(srcColumn(colSrc, c))])
 		}
 		return row
 	}
@@ -1611,6 +1639,7 @@ func (db *DB) dropTableByName(name string) error {
 // parseAlterTable 处理 ALTER TABLE：
 //   - ALTER TABLE t ADD COLUMN name TYPE [LENGTH]  （追加列，向后兼容已编码行）
 //   - ALTER TABLE t RENAME TO new
+//
 // 仅支持向表末尾追加列与重命名；不改变既有字段顺序（避免破坏既有 WAL 行编码）。
 func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	p.next() // ALTER

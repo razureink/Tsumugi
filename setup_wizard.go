@@ -179,16 +179,7 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 <script>
 /*__I18N__*/
 function $(id){return document.getElementById(id);}
-var LANG_CODES=['zh','en','ja','ko','fr','de','es','pt','ru','vi'];
 var rootPassword='';
-function curLang(){var v=localStorage.getItem('tsumugi_lang');if(v&&LANG_CODES.indexOf(v)>=0)return v;var n=(navigator.language||'zh').toLowerCase().split('-')[0];return LANG_CODES.indexOf(n)>=0?n:'zh';}
-function langName(c){for(var i=0;i<(I18N_LANGS||[]).length;i++){if(I18N_LANGS[i].code===c)return I18N_LANGS[i].name;}return c;}
-function t(k){
-  var v=I18N_TEXT[k];var c=curLang();
-  var s=v?(v[c]||v.en||v.zh||('['+k+']')):('['+k+']');
-  var args=Array.prototype.slice.call(arguments,1);
-  return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});
-}
 function applyTexts(){
   var c=curLang();
   document.documentElement.lang=c;
@@ -362,14 +353,6 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 <script>
 /*__I18N__*/
 function $(id){return document.getElementById(id);}
-var LANG_CODES=['zh','en','ja','ko','fr','de','es','pt','ru','vi'];
-function curLang(){var v=localStorage.getItem('tsumugi_lang');if(v&&LANG_CODES.indexOf(v)>=0)return v;var n=(navigator.language||'zh').toLowerCase().split('-')[0];return LANG_CODES.indexOf(n)>=0?n:'zh';}
-function t(k){
-  var v=I18N_TEXT[k];var c=curLang();
-  var s=v?(v[c]||v.en||v.zh||('['+k+']')):('['+k+']');
-  var args=Array.prototype.slice.call(arguments,1);
-  return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});
-}
 (function(){
   var c=curLang();
   document.documentElement.lang=c;

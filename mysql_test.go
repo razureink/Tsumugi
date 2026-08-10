@@ -95,16 +95,16 @@ func TestMySQLProtocol(t *testing.T) {
 	version := string(pkt[1:pos])
 	pos++ // skip null
 	t.Logf("server version: %s", version)
-	_ = pkt[pos : pos+4]  // thread id
+	_ = pkt[pos : pos+4] // thread id
 	pos += 4
 	authData1 := pkt[pos : pos+8]
-	pos += 9 // 8+1 null
+	pos += 9                                  // 8+1 null
 	_ = binary.LittleEndian.Uint16(pkt[pos:]) // caps
 	pos += 2
-	pos++ // collation
-	pos += 2 // status
-	pos += 2 // caps upper
-	pos++    // auth data len
+	pos++     // collation
+	pos += 2  // status
+	pos += 2  // caps upper
+	pos++     // auth data len
 	pos += 10 // reserved
 	authData2 := pkt[pos : pos+12]
 	pos += 13 // auth data 12+null
@@ -128,11 +128,11 @@ func TestMySQLProtocol(t *testing.T) {
 	var caps [4]byte
 	binary.LittleEndian.PutUint16(caps[:], 0x8d40)
 	var authBuf bytes.Buffer
-	authBuf.Write(caps[:]) // client capabilities
+	authBuf.Write(caps[:])               // client capabilities
 	authBuf.Write([]byte{0, 0, 0, 0x01}) // max packet
-	authBuf.Write([]byte{8})         // charset utf8
-	authBuf.Write(make([]byte, 23))  // reserved
-	authBuf.Write([]byte("root"))    // user
+	authBuf.Write([]byte{8})             // charset utf8
+	authBuf.Write(make([]byte, 23))      // reserved
+	authBuf.Write([]byte("root"))        // user
 	authBuf.Write([]byte{0})
 	authBuf.WriteByte(byte(len(authResp)))
 	authBuf.Write(authResp)
@@ -252,12 +252,12 @@ func TestMySQLPrepared(t *testing.T) {
 	var exec []byte
 	exec = append(exec, comStmtExecute)
 	exec = appendU32Little(exec, stmtID)
-	exec = append(exec, 0)           // flags
-	exec = appendU32Little(exec, 1)  // iteration count
-	exec = append(exec, 0x00)        // null bitmap: not null
-	exec = append(exec, 0x01)        // new_params_bound_flag
-	exec = append(exec, 0x08, 0x00)  // LONGLONG, unsigned
-	exec = appendU64Little(exec, 2)  // value = 2
+	exec = append(exec, 0)          // flags
+	exec = appendU32Little(exec, 1) // iteration count
+	exec = append(exec, 0x00)       // null bitmap: not null
+	exec = append(exec, 0x01)       // new_params_bound_flag
+	exec = append(exec, 0x08, 0x00) // LONGLONG, unsigned
+	exec = appendU64Little(exec, 2) // value = 2
 	c.write(exec)
 
 	// 消费结果集：列数、2 列定义、EOF、行、EOF
@@ -798,9 +798,9 @@ func BenchmarkMySQLQuery(b *testing.B) {
 	authData1 := hs[pos : pos+8]
 	pos += 9
 	pos += 2 + 1 + 2 + 2 + 1 + 10
-authData2 := hs[pos : pos+12]
+	authData2 := hs[pos : pos+12]
 	pos += 13
-_ = authData1
+	_ = authData1
 	_ = authData2
 	scramble := append(authData1, authData2[:12]...)
 	pass := []byte("password")

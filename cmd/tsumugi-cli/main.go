@@ -399,8 +399,6 @@ func repl(o options) {
 	fmt.Print(tr("welcome"))
 	sc := bufio.NewScanner(os.Stdin)
 	hist := loadHistory()
-	idx := len(hist) // 暂未实现上下翻历史
-	_ = idx
 	for {
 		fmt.Print("tsumugi> ")
 		if !sc.Scan() {
@@ -651,7 +649,8 @@ func quoteCSV(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-func runFile(c *client, path string) {	f, err := os.Open(path)
+func runFile(c *client, path string) {
+	f, err := os.Open(path)
 	if err != nil {
 		fail("open: %v", err)
 	}

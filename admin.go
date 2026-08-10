@@ -176,7 +176,7 @@ func (db *DB) handleAdminTables(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	dbName := r.URL.Query().Get("db")
 	if dbName != "" && !u.canUseDB(dbName) {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: database not allowed"})
+		denyJSON(w, "database not allowed")
 		return
 	}
 	tables, err := db.adminTables(dbName)
@@ -211,22 +211,46 @@ func validDBName(name string) bool {
 	return true
 }
 
-// handleAdminDBCreate 新建数据库：写入 mysqlCfg.Databases（持久化），
-// 与 SQL 控制台 CREATE DATABASE 走同一引擎路径，保证各处列表同步。
-func (db *DB) handleAdminDBCreate(w http.ResponseWriter, r *http.Request) {
+// denyJSON 写统一格式的拒绝响应（permission denied 前缀）。
+func denyJSON(w http.ResponseWriter, reason string) {
+	msg := "permission denied"
+	if reason != "" {
+		msg += ": " + reason
+	}
+	writeJSON(w, map[string]interface{}{"ok": false, "error": msg})
+}
+
+// requireAdmin 校验管理员权限；不满足时写拒绝响应并返回 false。
+func requireAdmin(w http.ResponseWriter, r *http.Request, reason string) bool {
+	if currentUser(r).fullAccess() {
+		return true
+	}
+	denyJSON(w, reason)
+	return false
+}
+
+// adminDBName 解码数据库管理请求，返回去除首尾空白的库名。
+func adminDBName(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var req dbManageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", 400)
+		return "", false
+	}
+	return strings.TrimSpace(req.Name), true
+}
+
+// handleAdminDBCreate 新建数据库：写入 mysqlCfg.Databases（持久化），
+// 与 SQL 控制台 CREATE DATABASE 走同一引擎路径，保证各处列表同步。
+func (db *DB) handleAdminDBCreate(w http.ResponseWriter, r *http.Request) {
+	name, ok := adminDBName(w, r)
+	if !ok {
 		return
 	}
-	name := strings.TrimSpace(req.Name)
 	if !validDBName(name) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid database name"})
 		return
 	}
-	u := currentUser(r)
-	if !u.fullAccess() {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: creating databases is admin-only"})
+	if !requireAdmin(w, r, "creating databases is admin-only") {
 		return
 	}
 	_, _, _, rawMsg, err := db.runSQL("CREATE DATABASE " + name)
@@ -243,12 +267,10 @@ func (db *DB) handleAdminDBCreate(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminDBDrop 删除数据库（连同库下所有表）。系统内置库受保护。
 func (db *DB) handleAdminDBDrop(w http.ResponseWriter, r *http.Request) {
-	var req dbManageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", 400)
+	name, ok := adminDBName(w, r)
+	if !ok {
 		return
 	}
-	name := strings.TrimSpace(req.Name)
 	for _, sys := range []string{"information_schema", "mysql", "performance_schema", "sys"} {
 		if strings.EqualFold(name, sys) {
 			writeJSON(w, map[string]interface{}{"ok": false, "error": "system database cannot be dropped"})
@@ -259,9 +281,7 @@ func (db *DB) handleAdminDBDrop(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid database name"})
 		return
 	}
-	u := currentUser(r)
-	if !u.fullAccess() {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: dropping databases is admin-only"})
+	if !requireAdmin(w, r, "dropping databases is admin-only") {
 		return
 	}
 	_, _, _, _, err := db.runSQL("DROP DATABASE " + name)
@@ -285,7 +305,7 @@ func (db *DB) handleAdminRows(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	table := r.URL.Query().Get("table")
 	if !u.canUseTable(table) {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: table not allowed"})
+		denyJSON(w, "table not allowed")
 		return
 	}
 	afterPK := int64(-1)
@@ -324,7 +344,7 @@ func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !u.canExecTableSQL(req.SQL) {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: statement references tables"})
+		denyJSON(w, "statement references tables")
 		return
 	}
 	columns, rows, affected, rawMsg, err := db.runSQL(req.SQL)
@@ -354,7 +374,7 @@ func (db *DB) handleAdminInsert(w http.ResponseWriter, r *http.Request) {
 	}
 	u := currentUser(r)
 	if !u.canUseTable(req.Table) {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: table not allowed"})
+		denyJSON(w, "table not allowed")
 		return
 	}
 	t := db.getTable(req.Table)
@@ -392,7 +412,7 @@ func (db *DB) handleAdminDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	u := currentUser(r)
 	if !u.canUseTable(req.Table) {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied: table not allowed"})
+		denyJSON(w, "table not allowed")
 		return
 	}
 	t := db.getTable(req.Table)
@@ -495,7 +515,7 @@ func (db *DB) handleUserList(w http.ResponseWriter, r *http.Request) {
 	user := requireUser(r)
 	u := globalUsers.Get(user)
 	if u == nil || !u.CanManage {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied"})
+		denyJSON(w, "")
 		return
 	}
 	list := globalUsers.List()
@@ -525,7 +545,7 @@ func (db *DB) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 	user := requireUser(r)
 	u := globalUsers.Get(user)
 	if u == nil || !u.CanManage {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied"})
+		denyJSON(w, "")
 		return
 	}
 	var req struct {
@@ -564,7 +584,7 @@ func (db *DB) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 	user := requireUser(r)
 	u := globalUsers.Get(user)
 	if u == nil || !u.CanManage {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied"})
+		denyJSON(w, "")
 		return
 	}
 	var req struct {
@@ -587,7 +607,7 @@ func (db *DB) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 	user := requireUser(r)
 	u := globalUsers.Get(user)
 	if u == nil || !u.CanManage {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "permission denied"})
+		denyJSON(w, "")
 		return
 	}
 	var req struct {

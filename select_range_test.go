@@ -87,8 +87,8 @@ func TestDecodeExpireAt(t *testing.T) {
 // TestCleanExpired 验证过期清理：过期行被删除、未过期行保留、无过期行时索引不重建。
 func TestCleanExpired(t *testing.T) {
 	meta := &TableMeta{
-		PK:     "id",
-		Fields: []Field{{Name: "id", Type: TypeInt}, {Name: "grp", Type: TypeVarchar}},
+		PK:      "id",
+		Fields:  []Field{{Name: "id", Type: TypeInt}, {Name: "grp", Type: TypeVarchar}},
 		Indexes: map[string]string{"ix_grp": "grp"},
 	}
 	tbl := NewTable(meta, nil)
@@ -131,8 +131,8 @@ func TestSQLRange(t *testing.T) {
 	_ = os.MkdirAll(dir, 0755)
 	db, err := NewDB(&Config{
 		WALDir:              dir,
-		WALFile:       "tsumugi.wal",
-		PrivilegeFile: "privileges.json",
+		WALFile:             "tsumugi.wal",
+		PrivilegeFile:       "privileges.json",
 		User:                "root",
 		Password:            "password",
 		FlushInterval:       100 * time.Millisecond,

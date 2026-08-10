@@ -11,7 +11,13 @@ func renderApp(w http.ResponseWriter, db *DB, page string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	html := strings.Replace(appHTML, "__APP_PAGE__", page, 1)
 	html = strings.Replace(html, "/*__I18N__*/", cachedDashDictJS(), 1)
+	html = strings.Replace(html, "/*__PORTS__*/", buildPortsJS(db), 1)
 	fmt.Fprint(w, html)
+}
+
+// buildPortsJS 生成前端端口默认值 JS，避免与 Go 侧默认端口重复维护。
+func buildPortsJS(db *DB) string {
+	return fmt.Sprintf("var PORTS={binary:%d,metrics:%d,mysql:%d};", db.config.Port, db.config.MetricsPort, db.config.MySQLPort)
 }
 
 // appHTML 统一前端：MD3 Expressive，含侧边栏、监控视图与数据管理视图。
@@ -596,22 +602,9 @@ function setRing(id,pct,color){var r=$('ring'+id.charAt(0).toUpperCase()+id.slic
 
 /* ---- i18n ---- */
 /*__I18N__*/
+/*__PORTS__*/
 
-var LANG_CODES=['zh','en','ja','ko','fr','de','es','pt','ru','vi'];
-function lang(){
-  var v=localStorage.getItem('tsumugi_lang');
-  if(v&&LANG_CODES.indexOf(v)>=0)return v;
-  var n=(navigator.language||'zh').toLowerCase().split('-')[0];
-  return LANG_CODES.indexOf(n)>=0?n:'zh';
-}
-function langName(c){for(var i=0;i<(I18N_LANGS||[]).length;i++){if(I18N_LANGS[i].code===c)return I18N_LANGS[i].name;}return c;}
-function t(k){
-  var v=I18N_TEXT[k];
-  var c=lang();
-  var s=v?(v[c]||v.en||v.zh||('['+k+']')):('['+k+']');
-  var args=Array.prototype.slice.call(arguments,1);
-  return s.replace(/\{(\d+)\}/g,function(_,n){return args[+n]!=null?args[+n]:'{'+n+'}';});
-}
+function lang(){return curLang();}
 function applyLang(){
   var c=lang();
   document.documentElement.lang=c;
@@ -750,7 +743,7 @@ async function fetchStats(force){
 function renderSysInfo(d){
   var rows=[
     [t('sysVer'),'<span class="pk-badge" style="background:var(--md-primary-container);color:var(--md-on-primary-container)">'+esc(d.server_version||'Tsumugi-0.1')+'</span>'],
-    [t('sysPort'),esc(d.binary_port)+' · '+t('sysMetrics')+' :'+(location.port||10232)],
+    [t('sysPort'),esc(d.binary_port)+' · '+t('sysMetrics')+' :'+(location.port||PORTS.metrics)],
     [t('sysMysql'),d.mysql_enabled?t('mysqlOn',d.mysql_port):t('mySqlOff')],
     [t('sysTables'),'<b>'+esc(d.table_count||0)+'</b> '+t('unitTables')],
     [t('sysRows'),'<b>'+esc(d.total_rows||0)+'</b> '+t('unitRows')],
@@ -1089,12 +1082,12 @@ async function saveSettings(){
   });
   var body={
     user:$('sUser').value.trim(), password:$('sPassword').value,
-    binary_port:parseInt($('sPort').value)||9999,
-    metrics_port:parseInt($('sMetrics').value)||10232,
+    binary_port:parseInt($('sPort').value)||PORTS.binary,
+    metrics_port:parseInt($('sMetrics').value)||PORTS.metrics,
     durability:$('sDurability').value,
     flush_interval_ms:parseInt($('sFlush').value)||100,
     mysql_enabled:$('sMysqlEnable').checked,
-    mysql_port:parseInt($('sMysqlPort').value)||3309,
+    mysql_port:parseInt($('sMysqlPort').value)||PORTS.mysql,
     auto_compact:$('sAutoCompact').checked,
     compact_idle_seconds:parseInt($('sCompactIdle').value)||60,
     compact_min_wal_mb:parseInt($('sCompactMin').value)||64,

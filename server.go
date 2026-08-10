@@ -121,7 +121,7 @@ type Session struct {
 // read 从会话缓冲读取指定字节数（优先用 bufio，减少 syscall）。
 // readFull 等价 io.ReadFull(session.conn)。
 func (s *Session) readFull(b []byte) (int, error) { return io.ReadFull(s.br, b) }
-func (s *Session) writeByte(b byte) error          { return s.bw.WriteByte(b) }
+func (s *Session) writeByte(b byte) error         { return s.bw.WriteByte(b) }
 
 // ---- 快速手动编解码（避免 binary.Read/Write 的反射开销） ----
 
