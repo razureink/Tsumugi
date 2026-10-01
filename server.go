@@ -885,15 +885,13 @@ func (s *Server) handleSelect(session *Session) {
 		}
 		return
 	}
-	rows, err := table.Select(conditions, minKey, maxKey)
-	if err != nil {
-		s.writeError(session, err.Error())
-		return
-	}
+	// 条件查询原始字节路径：与上面的无条件路径一致，直接返回树内行编码
+	// 字节（含 version/expireAt 前缀），跳过 Select 的行 map 物化与逐行
+	// encodeRow 重编码——命中行零分配。
+	rawRows := table.SelectRBytesCond(conditions, minKey, maxKey, -1)
 	session.bw.WriteByte(RespRows)
-	wU32(session.bw, uint32(len(rows)))
-	for _, row := range rows {
-		data := encodeRow(table.Meta(), row, 0, 0)
+	wU32(session.bw, uint32(len(rawRows)))
+	for _, data := range rawRows {
 		wU32(session.bw, uint32(len(data)))
 		session.bw.Write(data)
 	}

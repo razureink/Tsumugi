@@ -314,6 +314,23 @@ type TableMeta struct {
 	PK      string
 	Fields  []Field
 	Indexes map[string]string
+
+	// fieldNamesCache SELECT * 列头（字段名列表）的惰性缓存。meta 发布后
+	// 字段集不可变，缓存内容恒等；并发首查重复计算无害（原子发布）。
+	fieldNamesCache atomic.Pointer[[]string]
+}
+
+// fieldNames 返回字段名列表（SELECT * 列头）。调用方只读，不得改写。
+func (m *TableMeta) fieldNames() []string {
+	if p := m.fieldNamesCache.Load(); p != nil {
+		return *p
+	}
+	names := make([]string, len(m.Fields))
+	for i, f := range m.Fields {
+		names[i] = f.Name
+	}
+	m.fieldNamesCache.Store(&names)
+	return names
 }
 
 // 行编码
@@ -489,6 +506,35 @@ func decodeRowFlat(meta *TableMeta, data []byte, into []interface{}) []interface
 	return into
 }
 
+// rowArena 结果行的连续后备存储：一批行共用一个 []interface{} 大块，
+// 每行按 stride 切分，省去每行一次独立 make。块按 4 行起步几何翻倍
+//（小结果集不浪费，大扫描摊薄到对数次分配）；块耗尽换新块——已发出的行
+// 仍引用旧块，别名天然安全。
+type rowArena struct {
+	backing []interface{}
+	stride  int
+}
+
+func newRowArena(stride int) *rowArena {
+	if stride < 1 {
+		stride = 1
+	}
+	return &rowArena{backing: make([]interface{}, 0, stride*4), stride: stride}
+}
+
+func (a *rowArena) row() []interface{} {
+	if len(a.backing)+a.stride > cap(a.backing) {
+		n := (cap(a.backing) / a.stride) * 2
+		if n < 4 {
+			n = 4
+		}
+		a.backing = make([]interface{}, 0, a.stride*n)
+	}
+	start := len(a.backing)
+	a.backing = a.backing[:start+a.stride]
+	return a.backing[start : start+a.stride]
+}
+
 // selectRowsFlat 无 WHERE 条件的全表扫描：直接解码为 []interface{} 行，不建 map。
 // 过期行收集后锁外清理（与 SelectR 一致）。limit<0 表示不限制。
 func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{} {
@@ -499,6 +545,7 @@ func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{}
 		capHint = limit
 	}
 	rows := make([][]interface{}, 0, capHint)
+	arena := newRowArena(len(t.Meta().Fields))
 	var expired []int64
 	now := time.Now().UnixNano()
 	scan := func(key int64, value []byte) bool {
@@ -506,7 +553,7 @@ func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{}
 			expired = append(expired, key)
 			return true
 		}
-		rows = append(rows, decodeRowFlat(t.Meta(), value, nil))
+		rows = append(rows, decodeRowFlat(t.Meta(), value, arena.row()))
 		if limit >= 0 && len(rows) >= limit {
 			return false
 		}
@@ -785,6 +832,50 @@ func (t *Table) indexRemovePK(idxName string, idxKey string, pk int64) {
 	tree.Set(idxKey, newList)
 }
 
+// fieldValueAt 从编码行中按字段下标直接读取一个值（零拷贝字符串别名），
+// 供 Update/Delete 只提取索引列旧值、跳过整行 decodeRow 的场景。
+// 下标越界或行字节截断时返回 nil。
+func (m *TableMeta) fieldValueAt(data []byte, idx int) interface{} {
+	if idx < 0 || idx >= len(m.Fields) {
+		return nil
+	}
+	pos := 16
+	for i := 0; i < idx; i++ {
+		switch m.Fields[i].Type {
+		case TypeInt:
+			pos += 8
+		case TypeVarchar:
+			if pos+2 > len(data) {
+				return nil
+			}
+			pos += 2 + (int(data[pos])<<8 | int(data[pos+1]))
+		case TypeBool:
+			pos++
+		}
+	}
+	switch m.Fields[idx].Type {
+	case TypeInt:
+		v, _ := readI64(data, &pos)
+		return v
+	case TypeVarchar:
+		if pos+2 > len(data) {
+			return nil
+		}
+		l := int(data[pos])<<8 | int(data[pos+1])
+		pos += 2
+		if pos+l > len(data) {
+			return nil
+		}
+		return unsafeString(data[pos : pos+l])
+	case TypeBool:
+		if pos >= len(data) {
+			return nil
+		}
+		return data[pos] == 1
+	}
+	return nil
+}
+
 func (t *Table) Insert(pk int64, row map[string]interface{}, expireAt int64, txnID uint64, replay bool) error {
 	rowData := encodeRow(t.Meta(), row, 0, expireAt)
 	// 先改内存状态，再写 WAL：Compact 持有 walWriteMu 扫描时快照必然一致，
@@ -813,14 +904,19 @@ func (t *Table) InsertOrdered(pk int64, values []interface{}, expireAt int64, tx
 		return fmt.Errorf("primary key %d already exists", pk)
 	}
 	if len(t.Meta().Indexes) > 0 {
-		byName := make(map[string]interface{}, len(values))
-		for i, f := range t.Meta().Fields {
-			if i < len(values) {
-				byName[f.Name] = values[i]
+		// 索引列值按字段下标直接取，不构建每行临时 map
+		meta := t.Meta()
+		for idxName, fieldName := range meta.Indexes {
+			var val interface{}
+			for i := range meta.Fields {
+				if meta.Fields[i].Name == fieldName {
+					if i < len(values) {
+						val = values[i]
+					}
+					break
+				}
 			}
-		}
-		for idxName, fieldName := range t.Meta().Indexes {
-			t.indexAddPK(idxName, t.encodeIndexValue(fieldName, byName[fieldName]), pk)
+			t.indexAddPK(idxName, t.encodeIndexValue(fieldName, val), pk)
 		}
 	}
 	if !replay {
@@ -834,17 +930,19 @@ func (t *Table) InsertOrdered(pk int64, values []interface{}, expireAt int64, tx
 }
 
 func (t *Table) Update(pk int64, row map[string]interface{}, expireAt int64, txnID uint64, replay bool) error {
+	meta := t.Meta()
 	oldData, ok := t.pkTree.Get(pk)
 	if !ok {
 		return fmt.Errorf("row not found")
 	}
-	oldRow, oldVersion, _ := decodeRow(t.Meta(), oldData)
-	newVersion := oldVersion + 1
-	newData := encodeRow(t.Meta(), row, newVersion, expireAt)
+	// 版本号直接读行头，索引列旧值按下标按需提取——不再解码整行 map
+	//（无索引表此前每行 Update 白付一次全字段 map 分配）。
+	newVersion := decodeVersion(oldData) + 1
+	newData := encodeRow(meta, row, newVersion, expireAt)
 
 	t.pkTree.Set(pk, newData)
-	for idxName, fieldName := range t.Meta().Indexes {
-		oldVal := oldRow[fieldName]
+	for idxName, fieldName := range meta.Indexes {
+		oldVal := meta.fieldValueAt(oldData, meta.fieldIndexOf(fieldName))
 		newVal := row[fieldName]
 		t.updateIndex(fieldName, idxName, oldVal, newVal, pk)
 	}
@@ -859,14 +957,15 @@ func (t *Table) Update(pk int64, row map[string]interface{}, expireAt int64, txn
 }
 
 func (t *Table) Delete(pk int64, txnID uint64, replay bool) error {
+	meta := t.Meta()
 	oldData, ok := t.pkTree.Get(pk)
 	if !ok {
 		return fmt.Errorf("row not found")
 	}
-	oldRow, _, _ := decodeRow(t.Meta(), oldData)
 	t.pkTree.Delete(pk)
-	for idxName, fieldName := range t.Meta().Indexes {
-		t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), pk)
+	for idxName, fieldName := range meta.Indexes {
+		oldVal := meta.fieldValueAt(oldData, meta.fieldIndexOf(fieldName))
+		t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldVal), pk)
 	}
 	if !replay {
 		if err := t.writeLog(WALDelete, txnID, pk, nil); err != nil {
@@ -955,88 +1054,70 @@ type RangeCond struct {
 // - minKey/maxKey 显式主键扫描区间（配合主键范围条件，复用树裁剪）
 // - limit<0 表示不限制数量；否则凑够即停止，避免全表物化
 func (t *Table) SelectR(conditions map[string]interface{}, filters []RangeCond, minKey, maxKey *int64, limit int) ([]map[string]interface{}, error) {
+	raw := t.selectRBytes(conditions, filters, minKey, maxKey, limit)
+	meta := t.Meta()
+	result := make([]map[string]interface{}, 0, len(raw))
+	for _, data := range raw {
+		row, _, _ := decodeRow(meta, data)
+		result = append(result, row)
+	}
+	return result, nil
+}
+
+// selectRBytes SelectR 的原始字节内核：主键点查 / 二级索引等值 / 全表扫描
+// 三级分发与 SelectR 语义一致，但返回命中行的原始编码字节（树内 COW 数据，
+// 只读别名安全），不为命中行物化任何中间结构——SQL 路径按需投影，
+// 二进制协议直接把字节写给客户端（行编码格式相同，省去 decode→encode 往返）。
+func (t *Table) selectRBytes(conditions map[string]interface{}, filters []RangeCond, minKey, maxKey *int64, limit int) [][]byte {
+	meta := t.Meta()
+	scan := newScanConds(meta, conditions, filters)
 	// 主键点查优先：等值 + 精确范围
-	if pkVal, ok := conditions[t.Meta().PK]; ok {
+	if pkVal, ok := conditions[meta.PK]; ok {
 		if pk, ok := pkVal.(int64); ok {
 			rowData, found := t.pkTree.Get(pk)
 			if !found {
-				return nil, nil
+				return nil
 			}
 			if e := decodeExpireAt(rowData); e > 0 && time.Now().UnixNano() > e {
 				t.pkTree.Delete(pk)
-				return nil, nil
+				return nil
 			}
-			row, _, _ := decodeRow(t.Meta(), rowData)
-			if matchConditions(row, conditions) && matchRange(row, filters) {
-				return []map[string]interface{}{row}, nil
+			if scan.matchRow(meta, rowData) {
+				return [][]byte{rowData}
 			}
-			return nil, nil
+			return nil
 		}
 	}
 	// 二级索引等值路径
-	for idxName, fieldName := range t.Meta().Indexes {
-		if val, ok := conditions[fieldName]; ok {
-			idxKey := t.encodeIndexValue(fieldName, val)
+	if len(conditions) > 0 {
+		for idxName, fieldName := range meta.Indexes {
+			if val, ok := conditions[fieldName]; ok {
+				idxKey := t.encodeIndexValue(fieldName, val)
 				if tree, ok := t.indexes()[idxName]; ok && tree != nil {
 					if pkList, ok := tree.Get(idxKey); ok {
-						result := make([]map[string]interface{}, 0, len(pkList))
+						result := make([][]byte, 0, len(pkList))
 						for _, pk := range pkList {
 							if rowData, ok := t.pkTree.Get(pk); ok {
 								if e := decodeExpireAt(rowData); e > 0 && time.Now().UnixNano() > e {
 									t.pkTree.Delete(pk)
 									continue
 								}
-								row, _, _ := decodeRow(t.Meta(), rowData)
-								if matchConditions(row, conditions) && matchRange(row, filters) {
-									result = append(result, row)
+								if scan.matchRow(meta, rowData) {
+									result = append(result, rowData)
 									if limit >= 0 && len(result) >= limit {
 										break
 									}
 								}
 							}
 						}
-						return result, nil
+						return result
 					}
 				}
 			}
 		}
-	// 全范围扫描（可被主键范围裁剪）
-	// 预分配上限钳制：LIMIT 值客户端可控，直接用于 make 预分配会被
-	// LIMIT 999999999 之类一次打爆内存（fatal OOM）；大 limit 交给 append 摊还扩容。
-	capHint := 16
-	if limit > 0 && limit <= 4096 {
-		capHint = limit
 	}
-	result := make([]map[string]interface{}, 0, capHint)
-	var expired []int64
-	now := time.Now().UnixNano()
-	scan := func(key int64, value []byte) bool {
-		if e := decodeExpireAt(value); e > 0 && now > e {
-			expired = append(expired, key)
-			return true
-		}
-		row, _, _ := decodeRow(t.Meta(), value)
-		if matchConditions(row, conditions) && matchRange(row, filters) {
-			result = append(result, row)
-			if limit >= 0 && len(result) >= limit {
-				return false
-			}
-		}
-		return true
-	}
-	t.pkTree.scanRangeStop(minKey, maxKey, scan)
-	// 回调持读锁，不能在回调内删除；收集后锁外清理
-	for _, k := range expired {
-		t.pkTree.Delete(k)
-	}
-	return result, nil
-}
-
-// SelectRBytes 范围查询的零分配快速路径：返回原始行字节，跳过 decodeRow 的 map 分配。
-// 仅适用于 conditions==nil && filters==nil 的纯范围扫描场景（如压测）。
-func (t *Table) SelectRBytes(minKey, maxKey *int64, limit int) [][]byte {
-	// 预分配上限钳制：LIMIT 值客户端可控，直接用于 make 预分配会被
-	// LIMIT 999999999 之类一次打爆内存（fatal OOM）；大 limit 交给 append 摊还扩容。
+	// 全范围扫描（可被主键范围裁剪）：条件预编译为类型化比较器，
+	// 在行字节上直接求值（零分配），仅命中行进入结果。
 	capHint := 16
 	if limit > 0 && limit <= 4096 {
 		capHint = limit
@@ -1044,9 +1125,12 @@ func (t *Table) SelectRBytes(minKey, maxKey *int64, limit int) [][]byte {
 	result := make([][]byte, 0, capHint)
 	var expired []int64
 	now := time.Now().UnixNano()
-	scan := func(key int64, value []byte) bool {
+	t.pkTree.scanRangeStop(minKey, maxKey, func(key int64, value []byte) bool {
 		if e := decodeExpireAt(value); e > 0 && now > e {
 			expired = append(expired, key)
+			return true
+		}
+		if !scan.matchRow(meta, value) {
 			return true
 		}
 		result = append(result, value)
@@ -1054,12 +1138,296 @@ func (t *Table) SelectRBytes(minKey, maxKey *int64, limit int) [][]byte {
 			return false
 		}
 		return true
-	}
-	t.pkTree.scanRangeStop(minKey, maxKey, scan)
+	})
+	// 回调持读锁，不能在回调内删除；收集后锁外清理
 	for _, k := range expired {
 		t.pkTree.Delete(k)
 	}
 	return result
+}
+
+// SelectRBytesCond 条件查询的原始字节版本（SelectR 的零物化形态）。
+// 返回的行字节与写入时完全一致（含 version/expireAt 前缀）。
+func (t *Table) SelectRBytesCond(conditions map[string]interface{}, minKey, maxKey *int64, limit int) [][]byte {
+	return t.selectRBytes(conditions, nil, minKey, maxKey, limit)
+}
+
+// ---- 行字节上的类型化条件求值（SelectR 扫描快速路径） ----
+
+// condKind 值的动态类型（条件值与行值统一表示，用于零装箱比较）。
+type condKind uint8
+
+const (
+	condNil    condKind = iota // NULL / 字段缺失
+	condInt                    // int64
+	condFloat                  // float64
+	condString                 // string
+	condBool                   // bool
+	condOther                  // 其它类型：与行值（int64/string/bool）动态类型必不同
+)
+
+// scanVal 行字段值的类型化表示（s 引用行字节，零拷贝零装箱）。
+type scanVal struct {
+	kind condKind
+	i    int64
+	s    string
+	b    bool
+}
+
+// scanEq 预编译的等值条件：语义与 matchConditions 的严格接口值比较一致
+//（动态类型相同且值相等；行字段永不为 float/nil，对应条件恒假）。
+type scanEq struct {
+	idx  int // meta.Fields 下标；-1 = 字段不存在（行值视为 nil）
+	kind condKind
+	i    int64
+	f    float64
+	s    string
+	b    bool
+}
+
+// scanCmp 预编译的单侧比较值（范围条件用）。
+type scanCmp struct {
+	kind condKind
+	i    int64
+	f    float64
+	s    string
+}
+
+// scanFilter 预编译的范围条件（op ∈ gt/ge/lt/le/ne/between），
+// 语义与 testRange/cmpVal 一致：int 一律经 float64 比较（保持 toNum 行为），
+// 类型不可比时 cmp=0（ge/le/between 判真，gt/lt/ne 判假）。
+type scanFilter struct {
+	idx  int
+	op   string
+	a, b scanCmp
+}
+
+// scanConds 一次 SelectR 调用的全部预编译条件。
+type scanConds struct {
+	eqs     []scanEq
+	filters []scanFilter
+	maxIdx  int
+}
+
+func newScanConds(meta *TableMeta, conditions map[string]interface{}, filters []RangeCond) *scanConds {
+	sc := &scanConds{maxIdx: -1}
+	if len(conditions) > 0 {
+		sc.eqs = make([]scanEq, 0, len(conditions))
+		for k, v := range conditions {
+			e := scanEq{idx: meta.fieldIndexOf(k)}
+			switch c := v.(type) {
+			case nil:
+				e.kind = condNil
+			case int64:
+				e.kind, e.i = condInt, c
+			case float64:
+				e.kind, e.f = condFloat, c
+			case string:
+				e.kind, e.s = condString, c
+			case bool:
+				e.kind, e.b = condBool, c
+			default:
+				e.kind = condOther
+			}
+			if e.idx > sc.maxIdx {
+				sc.maxIdx = e.idx
+			}
+			sc.eqs = append(sc.eqs, e)
+		}
+	}
+	if len(filters) > 0 {
+		sc.filters = make([]scanFilter, len(filters))
+		for i := range filters {
+			fs := &sc.filters[i]
+			fs.idx = meta.fieldIndexOf(filters[i].Field)
+			fs.op = filters[i].Op
+			fs.a = newScanCmp(filters[i].Val)
+			fs.b = newScanCmp(filters[i].Val2)
+			if fs.idx > sc.maxIdx {
+				sc.maxIdx = fs.idx
+			}
+		}
+	}
+	return sc
+}
+
+func newScanCmp(v interface{}) scanCmp {
+	var c scanCmp
+	switch x := v.(type) {
+	case int64:
+		c.kind, c.i = condInt, x
+	case float64:
+		c.kind, c.f = condFloat, x
+	case string:
+		c.kind, c.s = condString, x
+	default:
+		c.kind = condOther // bool/nil 等与行值类型不可比 → cmp=0
+	}
+	return c
+}
+
+// matchRow 判断编码行是否满足全部预编译条件。单遍按字段推进，
+// 只解码 maxIdx 之前的字段；字符串直接在行字节上比较。
+func (sc *scanConds) matchRow(meta *TableMeta, data []byte) bool {
+	if len(sc.eqs) == 0 && len(sc.filters) == 0 {
+		return true
+	}
+	// 字段不存在的条件：行值视为 nil（与 map 缺键一致）
+	for i := range sc.eqs {
+		if sc.eqs[i].idx < 0 && sc.eqs[i].kind != condNil {
+			return false
+		}
+	}
+	for i := range sc.filters {
+		if sc.filters[i].idx < 0 && !sc.filters[i].match(scanVal{kind: condNil}) {
+			return false
+		}
+	}
+	pos := 16
+	for fi := range meta.Fields {
+		if fi > sc.maxIdx {
+			break
+		}
+		var v scanVal
+		switch meta.Fields[fi].Type {
+		case TypeInt:
+			if pos+8 > len(data) {
+				return false
+			}
+			v = scanVal{kind: condInt, i: int64(uint64(data[pos])<<56 | uint64(data[pos+1])<<48 |
+				uint64(data[pos+2])<<40 | uint64(data[pos+3])<<32 | uint64(data[pos+4])<<24 |
+				uint64(data[pos+5])<<16 | uint64(data[pos+6])<<8 | uint64(data[pos+7]))}
+			pos += 8
+		case TypeVarchar:
+			if pos+2 > len(data) {
+				return false
+			}
+			l := int(data[pos])<<8 | int(data[pos+1])
+			pos += 2
+			if pos+l > len(data) {
+				return false
+			}
+			v = scanVal{kind: condString, s: unsafeString(data[pos : pos+l])}
+			pos += l
+		case TypeBool:
+			if pos >= len(data) {
+				return false
+			}
+			v = scanVal{kind: condBool, b: data[pos] == 1}
+			pos++
+		default:
+			continue
+		}
+		if !sc.matchField(fi, v) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchField 对单个行字段求值所有指向它的条件。
+func (sc *scanConds) matchField(fi int, v scanVal) bool {
+	for i := range sc.eqs {
+		e := &sc.eqs[i]
+		if e.idx != fi {
+			continue
+		}
+		switch e.kind {
+		case condInt:
+			if v.kind != condInt || v.i != e.i {
+				return false
+			}
+		case condString:
+			if v.kind != condString || v.s != e.s {
+				return false
+			}
+		case condBool:
+			if v.kind != condBool || v.b != e.b {
+				return false
+			}
+		default:
+			// condNil（行字段永非 nil）/ condFloat（行值永不为 float）/
+			// condOther（动态类型不同）：接口值比较必不相等
+			return false
+		}
+	}
+	for i := range sc.filters {
+		fl := &sc.filters[i]
+		if fl.idx == fi && !fl.match(v) {
+			return false
+		}
+	}
+	return true
+}
+
+// match 求值单条范围条件（testRange 语义）。
+func (f *scanFilter) match(v scanVal) bool {
+	ca := f.a.cmpRow(v)
+	switch f.op {
+	case "gt":
+		return ca > 0
+	case "ge":
+		return ca >= 0
+	case "lt":
+		return ca < 0
+	case "le":
+		return ca <= 0
+	case "ne":
+		return ca != 0
+	case "between":
+		return ca >= 0 && f.b.cmpRow(v) <= 0
+	}
+	return true
+}
+
+// cmpRow 按行值类型求与比较值的 cmpVal 语义比较；类型不可比返回 0。
+func (c *scanCmp) cmpRow(v scanVal) int {
+	switch v.kind {
+	case condInt:
+		switch c.kind {
+		case condInt:
+			return cmpF64(float64(v.i), float64(c.i))
+		case condFloat:
+			return cmpF64(float64(v.i), c.f)
+		}
+	case condString:
+		if c.kind == condString {
+			return strings.Compare(v.s, c.s)
+		}
+	}
+	return 0 // bool 行值 / 类型不可比
+}
+
+func cmpF64(a, b float64) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+// fieldIndexOf 按字段名（大小写不敏感，与 SQL 列名解析一致）返回 meta.Fields 下标；
+// 未找到返回 -1（调用方按"行中无此字段 → 值为 nil"语义处理）。
+func (m *TableMeta) fieldIndexOf(name string) int {
+	for i := range m.Fields {
+		if m.Fields[i].Name == name {
+			return i
+		}
+	}
+	for i := range m.Fields {
+		if strings.EqualFold(m.Fields[i].Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// SelectRBytes 范围查询的零分配快速路径：返回原始行字节，跳过 decodeRow 的 map 分配。
+// 仅适用于 conditions==nil && filters==nil 的纯范围扫描场景（如压测）。
+func (t *Table) SelectRBytes(minKey, maxKey *int64, limit int) [][]byte {
+	return t.selectRBytes(nil, nil, minKey, maxKey, limit)
 }
 
 // SelectRaw 返回原始行字节（含 version+expireAt 前缀），用于 handleSelect 无条件快速路径。
@@ -1221,10 +1589,23 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 		defer wg.Done()
 	}
 	bw := bufio.NewWriterSize(file, 256*1024)
+	// writer 本地批量记账：单写者线程内累加字节数，每 32 条（或换文件/冲刷前）
+	// 统一上报。速率桶粒度为 100ms，少量跨桶误差可忽略，换来写路径 31/32
+	// 的取钟与原子累加省略。
+	var pendingBytes int
+	pendingRecs := 0
+	reportWal := func() {
+		if statsHook != nil && pendingBytes > 0 {
+			statsHook.IncWalWrite(pendingBytes)
+		}
+		pendingBytes = 0
+		pendingRecs = 0
+	}
 	for {
 		e := <-walCh
 		switch {
 		case e.stop:
+			reportWal()
 			if bw != nil {
 				bw.Flush()
 			}
@@ -1232,6 +1613,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 			walSignal(e.done)
 			return
 		case e.flush:
+			reportWal()
 			bw.Flush()
 			file.Sync()
 			if statsHook != nil {
@@ -1242,8 +1624,10 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 		}
 		// 普通记录
 		bw.Write(e.rec)
-		if statsHook != nil {
-			statsHook.IncWalWrite(len(e.rec))
+		pendingBytes += len(e.rec)
+		pendingRecs++
+		if pendingRecs >= 32 {
+			reportWal()
 		}
 		walBufPut(e.rec)
 		if !e.sync {
@@ -1266,9 +1650,8 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 					waiters = append(waiters, e2.done)
 				default:
 					bw.Write(e2.rec)
-					if statsHook != nil {
-						statsHook.IncWalWrite(len(e2.rec))
-					}
+					pendingBytes += len(e2.rec)
+					pendingRecs++
 					walBufPut(e2.rec)
 					if e2.sync {
 						waiters = append(waiters, e2.done)
@@ -1283,6 +1666,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 		if statsHook != nil {
 			statsHook.IncFsync()
 		}
+		reportWal()
 		for _, d := range waiters {
 			walSignal(d)
 		}

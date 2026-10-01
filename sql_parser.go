@@ -13,10 +13,23 @@ import (
 
 // ==================== SQL 解析与执行 ====================
 
+// sqlTokenKind token 类别（byte 常量：取代 string 比较并把结构体从 72B
+// 压到 48B——token 追加/消费是分词与解析热路径上最大的 memcpy）。
+type sqlTokenKind uint8
+
+const (
+	kindKw    sqlTokenKind = iota // 关键字
+	kindIdent                     // 标识符
+	kindStr                       // 字符串
+	kindNum                       // 数字
+	kindSym                       // 符号
+	kindEof                       // 结束
+)
+
 // sqlToken 词法单元。
 // upper 缓存标识符/关键字的大写形式，避免后续解析重复 strings.ToUpper。
 type sqlToken struct {
-	kind  string // "kw" 关键字, "ident" 标识符, "str" 字符串, "num" 数字, "sym" 符号, "eof"
+	kind  sqlTokenKind
 	val   string
 	upper string // 仅对 ident/kw 非空
 	pos   int
@@ -45,6 +58,11 @@ var interfaceSlicePool = sync.Pool{
 // 预分配 tokens 切片并缓存关键字大写字面量，降低热路径分配。
 func tokenizeSQL(sql string) ([]sqlToken, error) {
 	toks := sqlTokenPool.Get().([]sqlToken)[:0]
+	// 按 SQL 长度预估 token 数（平均 ≥3 字节/token）一次到位，避免中途
+	// 扩容拷贝（sqlToken 72B，长查询的反复扩容不小）；超大语句不预分配。
+	if est := len(sql)/3 + 4; cap(toks) < est && est <= 4096 {
+		toks = make([]sqlToken, 0, est)
+	}
 	i := 0
 	n := len(sql)
 	for i < n {
@@ -74,7 +92,7 @@ func tokenizeSQL(sql string) ([]sqlToken, error) {
 				putSQLTokens(toks)
 				return nil, err
 			}
-			toks = append(toks, sqlToken{kind: "str", val: val, pos: i})
+			toks = append(toks, sqlToken{kind: kindStr, val: val})
 			i = ni
 		case c == '`':
 			// 反引号引用标识符：`` doubling 表示字面反引号（MySQL 语义）。
@@ -111,7 +129,7 @@ func tokenizeSQL(sql string) ([]sqlToken, error) {
 				val = sb.String()
 			}
 			// 引用标识符永不作为关键字
-			toks = append(toks, sqlToken{kind: "ident", val: val, pos: i})
+			toks = append(toks, sqlToken{kind: kindIdent, val: val})
 			i = j + 1
 		case c >= '0' && c <= '9' || (c == '-' && i+1 < n && sql[i+1] >= '0' && sql[i+1] <= '9') || (c == '.' && i+1 < n && sql[i+1] >= '0' && sql[i+1] <= '9'):
 			j := i
@@ -143,7 +161,7 @@ func tokenizeSQL(sql string) ([]sqlToken, error) {
 					j = k
 				}
 			}
-			toks = append(toks, sqlToken{kind: "num", val: sql[i:j], pos: i})
+			toks = append(toks, sqlToken{kind: kindNum, val: sql[i:j]})
 			i = j
 		case isIdentChar(c):
 			j := i
@@ -153,20 +171,20 @@ func tokenizeSQL(sql string) ([]sqlToken, error) {
 			word := sql[i:j]
 			// 关键字：内部化 canonical 大写（零分配）；普通标识符不再预计算
 			// ToUpper（旧实现每个含小写字母的 token 一次堆分配，是分词热路径
-			// 的主要分配源）。ident 的大小写不敏感比较由消费方 EqualFold 完成。
-			kind := "ident"
+			// 的主要分配源）。ident 的大小写不敏感比较由消费方 asciiEq 完成。
+			kind := kindIdent
 			var upper string
 			if c := keywordCanonical(word); c != "" {
-				kind, upper = "kw", c
+				kind, upper = kindKw, c
 			}
-			toks = append(toks, sqlToken{kind: kind, val: word, upper: upper, pos: i})
+			toks = append(toks, sqlToken{kind: kind, val: word, upper: upper})
 			i = j
 		default:
-			toks = append(toks, sqlToken{kind: "sym", val: symChar(c), pos: i})
+			toks = append(toks, sqlToken{kind: kindSym, val: symChar(c)})
 			i++
 		}
 	}
-	toks = append(toks, sqlToken{kind: "eof", val: "", pos: n})
+	toks = append(toks, sqlToken{kind: kindEof, val: "", pos: n})
 	return toks, nil
 }
 
@@ -291,15 +309,49 @@ var sqlKeywords = []string{
 	"WHERE",
 }
 
-// kwByLen 按长度分桶的关键字表：keywordCanonical 对每个词只做同长度词的
-// EqualFold 扫描（通常个位数候选），零分配。
-var kwByLen [16][]string
+// asciiEq ASCII 专用的大小写不敏感比较（关键字词表全为大写 ASCII，语义与
+// strings.EqualFold 一致：非 ASCII 字节不可能折叠进纯 ASCII 词表）。
+// 取代 EqualFold 的 Unicode 逐字符折叠——分词/解析热路径上每 token 都要走。
+func asciiEq(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca != cb {
+			if ca >= 'a' {
+				ca -= 'a' - 'A'
+			}
+			if cb >= 'a' {
+				cb -= 'a' - 'A'
+			}
+			if ca != cb {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// kwByFirst 按首字母（折叠为小写）分桶的关键字表：keywordCanonical 对每个
+// 标识符只扫描同首字母候选（通常 1~3 个），再做 ASCII 折叠比较，零分配。
+var kwByFirst [26][][]string // [首字母][长度][候选词]
 
 func init() {
 	for _, k := range sqlKeywords {
-		if len(k) < len(kwByLen) {
-			kwByLen[len(k)] = append(kwByLen[len(k)], k)
+		c := k[0] | 0x20 // 已折叠小写（关键字均为大写 ASCII）
+		idx := c - 'a'
+		if int(idx) >= len(kwByFirst) {
+			continue
 		}
+		buckets := kwByFirst[idx]
+		if len(k) >= len(buckets) {
+			grown := make([][]string, len(k)+1)
+			copy(grown, buckets)
+			buckets = grown
+			kwByFirst[idx] = buckets
+		}
+		buckets[len(k)] = append(buckets[len(k)], k)
 	}
 }
 
@@ -307,11 +359,23 @@ func init() {
 // （零分配）；否则返回空串。取代旧的 isKeyword + strings.ToUpper 组合——
 // 后者对每个含小写字母的 token 都产生一次堆分配。
 func keywordCanonical(word string) string {
-	if len(word) >= len(kwByLen) {
+	if len(word) == 0 {
 		return ""
 	}
-	for _, k := range kwByLen[len(word)] {
-		if strings.EqualFold(k, word) {
+	c := word[0] | 0x20
+	if c < 'a' {
+		return "" // 非字母首字符不可能命中关键字
+	}
+	idx := int(c - 'a')
+	if idx >= len(kwByFirst) {
+		return ""
+	}
+	buckets := kwByFirst[idx]
+	if len(word) >= len(buckets) {
+		return ""
+	}
+	for _, k := range buckets[len(word)] {
+		if asciiEq(k, word) {
 			return k
 		}
 	}
@@ -362,17 +426,18 @@ func (p *sqlParser) next() sqlToken {
 
 // matchKeyword 匹配关键字/标识符，大小写不敏感。
 // kw token 的 upper 已内部化（== 快速路径）；ident（含 SHOW COLUMNS 等
-// 非关键字字面量）走 EqualFold——ident.upper 已不再预计算。
+// 非关键字字面量）走 ASCII 折叠比较——词表全为大写 ASCII，语义与
+// EqualFold 一致且更快。
 func (p *sqlParser) matchKeyword(kw string) bool {
 	t := p.peek()
-	if t.kind == "kw" {
+	if t.kind == kindKw {
 		if t.upper == kw {
 			p.next()
 			return true
 		}
 		return false
 	}
-	if t.kind == "ident" && strings.EqualFold(t.val, kw) {
+	if t.kind == kindIdent && asciiEq(t.val, kw) {
 		p.next()
 		return true
 	}
@@ -384,7 +449,7 @@ func (t sqlToken) is(word string) bool {
 	if t.upper != "" {
 		return t.upper == word
 	}
-	return strings.EqualFold(t.val, word)
+	return asciiEq(t.val, word)
 }
 
 // stmtWords 保留字表之外的语句级语法词：它们不在 sqlKeywords 中（避免侵占
@@ -392,16 +457,16 @@ func (t sqlToken) is(word string) bool {
 var stmtWords = []string{"ALTER", "SETS", "DATABASE", "USE"}
 
 // canonical 返回 token 的规整大写形式：关键字用内部化 upper（零分配），
-// 其余按 stmtWords 大小写不敏感解析。
+// 其余按 stmtWords 大小写不敏感解析（ASCII 折叠）。
 func (t sqlToken) canonical() string {
 	if t.upper != "" {
 		return t.upper
 	}
-	if t.kind != "ident" {
+	if t.kind != kindIdent {
 		return ""
 	}
 	for _, w := range stmtWords {
-		if strings.EqualFold(t.val, w) {
+		if asciiEq(t.val, w) {
 			return w
 		}
 	}
@@ -410,7 +475,7 @@ func (t sqlToken) canonical() string {
 
 func (p *sqlParser) matchSym(s string) bool {
 	t := p.peek()
-	if t.kind == "sym" && t.val == s {
+	if t.kind == kindSym && t.val == s {
 		p.next()
 		return true
 	}
@@ -446,11 +511,11 @@ func (db *DB) runSQLSchema(sql string, params []interface{}, txnID uint64, schem
 func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, txnID uint64, schema string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	p := &sqlParser{toks: toks, params: params, txnID: txnID, schema: schema}
 	// 去除开头的空/分号
-	for p.peek().kind == "sym" && p.peek().val == ";" {
+	for p.peek().kind == kindSym && p.peek().val == ";" {
 		p.next()
 	}
 	first := p.peek()
-	if first.kind == "eof" {
+	if first.kind == kindEof {
 		err = fmt.Errorf("empty query")
 		return
 	}
@@ -507,7 +572,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 					p.matchKeyword("NOT")
 					p.matchKeyword("EXISTS")
 				}
-				if d := p.next(); d.kind == "ident" || d.kind == "str" {
+				if d := p.next(); d.kind == kindIdent || d.kind == kindStr {
 					name = d.val
 				}
 				rows = [][]interface{}{{name, "CREATE DATABASE `" + name + "` /*!40100 DEFAULT CHARACTER SET utf8mb4 */"}}
@@ -630,7 +695,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		if p.matchKeyword("VARIABLES") {
 			like := ""
 			if p.matchKeyword("LIKE") {
-				if t := p.next(); t.kind == "str" {
+				if t := p.next(); t.kind == kindStr {
 					like = t.val
 				}
 			}
@@ -654,7 +719,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 	case "USE":
 		p.next()
 		nameTok := p.next()
-		if nameTok.kind != "ident" && nameTok.kind != "str" {
+		if nameTok.kind != kindIdent && nameTok.kind != kindStr {
 			err = fmt.Errorf("expected database name")
 			return
 		}
@@ -674,7 +739,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 				p.matchKeyword("EXISTS")
 			}
 			nameTok := p.next()
-			if nameTok.kind != "ident" && nameTok.kind != "str" {
+			if nameTok.kind != kindIdent && nameTok.kind != kindStr {
 				err = fmt.Errorf("expected database name")
 				return
 			}
@@ -694,7 +759,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 				ifExists = true
 			}
 			nameTok := p.next()
-			if nameTok.kind != "ident" && nameTok.kind != "str" {
+			if nameTok.kind != kindIdent && nameTok.kind != kindStr {
 				err = fmt.Errorf("expected database name")
 				return
 			}
@@ -717,35 +782,36 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 	case "DESCRIBE", "DESC":
 		p.next()
 		nameTok := p.next()
-		if nameTok.kind != "ident" && nameTok.kind != "str" {
+		if nameTok.kind != kindIdent && nameTok.kind != kindStr {
 			err = fmt.Errorf("expected table name")
 			return
 		}
-		tables, e := db.adminTables("")
-		if e != nil {
-			err = e
-			return
-		}
-		// 物理表名带 db. 前缀：裸名先精确匹配，再按当前连接库限定
-		qual := db.qualifyTableIn(nameTok.val, p.curSchema(db))
-		for _, tb := range tables {
-			if tb["name"] == nameTok.val || tb["name"] == qual {
-				columns = []string{"field", "type", "len", "key"}
-				for _, f := range tb["fields"].([]map[string]interface{}) {
-					key := ""
-					if tb["pk"] == f["name"] {
-						key = "PRI"
-					}
-					rows = append(rows, []interface{}{f["name"], f["type"], f["len"], key})
-				}
-				for _, ix := range tb["indexes"].([]map[string]interface{}) {
-					columns = []string{"field", "type", "len", "key"}
-					rows = append(rows, []interface{}{ix["field"], "INDEX(" + ix["name"].(string) + ")", "", "MUL"})
-				}
-				return
+		// 单表直查：不走 adminTables（会为所有表重建元数据 map）——
+		// phpMyAdmin 每次浏览都发 DESCRIBE，这里曾是 O(表数×字段数) 的分配。
+		// 物理表名带 db. 前缀：裸名先精确匹配，再按当前连接库限定。
+		tbl := db.getTable(nameTok.val)
+		if tbl == nil {
+			qual := db.qualifyTableIn(nameTok.val, p.curSchema(db))
+			if qual != nameTok.val {
+				tbl = db.getTable(qual)
 			}
 		}
-		err = fmt.Errorf("table not found: %s", nameTok.val)
+		if tbl == nil {
+			err = fmt.Errorf("table not found: %s", nameTok.val)
+			return
+		}
+		dmeta := tbl.Meta()
+		columns = []string{"field", "type", "len", "key"}
+		for _, f := range dmeta.Fields {
+			key := ""
+			if dmeta.PK == f.Name {
+				key = "PRI"
+			}
+			rows = append(rows, []interface{}{f.Name, fieldTypeName(f.Type), f.Len, key})
+		}
+		for idxName, fieldName := range dmeta.Indexes {
+			rows = append(rows, []interface{}{fieldName, "INDEX(" + idxName + ")", "", "MUL"})
+		}
 		return
 	case "SELECT":
 		return db.parseSelect(p)
@@ -769,7 +835,7 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 func countSQLTokens(toks []sqlToken) int {
 	n := 0
 	for _, t := range toks {
-		if t.kind == "sym" && t.val == "?" {
+		if t.kind == kindSym && t.val == "?" {
 			n++
 		}
 	}
@@ -797,7 +863,7 @@ func (p *sqlParser) readTableIdent() (string, error) {
 // readName 读取标识符（allowKeyword 时允许关键字）；字符串字面量始终允许。
 func (p *sqlParser) readName(allowKeyword bool) (string, error) {
 	t := p.next()
-	ok := t.kind == "ident" || t.kind == "str" || (allowKeyword && t.kind == "kw")
+	ok := t.kind == kindIdent || t.kind == kindStr || (allowKeyword && t.kind == kindKw)
 	if !ok {
 		return "", fmt.Errorf("expected identifier, got %q", t.val)
 	}
@@ -810,7 +876,7 @@ func (p *sqlParser) readQualifiedTable() (string, error) {
 	if e != nil {
 		return "", e
 	}
-	for p.peek().kind == "sym" && p.peek().val == "." {
+	for p.peek().kind == kindSym && p.peek().val == "." {
 		p.next()
 		part, pe := p.readTableIdent()
 		if pe != nil {
@@ -826,7 +892,7 @@ func (p *sqlParser) readOptionalDBName(cur string) string {
 	if !p.matchKeyword("FROM") {
 		return cur
 	}
-	if d := p.next(); d.kind == "ident" || d.kind == "str" {
+	if d := p.next(); d.kind == kindIdent || d.kind == kindStr {
 		return d.val
 	}
 	return cur
@@ -845,7 +911,7 @@ func (p *sqlParser) parseEqConds() (map[string]interface{}, error) {
 			return nil, e
 		}
 		op := p.next()
-		if op.kind != "sym" || op.val != "=" {
+		if op.kind != kindSym || op.val != "=" {
 			return nil, fmt.Errorf("unsupported condition in COUNT")
 		}
 		v, e := p.parseValue()
@@ -873,7 +939,7 @@ func srcColumn(colSrc map[string]string, colName string) string {
 func (p *sqlParser) parseValue() (interface{}, error) {
 	t := p.next()
 	// 参数绑定占位符：? 从运行参数按下标取值（prepared execute）。
-	if t.kind == "sym" && t.val == "?" {
+	if t.kind == kindSym && t.val == "?" {
 		v := p.nextParam()
 		if v == nil {
 			return nil, fmt.Errorf("no value bound for parameter %d", p.paramIdx+1)
@@ -881,7 +947,7 @@ func (p *sqlParser) parseValue() (interface{}, error) {
 		return v, nil
 	}
 	switch t.kind {
-	case "num":
+	case kindNum:
 		if strings.ContainsAny(t.val, ".eE") {
 			// 浮点字面量按 float64 返回；列类型为 INT 时由写入路径取整
 			v, err := strconv.ParseFloat(t.val, 64)
@@ -895,9 +961,9 @@ func (p *sqlParser) parseValue() (interface{}, error) {
 			return nil, err
 		}
 		return v, nil
-	case "str":
+	case kindStr:
 		return t.val, nil
-	case "kw":
+	case kindKw:
 		switch t.upper {
 		case "TRUE":
 			return true, nil
@@ -920,7 +986,8 @@ type rawCond struct {
 
 // andGroup 以 AND 连接的条件组；orGroups 各组之间以 OR 连接。
 // 无括号 SQL 的标准优先级：AND 高于 OR，因此按 OR 分割成若干 AND 组。
-type andGroup []*rawCond
+// 元素为值类型：条件随查询结束即弃，值切片省去每条件一次堆分配。
+type andGroup []rawCond
 
 func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	p.next() // SELECT
@@ -930,16 +997,16 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	// COUNT 聚合：SELECT COUNT(*) FROM tbl [WHERE ..] / SELECT COUNT(1) 等
-	isCount := p.peek().is("COUNT") && p.toks[p.i+1].kind == "sym" && p.toks[p.i+1].val == "("
+	isCount := p.peek().is("COUNT") && p.toks[p.i+1].kind == kindSym && p.toks[p.i+1].val == "("
 	if isCount {
 		p.next() // COUNT
 		p.next() // (
 		for {
 			t := p.next()
-			if t.kind == "sym" && t.val == ")" {
+			if t.kind == kindSym && t.val == ")" {
 				break
 			}
-			if t.kind == "eof" {
+			if t.kind == kindEof {
 				err = fmt.Errorf("expected ) in COUNT")
 				return
 			}
@@ -952,15 +1019,14 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	var selectCols []string
-	colSrc := map[string]string{} // 输出列名 -> 源列名（AS 别名映射）
-	if pt := p.peek(); pt.kind == "sym" && pt.val == "*" {
+	var colSrc map[string]string // 输出列名 -> 源列名（AS 别名映射；无别名时不分配）
+	if pt := p.peek(); pt.kind == kindSym && pt.val == "*" {
 		p.next()
 		selectCols = nil // 表示所有列
-		colSrc = nil
 	} else {
 		readCol := func() (string, error) {
 			ct := p.peek()
-			if ct.kind != "ident" && ct.kind != "kw" && ct.kind != "str" {
+			if ct.kind != kindIdent && ct.kind != kindKw && ct.kind != kindStr {
 				return "", fmt.Errorf("expected column name, got %q", ct.val)
 			}
 			p.next()
@@ -974,7 +1040,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			}
 			src := field
 			colName := field
-			if p.peek().kind == "sym" && p.peek().val == "." {
+			if p.peek().kind == kindSym && p.peek().val == "." {
 				p.next()
 				part, pe := readCol()
 				if pe != nil {
@@ -992,9 +1058,14 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 					return
 				}
 				colName = alias
+				if colSrc == nil {
+					colSrc = make(map[string]string)
+				}
 			}
 			selectCols = append(selectCols, colName)
-			colSrc[strings.ToLower(colName)] = src
+			if colSrc != nil {
+				colSrc[strings.ToLower(colName)] = src
+			}
 			if !p.matchSym(",") {
 				break
 			}
@@ -1010,7 +1081,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	// 非 mysql.* 且无前缀时按当前数据库解析（仅非默认库加前缀）
-	if !strings.HasPrefix(strings.ToLower(tableName), "mysql.") {
+	if !hasPrefixFold(tableName, "mysql.") {
 		tableName = db.qualifyTableIn(tableName, p.curSchema(db))
 	}
 	// WHERE：解析为 OR 连接的 AND 条件组（支持 = / 范围 / BETWEEN / LIKE / IS [NOT] NULL）
@@ -1024,7 +1095,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 				return
 			}
 			cur := &orGroups[len(orGroups)-1]
-			addCond := func(c *rawCond) {
+			addCond := func(c rawCond) {
 				*cur = append(*cur, c)
 			}
 			if p.matchKeyword("IS") {
@@ -1034,20 +1105,20 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 					return
 				}
 				if neg {
-					addCond(&rawCond{field: field, op: "ISNOTNULL"})
+					addCond(rawCond{field: field, op: "ISNOTNULL"})
 				} else {
-					addCond(&rawCond{field: field, op: "ISNULL"})
+					addCond(rawCond{field: field, op: "ISNULL"})
 				}
 			} else {
 				op := p.next()
 				// BETWEEN / LIKE 是关键字(kw)，其余比较符是符号(sym)
-				isKwOp := (op.kind == "kw" || op.kind == "ident") && (op.upper == "BETWEEN" || op.upper == "LIKE")
-				if op.kind != "sym" && !isKwOp {
+				isKwOp := (op.kind == kindKw || op.kind == kindIdent) && (op.upper == "BETWEEN" || op.upper == "LIKE")
+				if op.kind != kindSym && !isKwOp {
 					err = fmt.Errorf("unsupported comparison operator")
 					return
 				}
 				// tokenizer 会把 >= <= <> != 拆成两个单字符符号，这里合并
-				if (op.val == ">" || op.val == "<" || op.val == "!") && p.peek().kind == "sym" && p.peek().val == "=" {
+				if (op.val == ">" || op.val == "<" || op.val == "!") && p.peek().kind == kindSym && p.peek().val == "=" {
 					p.next() // 消费 "="，组成 ">=" "<=" "!="
 					if op.val == "!" {
 						op.val = "<>"
@@ -1055,14 +1126,20 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 						op.val = op.val + "="
 					}
 				}
-				switch strings.ToUpper(op.val) {
+				// 比较符归一：符号本身即 canonical；关键字（BETWEEN/LIKE）取
+				// 内部化大写 upper，免去每条件两次 ToUpper 堆分配。
+				cmp := op.val
+				if op.upper != "" {
+					cmp = op.upper
+				}
+				switch cmp {
 				case "=", ">", "<", ">=", "<=", "<>", "!=":
 					val, e := p.parseValue()
 					if e != nil {
 						err = e
 						return
 					}
-					addCond(&rawCond{field: field, op: strings.ToUpper(op.val), val: val})
+					addCond(rawCond{field: field, op: cmp, val: val})
 				case "BETWEEN":
 					lo, e := p.parseValue()
 					if e != nil {
@@ -1078,14 +1155,14 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 						err = e
 						return
 					}
-					addCond(&rawCond{field: field, op: "BETWEEN", val: lo, val2: hi})
+					addCond(rawCond{field: field, op: "BETWEEN", val: lo, val2: hi})
 				case "LIKE":
 					pat, e := p.parseValue()
 					if e != nil {
 						err = e
 						return
 					}
-					addCond(&rawCond{field: field, op: "LIKE", val: pat})
+					addCond(rawCond{field: field, op: "LIKE", val: pat})
 				default:
 					err = fmt.Errorf("unsupported comparison operator: %s", op.val)
 					return
@@ -1147,7 +1224,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	offset := int64(0)
 	if p.matchKeyword("LIMIT") {
 		num := p.next()
-		if num.kind != "num" {
+		if num.kind != kindNum {
 			err = fmt.Errorf("expected number after LIMIT")
 			return
 		}
@@ -1160,7 +1237,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			// MySQL 形式 LIMIT offset, count（phpMyAdmin 浏览固定发 LIMIT 0, N）
 			offset = v
 			num2 := p.next()
-			if num2.kind != "num" {
+			if num2.kind != kindNum {
 				err = fmt.Errorf("expected number after LIMIT offset,")
 				return
 			}
@@ -1172,7 +1249,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			limit = int(v2)
 		} else if p.matchKeyword("OFFSET") {
 			num2 := p.next()
-			if num2.kind != "num" {
+			if num2.kind != kindNum {
 				err = fmt.Errorf("expected number after OFFSET")
 				return
 			}
@@ -1194,7 +1271,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	// mysql.* 虚拟系统表
-	if strings.HasPrefix(strings.ToLower(tableName), "mysql.") {
+	if hasPrefixFold(tableName, "mysql.") {
 		mt := strings.ToLower(strings.TrimPrefix(tableName, "mysql."))
 		conds := condsFromGroups(orGroups)
 		if conds == nil && len(orGroups) > 1 {
@@ -1204,7 +1281,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return db.queryMysqlTable(mt, conds, selectCols, colSrc)
 	}
 	// information_schema.* 虚拟系统表
-	if strings.HasPrefix(strings.ToLower(tableName), "information_schema.") {
+	if hasPrefixFold(tableName, "information_schema.") {
 		it := strings.ToLower(strings.TrimPrefix(tableName, "information_schema."))
 		conds := condsFromGroups(orGroups)
 		if conds == nil && len(orGroups) > 1 {
@@ -1219,6 +1296,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		err = fmt.Errorf("table not found: %s", tableName)
 		return
 	}
+	meta := t.Meta()
 	// 单一 AND 组且无 OR 时走索引/范围下推快速路径；含 OR 时退化为全表谓词过滤
 	hasOR := len(orGroups) > 1
 	// 主键点查快速路径：单一 `pk = 整数常量` 条件且无 ORDER BY / OFFSET 时，
@@ -1227,22 +1305,26 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	var pkPointVal int64
 	if len(orGroups) == 1 && len(orGroups[0]) == 1 && len(orderBys) == 0 && offset == 0 {
 		c := orGroups[0][0]
-		if c.op == "=" && strings.EqualFold(c.field, t.Meta().PK) {
+		if c.op == "=" && strings.EqualFold(c.field, meta.PK) {
 			if v, ok := c.val.(int64); ok {
 				pkPointVal, pkPoint = v, true
 			}
 		}
 	}
-	conds := map[string]interface{}{}
+	// conds 懒分配：主键点查与无 WHERE 路径不需要条件 map
+	var conds map[string]interface{}
 	var minKey, maxKey *int64
 	var filters []RangeCond
 	if len(orGroups) == 1 && !pkPoint {
 		for _, c := range orGroups[0] {
 			if c.op == "=" {
+				if conds == nil {
+					conds = make(map[string]interface{})
+				}
 				conds[c.field] = c.val
 				continue
 			}
-			if strings.EqualFold(c.field, t.Meta().PK) {
+			if strings.EqualFold(c.field, meta.PK) {
 				switch c.op {
 				case ">":
 					iv := toInt64(c.val)
@@ -1299,8 +1381,11 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			filters = append(filters, RangeCond{Field: c.field, Op: rangeOp(c.op), Val: c.val, Val2: c.val2})
 		}
 	}
-	// 列投影准备：SELECT * 返回全部列；否则只返回指定的列（AS 别名映射到源列）
-	cols := t.Meta().Fields
+	// 列投影准备：SELECT * 返回全部列（colIdx 为 nil 表示恒等投影，行值直接
+	// copy）；否则只返回指定的列（AS 别名映射到源列），colIdx 记录各输出列
+	// 在 meta.Fields 中的下标。
+	cols := meta.Fields
+	var colIdx []int
 	outNames := []string(nil)
 	if selectCols != nil {
 		cols = nil
@@ -1311,9 +1396,10 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 					src = s
 				}
 			}
-			for _, f := range t.Meta().Fields {
+			for i, f := range meta.Fields {
 				if strings.EqualFold(src, f.Name) {
 					cols = append(cols, f)
+					colIdx = append(colIdx, i)
 					outNames = append(outNames, sc)
 					break
 				}
@@ -1325,18 +1411,25 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		}
 	}
 	if outNames == nil {
-		outNames = make([]string, 0, len(cols))
-		for _, f := range cols {
-			outNames = append(outNames, f.Name)
-		}
+		outNames = meta.fieldNames() // SELECT *：列头取 meta 惰性缓存
 	}
 	columns = outNames
+	// projectRow 将 flat 解码行投影到 arena 行（恒等投影走 copy，零下标循环）。
+	projectRow := func(flat, row []interface{}) {
+		if colIdx == nil {
+			copy(row, flat)
+			return
+		}
+		for i, ci := range colIdx {
+			row[i] = flat[ci]
+		}
+	}
 	// ORDER BY / OFFSET 需要完整结果集后再裁剪，扫描阶段不能提前 limit
 	scanLimit := limit
 	if hasOR || len(orderBys) > 0 || offset > 0 {
 		scanLimit = -1
 	}
-	// 主键点查：树内直接命中 + TTL 检查 + 单行投影，避开通用扫描路径
+	// 主键点查：树内直接命中 + TTL 检查 + flat 单行投影，避开通用扫描路径
 	if pkPoint {
 		if limit == 0 {
 			rows = nil
@@ -1352,41 +1445,46 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			rows = nil
 			return
 		}
-		r, _, _ := decodeRow(t.Meta(), rowData)
-		row := make([]interface{}, 0, len(cols))
-		for _, f := range cols {
-			row = append(row, r[f.Name])
-		}
+		flat := decodeRowFlat(meta, rowData, nil)
+		row := make([]interface{}, len(cols))
+		projectRow(flat, row)
 		rows = [][]interface{}{row}
 		return
 	}
 	// 扫描 + 过滤 + 投影
 	if hasOR {
-		// 全表扫描 + 逐行谓词求值（OR 或 LIKE / IS NULL 等不可下推条件）
+		// 全表扫描 + 逐行谓词求值（OR 或 LIKE / IS NULL 等不可下推条件）：
+		// 条件字段预解析为下标，行 flat 解码后求值、命中行内联投影，
+		// 全程不为扫描行物化 map（此前每行一个 map 是该路径最大分配源）。
+		gIdx := make([][]int, len(orGroups))
+		for gi, g := range orGroups {
+			idxs := make([]int, len(g))
+			for ci := range g {
+				idxs[ci] = meta.fieldIndexOf(g[ci].field)
+			}
+			gIdx[gi] = idxs
+		}
 		var expired []int64
 		now := time.Now().UnixNano()
-		matched := make([]map[string]interface{}, 0, 64)
+		var flat []interface{}
+		arena := newRowArena(len(colIdx))
+		rows = make([][]interface{}, 0, 64)
 		t.pkTree.scanRangeStop(minKey, maxKey, func(key int64, value []byte) bool {
 			if e := decodeExpireAt(value); e > 0 && now > e {
 				expired = append(expired, key)
 				return true
 			}
-			row, _, _ := decodeRow(t.Meta(), value)
-			if rowMatchGroups(row, orGroups) {
-				matched = append(matched, row)
+			flat = decodeRowFlat(meta, value, flat)
+			if !rowMatchGroupsFlat(flat, orGroups, gIdx) {
+				return true
 			}
+			row := arena.row()
+			projectRow(flat, row)
+			rows = append(rows, row)
 			return true
 		})
 		for _, k := range expired {
 			t.pkTree.Delete(k)
-		}
-		rows = make([][]interface{}, 0, len(matched))
-		for _, r := range matched {
-			row := make([]interface{}, 0, len(cols))
-			for _, f := range cols {
-				row = append(row, r[f.Name])
-			}
-			rows = append(rows, row)
 		}
 	} else if len(conds) == 0 && len(filters) == 0 {
 		// 无 WHERE 条件的快速路径：直接解码为 []interface{}，跳过每行 map 分配
@@ -1395,36 +1493,26 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			rows = flat
 		} else {
 			// 列投影：flat 行按 meta.Fields 顺序排列，按下标取值
-			idx := make([]int, 0, len(cols))
-			for _, f := range cols {
-				for i, mf := range t.Meta().Fields {
-					if mf.Name == f.Name {
-						idx = append(idx, i)
-						break
-					}
-				}
-			}
+			arena := newRowArena(len(colIdx))
 			rows = make([][]interface{}, 0, len(flat))
 			for _, r := range flat {
-				row := make([]interface{}, 0, len(idx))
-				for _, i := range idx {
-					row = append(row, r[i])
-				}
+				row := arena.row()
+				projectRow(r, row)
 				rows = append(rows, row)
 			}
 		}
 	} else {
-		res, e := t.SelectR(conds, filters, minKey, maxKey, scanLimit)
-		if e != nil {
-			err = e
-			return
-		}
-		rows = make([][]interface{}, 0, len(res))
-		for _, r := range res {
-			row := make([]interface{}, 0, len(cols))
-			for _, f := range cols {
-				row = append(row, r[f.Name])
-			}
+		// 等值/范围条件路径：与 SelectR 相同的字节级求值内核
+		//（主键点查/二级索引/全表扫描三级分发），命中行 flat 解码后
+		// 按 colIdx 直接投影，全程不物化行 map。
+		rawRows := t.selectRBytes(conds, filters, minKey, maxKey, scanLimit)
+		arena := newRowArena(len(colIdx))
+		var flat []interface{}
+		rows = make([][]interface{}, 0, len(rawRows))
+		for _, data := range rawRows {
+			flat = decodeRowFlat(meta, data, flat)
+			row := arena.row()
+			projectRow(flat, row)
 			rows = append(rows, row)
 		}
 	}
@@ -1486,10 +1574,10 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 // expectEnd 断言语句已解析到结尾（允许尾随分号）。剩余 token 说明存在
 // 解析器不支持的语法，必须显式报错而不是静默丢弃。
 func (p *sqlParser) expectEnd() error {
-	for p.peek().kind == "sym" && p.peek().val == ";" {
+	for p.peek().kind == kindSym && p.peek().val == ";" {
 		p.next()
 	}
-	if p.peek().kind != "eof" {
+	if p.peek().kind != kindEof {
 		return fmt.Errorf("unexpected %q after statement (unsupported syntax is rejected, not ignored)", p.peek().val)
 	}
 	return nil
@@ -1540,12 +1628,17 @@ func cmpCell(a, b interface{}) int {
 	return 0
 }
 
-// rowMatchGroups 逐行求值 OR 连接的 AND 条件组。
-func rowMatchGroups(row map[string]interface{}, orGroups []andGroup) bool {
-	for _, g := range orGroups {
+// rowMatchGroupsFlat 按预解析字段下标求值 OR 连接的 AND 条件组（flat 行值）。
+// 下标 -1 表示字段不在表中，值视为 nil（与 map 缺键语义一致）。
+func rowMatchGroupsFlat(vals []interface{}, groups []andGroup, gIdx [][]int) bool {
+	for gi, g := range groups {
 		ok := true
-		for _, c := range g {
-			if !evalCond(row[c.field], c) {
+		for ci := range g {
+			var v interface{}
+			if i := gIdx[gi][ci]; i >= 0 {
+				v = vals[i]
+			}
+			if !evalCond(v, &g[ci]) {
 				ok = false
 				break
 			}
@@ -1732,7 +1825,7 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 	}
 	var fields []string
 	colsExplicit := false
-	if p.peek().kind == "sym" && p.peek().val == "(" {
+	if p.peek().kind == kindSym && p.peek().val == "(" {
 		colsExplicit = true
 		p.next()
 		for {
@@ -1745,7 +1838,7 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 			if p.matchSym(")") {
 				break
 			}
-			if q := p.next(); q.kind != "sym" || q.val != "," {
+			if q := p.next(); q.kind != kindSym || q.val != "," {
 				err = fmt.Errorf("expected , or )")
 				return
 			}
@@ -1770,7 +1863,7 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 	}
 	affected = 0
 	for {
-		if q := p.next(); q.kind != "sym" || q.val != "(" {
+		if q := p.next(); q.kind != kindSym || q.val != "(" {
 			return rollback(fmt.Errorf("expected ("))
 		}
 		var values []interface{}
@@ -1794,7 +1887,7 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 			if p.matchSym(")") {
 				break
 			}
-			if q := p.next(); q.kind != "sym" || q.val != "," {
+			if q := p.next(); q.kind != kindSym || q.val != "," {
 				if !colsExplicit {
 					interfaceSlicePool.Put(values[:0])
 				}
@@ -1816,7 +1909,7 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 		if !p.matchSym(",") {
 			break
 		}
-		if p.peek().kind == "sym" && p.peek().val == "(" {
+		if p.peek().kind == kindSym && p.peek().val == "(" {
 			continue
 		}
 		break
@@ -1952,7 +2045,7 @@ func (db *DB) parseUpdate(p *sqlParser) (columns []string, rows [][]interface{},
 			err = e
 			return
 		}
-		if op := p.next(); op.kind != "sym" || op.val != "=" {
+		if op := p.next(); op.kind != kindSym || op.val != "=" {
 			err = fmt.Errorf("expected =")
 			return
 		}
@@ -1975,7 +2068,7 @@ func (db *DB) parseUpdate(p *sqlParser) (columns []string, rows [][]interface{},
 		err = e
 		return
 	}
-	if op := p.next(); op.kind != "sym" || op.val != "=" {
+	if op := p.next(); op.kind != kindSym || op.val != "=" {
 		err = fmt.Errorf("expected =")
 		return
 	}
@@ -2048,7 +2141,7 @@ func (db *DB) parseDelete(p *sqlParser) (columns []string, rows [][]interface{},
 		err = e
 		return
 	}
-	if op := p.next(); op.kind != "sym" || op.val != "=" {
+	if op := p.next(); op.kind != kindSym || op.val != "=" {
 		err = fmt.Errorf("expected =")
 		return
 	}
@@ -2103,7 +2196,7 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 			return
 		}
 	}
-	if q := p.next(); q.kind != "sym" || q.val != "(" {
+	if q := p.next(); q.kind != kindSym || q.val != "(" {
 		err = fmt.Errorf("expected (")
 		return
 	}
@@ -2117,7 +2210,7 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 				err = fmt.Errorf("expected KEY")
 				return
 			}
-			if q := p.next(); q.kind != "sym" || q.val != "(" {
+			if q := p.next(); q.kind != kindSym || q.val != "(" {
 				err = fmt.Errorf("expected (")
 				return
 			}
@@ -2131,7 +2224,7 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 			if p.matchSym(")") {
 				break
 			}
-			if q := p.next(); q.kind != "sym" || q.val != "," {
+			if q := p.next(); q.kind != kindSym || q.val != "," {
 				err = fmt.Errorf("expected ,")
 				return
 			}
@@ -2143,7 +2236,7 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 			return
 		}
 		typeTok := p.next()
-		if typeTok.kind != "kw" && typeTok.kind != "ident" {
+		if typeTok.kind != kindKw && typeTok.kind != kindIdent {
 			err = fmt.Errorf("expected type after %s", fname)
 			return
 		}
@@ -2156,14 +2249,14 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 		if ftype == TypeVarchar {
 			flen = 255
 		}
-		if q := p.next(); q.kind == "sym" && q.val == "(" {
+		if q := p.next(); q.kind == kindSym && q.val == "(" {
 			num := p.next()
-			if num.kind != "num" {
+			if num.kind != kindNum {
 				err = fmt.Errorf("expected length")
 				return
 			}
 			flen, _ = strconv.Atoi(num.val)
-			if q := p.next(); q.kind != "sym" || q.val != ")" {
+			if q := p.next(); q.kind != kindSym || q.val != ")" {
 				err = fmt.Errorf("expected )")
 				return
 			}
@@ -2171,7 +2264,7 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 			p.i-- // 回退已读符号
 		}
 		// 行内 PRIMARY KEY
-		if p.peek().kind == "kw" && p.peek().upper == "PRIMARY" {
+		if p.peek().kind == kindKw && p.peek().upper == "PRIMARY" {
 			p.next()
 			p.next() // KEY
 			if !pkNameSet {
@@ -2183,7 +2276,7 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 		if p.matchSym(")") {
 			break
 		}
-		if q := p.next(); q.kind != "sym" || q.val != "," {
+		if q := p.next(); q.kind != kindSym || q.val != "," {
 			err = fmt.Errorf("expected , or )")
 			return
 		}
@@ -2323,14 +2416,14 @@ func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interfac
 		if ftype == TypeVarchar {
 			flen = 255
 		}
-		if q := p.next(); q.kind == "sym" && q.val == "(" {
+		if q := p.next(); q.kind == kindSym && q.val == "(" {
 			num := p.next()
-			if num.kind != "num" {
+			if num.kind != kindNum {
 				err = fmt.Errorf("expected length")
 				return
 			}
 			flen, _ = strconv.Atoi(num.val)
-			if q := p.next(); q.kind != "sym" || q.val != ")" {
+			if q := p.next(); q.kind != kindSym || q.val != ")" {
 				err = fmt.Errorf("expected )")
 				return
 			}
@@ -2424,6 +2517,22 @@ func likeMatch(s, pattern string) bool {
 		pi++
 	}
 	return pi == len(lp)
+}
+
+// hasPrefixFold 大小写不敏感的前缀比较（标准库无此函数；避免为每次检查
+// 做一次整串 ToLower/ToUpper 拷贝）。
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
+}
+
+// matchAnyFold 报告 w 与 words 中任一词大小写不敏感相等（零分配）。
+func matchAnyFold(w string, words ...string) bool {
+	for _, x := range words {
+		if strings.EqualFold(w, x) {
+			return true
+		}
+	}
+	return false
 }
 
 // sortRowsByFirst 按首列字符串升序排序。

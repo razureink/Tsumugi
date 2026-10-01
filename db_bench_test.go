@@ -190,6 +190,25 @@ func BenchmarkSQLPointSelect(b *testing.B) {
 	}
 }
 
+// BenchmarkSQLRangeScan 走完整 SQL 链路的主键范围扫描（SELECT * ... LIMIT 100），
+// 量化 selectRowsFlat 行结果的分配开销（rowArena 后备存储）。
+func BenchmarkSQLRangeScan(b *testing.B) {
+	db, tbl := benchDB(b)
+	const n = 100000
+	for i := int64(0); i < n; i++ {
+		if err := tbl.Insert(i, benchRow(i), 0, 0, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, rows, _, _, err := db.runSQL(fmt.Sprintf("SELECT * FROM bench WHERE id > %d LIMIT 100", i%(n-200)))
+		if err != nil || len(rows) != 100 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
 // BenchmarkTokenizeSQL 分词器本身（含关键字内部化路径）
 func BenchmarkTokenizeSQL(b *testing.B) {
 	sql := "select id, name from bench where id = 12345 and name like 'name-1%' order by id desc limit 10"
@@ -200,5 +219,42 @@ func BenchmarkTokenizeSQL(b *testing.B) {
 			b.Fatal(err)
 		}
 		putSQLTokens(toks)
+	}
+}
+
+// BenchmarkFilteredScan 引擎级谓词过滤扫描：WHERE 非索引列 = 常量（1 万行命中 1 行）。
+// 量化 SelectR 扫描路径的每行开销——flat 求值不应为被过滤行分配 map。
+func BenchmarkFilteredScan(b *testing.B) {
+	_, tbl := benchDB(b)
+	const n = 10000
+	for i := int64(0); i < n; i++ {
+		if err := tbl.Insert(i, benchRow(i), 0, 0, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := tbl.SelectR(map[string]interface{}{"name": fmt.Sprintf("name-%d", i%(n/2))}, nil, nil, nil, -1)
+		if err != nil || len(rows) != 1 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+// BenchmarkSQLFilteredScan 走完整 SQL 链路的非索引列等值过滤（全表扫描 + 投影）。
+func BenchmarkSQLFilteredScan(b *testing.B) {
+	db, tbl := benchDB(b)
+	const n = 10000
+	for i := int64(0); i < n; i++ {
+		if err := tbl.Insert(i, benchRow(i), 0, 0, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, rows, _, _, err := db.runSQL(fmt.Sprintf("SELECT * FROM bench WHERE name = 'name-%d'", i%(n/2)))
+		if err != nil || len(rows) != 1 {
+			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
 	}
 }

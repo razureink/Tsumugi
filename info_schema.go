@@ -621,12 +621,12 @@ func (db *DB) queryScalarSelect(p *sqlParser) (columns []string, rows [][]interf
 		vals = append(vals, val)
 		// 可选的 AS 别名
 		if p.matchKeyword("AS") {
-			if t := p.peek(); t.kind == "ident" || t.kind == "kw" {
+			if t := p.peek(); t.kind == kindIdent || t.kind == kindKw {
 				cols[len(cols)-1] = t.val
 				p.next()
 			}
 		}
-		if p.peek().kind == "sym" && p.peek().val == "," {
+		if p.peek().kind == kindSym && p.peek().val == "," {
 			p.next()
 			continue
 		}
@@ -634,11 +634,11 @@ func (db *DB) queryScalarSelect(p *sqlParser) (columns []string, rows [][]interf
 	}
 	// 尾部可选 LIMIT 1 / 分号
 	p.matchKeyword("LIMIT")
-	if t := p.peek(); t.kind == "num" {
+	if t := p.peek(); t.kind == kindNum {
 		p.next()
 	}
 	// 必须是语句结尾（无 FROM），否则交给常规 SELECT 解析
-	if t := p.peek(); t.kind != "eof" && !(t.kind == "sym" && t.val == ";") {
+	if t := p.peek(); t.kind != kindEof && !(t.kind == kindSym && t.val == ";") {
 		p.i = save
 		return nil, nil, nil
 	}
@@ -651,20 +651,20 @@ func (db *DB) queryScalarSelect(p *sqlParser) (columns []string, rows [][]interf
 func (db *DB) parseScalarExpr(p *sqlParser) (name string, val interface{}, ok bool) {
 	t := p.peek()
 	// @@变量：tokenizer 将 @@ 拆为两个 @ 符号，后接 [session.|global.]ident[.ident]
-	if t.kind == "sym" && t.val == "@" {
+	if t.kind == kindSym && t.val == "@" {
 		p.next()
-		if p.peek().kind == "sym" && p.peek().val == "@" {
+		if p.peek().kind == kindSym && p.peek().val == "@" {
 			p.next()
 		}
 		var sb strings.Builder
 		for {
 			nt := p.peek()
-			if nt.kind == "ident" || nt.kind == "kw" {
+			if nt.kind == kindIdent || nt.kind == kindKw {
 				sb.WriteString(nt.val)
 				p.next()
 				continue
 			}
-			if nt.kind == "sym" && nt.val == "." {
+			if nt.kind == kindSym && nt.val == "." {
 				sb.WriteString(".")
 				p.next()
 				continue
@@ -679,70 +679,67 @@ func (db *DB) parseScalarExpr(p *sqlParser) (name string, val interface{}, ok bo
 		colName := "@@" + name
 		return colName, db.systemVar(name), true
 	}
-	// 函数调用：IDENT( 形式
-	if t.kind == "ident" {
+	// 函数调用：IDENT( 形式。先确认后随 "(" 再做大写归一——普通 SELECT 的
+	// 首个列名（SELECT id, name FROM ...）会走这里快速失败，省一次 ToUpper 分配。
+	if t.kind == kindIdent && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == kindSym && p.toks[p.i+1].val == "(" {
 		fn := strings.ToUpper(t.val)
 		save := p.i
 		p.next()
-		if p.peek().kind == "sym" && p.peek().val == "(" {
-			// 跳过括号内内容（含嵌套括号/字符串），仅消费 token
-			depth := 1
-			p.next() // 消费 (
-			for depth > 0 {
-				tok := p.next()
-				if tok.kind == "eof" {
-					p.i = save
-					return "", nil, false
-				}
-				if tok.kind == "sym" {
-					if tok.val == "(" {
-						depth++
-					} else if tok.val == ")" {
-						depth--
-					}
+		// 跳过括号内内容（含嵌套括号/字符串），仅消费 token
+		depth := 1
+		p.next() // 消费 (
+		for depth > 0 {
+			tok := p.next()
+			if tok.kind == kindEof {
+				p.i = save
+				return "", nil, false
+			}
+			if tok.kind == kindSym {
+				if tok.val == "(" {
+					depth++
+				} else if tok.val == ")" {
+					depth--
 				}
 			}
-			switch fn {
-			case "VERSION":
-				val = mysqlCfg.get().Version
-			case "NOW", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP":
-				val = time.Now().Format("2006-01-02 15:04:05")
-			case "DATABASE", "SCHEMA":
-				val = db.getCurDB()
-			case "CURRENT_USER", "USER", "SESSION_USER", "SYSTEM_USER":
-				val = mysqlCfg.defaultUser()
-			case "CONNECTION_ID":
-				val = int64(1)
-			case "COLLATION":
-				val = "utf8mb4_unicode_ci"
-			case "CHARSET":
-				val = "utf8mb4"
-			case "FOUND_ROWS":
-				val = int64(0)
-			case "ROW_COUNT":
-				val = int64(0)
-			case "LAST_INSERT_ID":
-				val = int64(0)
-			case "CURRENT_DATE", "CURDATE":
-				val = time.Now().Format("2006-01-02")
-			case "CURTIME":
-				val = time.Now().Format("15:04:05")
-			case "UUID":
-				val = newUUID()
-			default:
-				val = ""
-			}
-			return strings.ToLower(fn), val, true
 		}
-		p.i = save
-		return "", nil, false
+		switch fn {
+		case "VERSION":
+			val = mysqlCfg.get().Version
+		case "NOW", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP":
+			val = time.Now().Format("2006-01-02 15:04:05")
+		case "DATABASE", "SCHEMA":
+			val = db.getCurDB()
+		case "CURRENT_USER", "USER", "SESSION_USER", "SYSTEM_USER":
+			val = mysqlCfg.defaultUser()
+		case "CONNECTION_ID":
+			val = int64(1)
+		case "COLLATION":
+			val = "utf8mb4_unicode_ci"
+		case "CHARSET":
+			val = "utf8mb4"
+		case "FOUND_ROWS":
+			val = int64(0)
+		case "ROW_COUNT":
+			val = int64(0)
+		case "LAST_INSERT_ID":
+			val = int64(0)
+		case "CURRENT_DATE", "CURDATE":
+			val = time.Now().Format("2006-01-02")
+		case "CURTIME":
+			val = time.Now().Format("15:04:05")
+		case "UUID":
+			val = newUUID()
+		default:
+			val = ""
+		}
+		return strings.ToLower(fn), val, true
 	}
 	// 字符串或数字字面量
-	if t.kind == "str" {
+	if t.kind == kindStr {
 		p.next()
 		return t.val, t.val, true
 	}
-	if t.kind == "num" {
+	if t.kind == kindNum {
 		p.next()
 		if n, e := strconv.ParseInt(t.val, 10, 64); e == nil {
 			return t.val, n, true

@@ -355,7 +355,7 @@ func (db *DB) webSchemaFor(token string) string {
 // handleWebUse 处理 SQL 控制台的 USE：校验目标库后记到该 token 的会话上。
 func (db *DB) handleWebUse(u *User, token, sql string) (bool, string) {
 	toks, err := tokenizeSQL(sql)
-	if err != nil || len(toks) < 2 || (toks[1].kind != "ident" && toks[1].kind != "str") {
+	if err != nil || len(toks) < 2 || (toks[1].kind != kindIdent && toks[1].kind != kindStr) {
 		return false, "invalid USE statement"
 	}
 	name := toks[1].val

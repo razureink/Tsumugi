@@ -151,17 +151,17 @@ func extractedTableNames(sql string) []string {
 			continue
 		}
 		j := i + 1
-		if toks[j].kind == "kw" && (toks[j].upper == "TABLE" || toks[j].upper == "KEY") {
+		if toks[j].kind == kindKw && (toks[j].upper == "TABLE" || toks[j].upper == "KEY") {
 			j++
 			if j >= len(toks) {
 				continue
 			}
 		}
-		if toks[j].kind != "ident" && toks[j].kind != "kw" {
+		if toks[j].kind != kindIdent && toks[j].kind != kindKw {
 			continue
 		}
 		name := toks[j].val
-		if j+2 < len(toks) && toks[j+1].kind == "sym" && toks[j+1].val == "." && (toks[j+2].kind == "ident" || toks[j+2].kind == "kw") {
+		if j+2 < len(toks) && toks[j+1].kind == kindSym && toks[j+1].val == "." && (toks[j+2].kind == kindIdent || toks[j+2].kind == kindKw) {
 			name += "." + toks[j+2].val
 		}
 		names = append(names, name)

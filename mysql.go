@@ -532,24 +532,25 @@ func (mc *mysqlConn) handleQuery(sql string) {
 		return
 	}
 	// 事务与 SET 语句：维护连接级事务状态，不进入数据引擎。
-	// 命令分派只依赖首个单词：仅对首词做 ToUpper，避免整条 SQL 的大写拷贝
-	//（旧实现每条查询先整串 ToUpper，长语句下是热路径最大的一次分配）。
-	kw := strings.ToUpper(firstWordUpper(sql))
+	// 命令分派只依赖首词：EqualFold 直接比较（零分配），不再做任何 ToUpper
+	// 拷贝——旧实现先整串、后首词大写，每条查询至少多一次堆分配。
+	fw := firstWordUpper(sql)
 	// 命令计数：按语句类型计入与二进制协议一致的命令名（此前 MySQL 路径
 	// 完全没有计数，QPS/TPS 对 MySQL 流量恒为 0）。
-	switch kw {
-	case "INSERT", "UPDATE", "DELETE", "SELECT", "CREATE", "DROP", "ALTER", "SHOW", "DESCRIBE", "DESC":
-		mc.db.stats.IncCmd(kw)
-	default:
-		mc.db.stats.IncCmd("QUERY")
+	cmd := "QUERY"
+	for _, w := range mysqlCmdWords {
+		if strings.EqualFold(fw, w) {
+			cmd = w
+			break
+		}
 	}
-	if kw == "BEGIN" || kw == "START" || kw == "COMMIT" || kw == "ROLLBACK" ||
-		kw == "SET" || kw == "SETS" {
-		mc.handleTxCommand(strings.ToUpper(sql), sql)
+	mc.db.stats.IncCmd(cmd)
+	if matchAnyFold(fw, "BEGIN", "START", "COMMIT", "ROLLBACK", "SET", "SETS") {
+		mc.handleTxCommand(sql)
 		return
 	}
 	// USE：切换本连接的默认数据库（连接级状态，不再污染全局 curDB）
-	if kw == "USE" {
+	if strings.EqualFold(fw, "USE") {
 		mc.handleUse(sql)
 		return
 	}
@@ -584,7 +585,7 @@ func (mc *mysqlConn) handleUse(sql string) {
 	}
 	defer putSQLTokens(toks)
 	// toks[0]=USE
-	if len(toks) < 2 || (toks[1].kind != "ident" && toks[1].kind != "str") || (len(toks) > 3 && toks[2].kind != "eof") {
+	if len(toks) < 2 || (toks[1].kind != kindIdent && toks[1].kind != kindStr) || (len(toks) > 3 && toks[2].kind != kindEof) {
 		mc.sendError(1064, "invalid USE statement")
 		return
 	}
@@ -612,10 +613,14 @@ func firstWordUpper(upper string) string {
 	return upper[:end]
 }
 
+// mysqlCmdWords 统计用命令词表（与二进制协议一致的命令名）。
+var mysqlCmdWords = [...]string{"INSERT", "UPDATE", "DELETE", "SELECT", "CREATE", "DROP", "ALTER", "SHOW", "DESCRIBE", "DESC"}
+
 // handleTxCommand 处理 BEGIN/COMMIT/ROLLBACK/SET 等连接级事务与会话语句。
-func (mc *mysqlConn) handleTxCommand(upper, sql string) {
+// 前缀判断走大小写不敏感比较：不再整串 ToUpper（SET 常携带很长的变量清单）。
+func (mc *mysqlConn) handleTxCommand(sql string) {
 	switch {
-	case strings.HasPrefix(upper, "BEGIN"), strings.HasPrefix(upper, "START"):
+	case hasPrefixFold(sql, "BEGIN"), hasPrefixFold(sql, "START"):
 		if mc.inTxn {
 			mc.sendError(1568, "transaction already active")
 			return
@@ -623,7 +628,7 @@ func (mc *mysqlConn) handleTxCommand(upper, sql string) {
 		mc.txnID = mc.db.BeginTxn()
 		mc.inTxn = true
 		mc.writeOK()
-	case strings.HasPrefix(upper, "COMMIT"):
+	case hasPrefixFold(sql, "COMMIT"):
 		if !mc.inTxn {
 			mc.sendError(1614, "no transaction active")
 			return
@@ -637,14 +642,14 @@ func (mc *mysqlConn) handleTxCommand(upper, sql string) {
 		mc.inTxn = false
 		mc.txnID = 0
 		mc.writeOK()
-	case strings.HasPrefix(upper, "ROLLBACK"):
+	case hasPrefixFold(sql, "ROLLBACK"):
 		if mc.inTxn {
 			_ = mc.db.RollbackTxn(mc.txnID)
 			mc.inTxn = false
 			mc.txnID = 0
 		}
 		mc.writeOK()
-	case strings.HasPrefix(upper, "SET"): // 会话变量：忽略，仅返回 OK
+	case hasPrefixFold(sql, "SET"): // 会话变量：忽略，仅返回 OK
 		mc.writeOK()
 	}
 }
