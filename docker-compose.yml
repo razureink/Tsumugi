@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   tsumugi:
     build: .
@@ -16,8 +14,12 @@ services:
       TSUMUGI_PORT: "9999"
     volumes:
       - ./data:/app/data
+      - ./config:/app/config
+      - ./backup:/app/backup
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/api/setup/status"]
+      # 面板端口是 10232（曾误写 8080 导致容器永久 unhealthy）
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:10232/api/setup/status"]
       interval: 10s
       timeout: 3s
       retries: 5
+      start_period: 30s

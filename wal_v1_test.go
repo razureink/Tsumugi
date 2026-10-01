@@ -36,7 +36,7 @@ func walTestMeta(name string) *TableMeta {
 	}
 }
 
-func walMustCreate(t *testing.T, db *DB, name string) {
+func walMustCreate(t testing.TB, db *DB, name string) {
 	t.Helper()
 	meta := walTestMeta(name)
 	db.mu.Lock()

@@ -14,27 +14,23 @@ import (
 
 // ==================== 统计 ====================
 
-// opsShard 命令计数分片：降低高并发下 opsCount 的锁竞争
-type opsShard struct {
-	mu sync.Mutex
-	m  map[string]uint64
-}
-
-func fnv1a(s string) uint32 {
-	var h uint32 = 2166136261
-	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= 16777619
-	}
-	return h
-}
+// maxOpsSlots 命令计数槽位上限。命令名是一个固定小词表（~35 个），
+// 槽位耗尽后落到共享的溢出槽（计数合并，仅影响可观测性不影响正确性）。
+const maxOpsSlots = 256
+const opsOverflowSlot = maxOpsSlots - 1
 
 type Stats struct {
 	cmdCount uint64
 	errCount uint64
 
-	// 命令计数分片（每命令一个原子计数，避免单一互斥锁竞争）
-	opsShards [16]opsShard
+	// 命令计数：name -> 槽位（sync.Map，注册一次后只读）+ 槽位原子计数。
+	// 取代旧的互斥锁分片 map——旧实现把同名命令全部压到同一把锁上，
+	// 高并发 INSERT 实测每条命令多花 ~285ns 且互斥。
+	opsNames  [maxOpsSlots]string
+	opsCounts [maxOpsSlots]atomic.Uint64
+	opsSlots  sync.Map // name -> uint32
+	opsMu     sync.Mutex
+	opsNext   uint32
 
 	// 速率统计：100ms 一个桶，256 桶共 25.6s，任意吞吐下不封顶、内存固定
 	// rate* 统计全部命令（QPS），rate*W 统计写入命令（TPS）
@@ -67,9 +63,6 @@ func NewStats() *Stats {
 		startTime:    time.Now(),
 		cpuLast:      time.Now(),
 		cpuLastTotal: readProcessCPUSeconds(),
-	}
-	for i := range s.opsShards {
-		s.opsShards[i].m = make(map[string]uint64)
 	}
 	return s
 }
@@ -111,25 +104,46 @@ func (s *Stats) calcCPUPercent() float64 {
 	return pct
 }
 
+// slotFor 返回命令名的计数槽位（注册一次，此后原子读）。
+func (s *Stats) slotFor(name string) uint32 {
+	if v, ok := s.opsSlots.Load(name); ok {
+		return v.(uint32)
+	}
+	s.opsMu.Lock()
+	defer s.opsMu.Unlock()
+	if v, ok := s.opsSlots.Load(name); ok {
+		return v.(uint32)
+	}
+	next := atomic.AddUint32(&s.opsNext, 1) - 1
+	slot := next
+	if slot >= opsOverflowSlot {
+		slot = opsOverflowSlot // 槽位耗尽：合并到溢出槽
+	} else {
+		s.opsNames[slot] = name
+	}
+	s.opsSlots.Store(name, slot)
+	return slot
+}
+
 func (s *Stats) IncCmd(name string) {
 	atomic.AddUint64(&s.cmdCount, 1)
-	shard := &s.opsShards[fnv1a(name)%uint32(len(s.opsShards))]
-	shard.mu.Lock()
-	shard.m[name]++
-	shard.mu.Unlock()
+	s.opsCounts[s.slotFor(name)].Add(1)
 	if name == "AUTH" || name == "PING" {
 		return
 	}
-	incRate(&s.rateTicks, &s.rateCounts)
+	// QPS/TPS 两个桶共用同一刻度：只取一次时钟（Windows 上 time.Now 走 QPC，
+	// 每条命令两次取钟约占 IncCmd 总开销的 1/3）。
+	tick := time.Now().UnixMilli() / 100
+	incRateTick(&s.rateTicks, &s.rateCounts, tick)
 	if isWriteCmd(name) {
-		incRate(&s.rateTicksW, &s.rateCountsW)
+		incRateTick(&s.rateTicksW, &s.rateCountsW, tick)
 	}
 }
 
 // isWriteCmd 判断命令是否属于写操作（用于 TPS 统计）。
 func isWriteCmd(name string) bool {
 	switch name {
-	case "INSERT", "UPDATE", "DELETE", "BATCH", "STRESS_WRITE":
+	case "INSERT", "UPDATE", "DELETE", "BATCH":
 		return true
 	}
 	return false
@@ -137,7 +151,11 @@ func isWriteCmd(name string) bool {
 
 // incRate 无锁速率统计：100ms 一个桶，CAS 推进刻度避免并发推进同一桶的竞态。
 func incRate(ticks *[256]int64, counts *[256]int64) {
-	tick := time.Now().UnixMilli() / 100
+	incRateTick(ticks, counts, time.Now().UnixMilli()/100)
+}
+
+// incRateTick 同 incRate，但刻度由调用方传入（同一命令的多个速率桶共用一次取钟）。
+func incRateTick(ticks *[256]int64, counts *[256]int64, tick int64) {
 	i := int(tick % 256)
 	for {
 		cur := atomic.LoadInt64(&ticks[i])
@@ -196,14 +214,22 @@ func (s *Stats) IncErr() {
 
 func (s *Stats) Snapshot() map[string]interface{} {
 	opsCopy := make(map[string]uint64)
-	for i := range s.opsShards {
-		shard := &s.opsShards[i]
-		shard.mu.Lock()
-		for k, v := range shard.m {
-			opsCopy[k] = v
-		}
-		shard.mu.Unlock()
+	n := atomic.LoadUint32(&s.opsNext)
+	if n > opsOverflowSlot {
+		n = opsOverflowSlot
 	}
+	for i := uint32(0); i < n; i++ {
+		if name := s.opsNames[i]; name != "" {
+			opsCopy[name] = s.opsCounts[i].Load()
+		}
+	}
+	// 溢出槽中的名字（极少发生）：单独列出避免丢计数
+	s.opsSlots.Range(func(k, v interface{}) bool {
+		if v.(uint32) == opsOverflowSlot {
+			opsCopy[k.(string)+"*"] = s.opsCounts[opsOverflowSlot].Load()
+		}
+		return true
+	})
 	qps, tps := s.calcRates()
 	walMBs := float64(calcRate(&s.walRateTicks, &s.walRateBytes)) / 1024 / 1024
 	fsyncPerS := float64(calcRate(&s.walRateTicksF, &s.walRateFsync))
@@ -283,8 +309,8 @@ func (db *DB) startMetricsServer() {
 		}
 	})
 
-	// JSON API
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+	// JSON API（需管理员认证）
+	mux.HandleFunc("/api/stats", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		snap := db.stats.Snapshot()
 		// 附加服务/存储信息（专业面板）
@@ -311,10 +337,19 @@ func (db *DB) startMetricsServer() {
 			"checksum":          db.config.EnableChecksum,
 		}
 		json.NewEncoder(w).Encode(snap)
-	})
+	}))
 
-	// 压力测试（需管理员认证）
+	// 压力测试：管理员或显式授予 can_stress 的用户；时长钳制且不允许叠跑
 	mux.HandleFunc("/stress", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		u := currentUser(r)
+		if u == nil || (!u.IsAdmin && !u.CanStress) {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "stress test requires can_stress permission"})
+			return
+		}
+		if !stressRunning.CompareAndSwap(false, true) {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "a stress test is already running"})
+			return
+		}
 		duration := 10
 		workers := 4
 		mode := "rw"
@@ -322,6 +357,9 @@ func (db *DB) startMetricsServer() {
 			if v, err := strconv.Atoi(d); err == nil && v > 0 {
 				duration = v
 			}
+		}
+		if duration > 300 {
+			duration = 300
 		}
 		if w := r.URL.Query().Get("workers"); w != "" {
 			if v, err := strconv.Atoi(w); err == nil && v > 0 && v <= 100 {
@@ -331,13 +369,22 @@ func (db *DB) startMetricsServer() {
 		if m := r.URL.Query().Get("mode"); m != "" && stressModeValid(m) {
 			mode = m
 		}
-		go db.runStressTest(duration, workers, mode)
+		// 压测协议：native（二进制协议，默认）或 mysql（MySQL 线缆协议）
+		proto := "native"
+		if p := r.URL.Query().Get("protocol"); p == "mysql" || p == "native" {
+			proto = p
+		}
+		go func() {
+			defer stressRunning.Store(false)
+			db.runStressTest(duration, workers, mode, proto)
+		}()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":   "started",
 			"duration": duration,
 			"workers":  workers,
 			"mode":     mode,
+			"protocol": proto,
 		})
 	}))
 
@@ -350,9 +397,9 @@ func (db *DB) startMetricsServer() {
 	// 管理面板 API
 	mux.HandleFunc("/api/login", db.handleLogin)
 	mux.HandleFunc("/api/logout", db.handleLogout)
-	// 首次设置向导
+	// 首次设置向导（root-password 端点已删除：前端从不调用，且安装前无鉴权地
+	// 返回生成密码只增加攻击面；安装统一走 /api/setup/complete）
 	mux.HandleFunc("/api/setup/status", db.handleSetupStatus)
-	mux.HandleFunc("/api/setup/root-password", db.handleSetupRootPwd)
 	mux.HandleFunc("/api/setup/complete", db.handleSetupComplete)
 	// 用户管理
 	mux.HandleFunc("/api/admin/users", adminAuthRequired(db.handleUserList))
@@ -376,6 +423,9 @@ func (db *DB) startMetricsServer() {
 		db.handleSettingsGet(w, r)
 	}))
 	mux.HandleFunc("/api/admin/compact", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, "compact is admin-only") {
+			return
+		}
 		if err := db.Compact(); err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
 			return
@@ -383,6 +433,9 @@ func (db *DB) startMetricsServer() {
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": trMsg(reqLang(r), "compact_done")})
 	}))
 	mux.HandleFunc("/api/admin/restart", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, "restart is admin-only") {
+			return
+		}
 		writeJSON(w, map[string]interface{}{"ok": true})
 		db.handleRestart()
 	}))
@@ -400,6 +453,9 @@ func (db *DB) startMetricsServer() {
 
 // 压测递增序号（保证多个 worker 生成不重复主键）
 var stressSeq uint64
+
+// stressRunning 压测叠跑保护：同一时刻只允许一个压测任务。
+var stressRunning atomic.Bool
 
 // stressMode 压测负载模式。
 type stressMode string
@@ -420,90 +476,3 @@ func stressModeValid(m string) bool {
 	return false
 }
 
-func (db *DB) runStressTest(duration int, workers int, mode string) {
-	logf(LOG_VERB, "Stress test: %d workers, %d seconds, mode=%s", workers, duration, mode)
-	// 广播停止信号：close(stop) 可同时唤醒所有 worker
-	stop := make(chan struct{})
-	time.AfterFunc(time.Duration(duration)*time.Second, func() { close(stop) })
-	var wg sync.WaitGroup
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			// 每个 worker 确保 test 表存在（写入 catalog，重启后仍可恢复）
-			db.mu.Lock()
-			if _, ok := db.tables.Load("test"); !ok {
-				meta := &TableMeta{
-					Name:    "test",
-					PK:      "id",
-					Fields:  []Field{{Name: "id", Type: TypeInt}, {Name: "val", Type: TypeVarchar, Len: 100}},
-					Indexes: map[string]string{},
-				}
-				table := NewTable(meta, db.walFile)
-				db.tables.Store("test", table)
-				db.tablesCount.Add(1)
-				db.catalog["test"] = meta
-				if err := db.writeCatalog(meta); err != nil {
-					logf(LOG_ERR, "stress: persist catalog: %v", err)
-				}
-			}
-			db.mu.Unlock()
-
-			var table *Table
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					key := int64(atomic.AddUint64(&stressSeq, 1))
-					if table == nil {
-						v, _ := db.tables.Load("test")
-						if v != nil {
-							table = v.(*Table)
-						} else {
-							continue
-						}
-					}
-					db.stressStep(table, stressMode(mode), key)
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
-	logf(LOG_VERB, "Stress test completed (mode=%s)", mode)
-}
-
-// stressStep 按负载模式执行一次读写/查询操作。
-func (db *DB) stressStep(table *Table, mode stressMode, key int64) {
-	switch mode {
-	case stressWrite:
-		row := map[string]interface{}{"id": key, "val": strconv.FormatInt(key, 10)}
-		table.Insert(key, row, 0, 0, false)
-		db.stats.IncCmd("STRESS_WRITE")
-	case stressPoint, stressRead:
-		// 点查询：走索引等值路径（point）或主键直查（read）
-		if mode == stressPoint {
-			table.SelectR(map[string]interface{}{"id": key}, nil, nil, nil, 1)
-			db.stats.IncCmd("STRESS_POINT")
-		} else {
-			table.SelectByPK(key)
-			db.stats.IncCmd("STRESS_READ")
-		}
-	case stressRange:
-		// 范围查询：主键区间 [key, key+999] 扫描，限制 100 行（零分配快速路径）
-		minKey := key
-		maxKey := key + 999
-		table.SelectRBytes(&minKey, &maxKey, 100)
-		db.stats.IncCmd("STRESS_RANGE")
-	default: // stressRW 默认 7:3 读写混合
-		if key%10 < 7 {
-			table.SelectByPK(key)
-			db.stats.IncCmd("STRESS_READ")
-		} else {
-			row := map[string]interface{}{"id": key, "val": strconv.FormatInt(key, 10)}
-			table.Insert(key, row, 0, 0, false)
-			db.stats.IncCmd("STRESS_WRITE")
-		}
-	}
-}

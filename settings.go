@@ -34,12 +34,17 @@ type settingsPayload struct {
 }
 
 func (db *DB) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r, "settings are admin-only") {
+		return
+	}
 	mc := mysqlCfg.get()
+	db.cfgMu.RLock()
+	defer db.cfgMu.RUnlock()
 	writeJSON(w, map[string]interface{}{
 		"ok": true,
 		"server": map[string]interface{}{
 			"user":                 db.config.User,
-			"password":             db.config.Password,
+			"password":             "",
 			"mysql_enabled":        db.config.MySQLEnabled,
 			"mysql_port":           db.config.MySQLPort,
 			"durability":           db.config.Durability,
@@ -62,18 +67,24 @@ func (db *DB) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (db *DB) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r, "settings are admin-only") {
+		return
+	}
 	var p settingsPayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "bad request"})
 		return
 	}
 
-	// ---- 热更新数据库运行时配置（部分字段）----
+	// ---- 热更新数据库运行时配置（写者互斥，避免与其他设置写入交错）----
+	db.cfgMu.Lock()
+	defer db.cfgMu.Unlock()
 	if p.User != "" {
 		db.config.User = p.User
 	}
 	if p.Password != "" {
 		db.config.Password = p.Password
+		db.config.PasswordSHA1 = passwordSHA1Hex(p.Password)
 	}
 	if p.MySQLEnabled != nil {
 		db.config.MySQLEnabled = *p.MySQLEnabled
@@ -82,7 +93,34 @@ func (db *DB) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		db.config.MySQLPort = *p.MySQLPort
 	}
 	if p.Durability.Valid() {
-		db.config.Durability = p.Durability
+		db.setDurability(p.Durability)
+	}
+	// 以下字段此前未应用（接口返回 ok 但什么都没保存）；现补齐并做范围校验，
+	// 端口类字段需重启生效，间隔类字段热生效。
+	if p.Port != nil && *p.Port > 0 && *p.Port < 65536 {
+		db.config.Port = *p.Port
+	}
+	if p.MetricsPort != nil && *p.MetricsPort > 0 && *p.MetricsPort < 65536 {
+		db.config.MetricsPort = *p.MetricsPort
+	}
+	if p.FlushMS != nil && *p.FlushMS > 0 && *p.FlushMS <= 600000 {
+		db.config.FlushInterval = time.Duration(*p.FlushMS) * time.Millisecond
+		if db.flushTicker != nil {
+			db.flushTicker.Reset(db.config.FlushInterval)
+		}
+	}
+	if p.GroupCommitMS != nil && *p.GroupCommitMS > 0 && *p.GroupCommitMS <= 1000 {
+		db.config.GroupCommitInterval = time.Duration(*p.GroupCommitMS) * time.Millisecond
+	}
+	if p.TTLCleanMS != nil && *p.TTLCleanMS >= 1000 && *p.TTLCleanMS <= 3600000 {
+		db.config.TTLCleanInterval = time.Duration(*p.TTLCleanMS) * time.Millisecond
+		if db.ttlTicker != nil {
+			db.ttlTicker.Reset(db.config.TTLCleanInterval)
+		}
+	}
+	if p.Checksum != nil {
+		db.config.EnableChecksum = *p.Checksum
+		walCRC.Store(*p.Checksum)
 	}
 	if p.AutoCompact != nil {
 		db.config.AutoCompact = *p.AutoCompact
@@ -97,7 +135,7 @@ func (db *DB) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 		db.config.CompactPeakRate = *p.CompactPeakRate
 	}
 
-	// ---- 落盘到 /config/tsumugi.json ----
+	// ---- 落盘到 /config/tsumugi.json（原子写；配置含 MySQL 认证摘要，0600）----
 	var cfgFile configFile
 	cfgFile.fillFromConfig(db.config)
 	if err := writeJSONFile(tsumugiConfigPath, &cfgFile); err != nil {
@@ -127,6 +165,7 @@ func (db *DB) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"ok": true, "msg": trMsg(reqLang(r), "settings_saved")})
 }
 
+// writeJSONFile 原子写：tmp + rename。含敏感摘要的配置文件权限收紧为 0600。
 func writeJSONFile(path string, v interface{}) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -138,5 +177,13 @@ func writeJSONFile(path string, v interface{}) error {
 			return err
 		}
 	}
-	return os.WriteFile(path, data, 0644)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

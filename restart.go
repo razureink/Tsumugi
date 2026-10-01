@@ -1,9 +1,10 @@
 package main
 
 // ==================== 服务重启（网页端触发） ====================
-// 部分配置（如实验性显存镜像）只在启动时生效；保存后需要重启服务。
 // /api/admin/restart 用当前可执行文件与相同参数拉起一个新的子进程，
-// 随后优雅关闭当前进程。子进程独立于父进程运行，父进程退出不影响它。
+// 随后立即优雅关闭当前进程并释放端口，子进程再绑定端口。
+// 顺序很关键：旧实现先 spawn 子进程、父进程睡 1.5s 才关监听——
+// 小数据量时子进程会在 1.5s 内抢先 bind 失败退出，父进程再退出 = 服务全下线。
 
 import (
 	"os"
@@ -34,16 +35,20 @@ func (db *DB) handleRestart() {
 	if attr := restartProcAttr(); attr != nil {
 		cmd.SysProcAttr = attr
 	}
-	if err := cmd.Start(); err != nil {
-		logf(LOG_ERR, "restart: start process: %v", err)
-		restartInProgress.Store(0)
-		return
-	}
-	logf(LOG_VERB, "restart: new process started (pid=%d), shutting down old instance", cmd.Process.Pid)
-	// 给新进程留出绑定端口的时间，再优雅关闭当前实例
+	// 先关闭全部服务监听（二进制/MySQL 由注册表管理，metrics 由 db.Close 关闭）
+	// 和当前实例，再拉起子进程，消除子进程 bind "address already in use" 的竞态窗口。
 	go func() {
-		time.Sleep(1500 * time.Millisecond)
+		closeServiceListeners()
 		db.Close()
+		if err := cmd.Start(); err != nil {
+			logf(LOG_ERR, "restart: start process: %v", err)
+			logf(LOG_ERR, "restart: listeners are already closed; start the service manually")
+			restartInProgress.Store(0)
+			return
+		}
+		logf(LOG_VERB, "restart: new process started (pid=%d)", cmd.Process.Pid)
+		// 子进程已接管；稍等其完成启动日志后退出父进程
+		time.Sleep(300 * time.Millisecond)
 		os.Exit(0)
 	}()
 }

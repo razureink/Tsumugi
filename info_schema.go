@@ -437,9 +437,9 @@ func (db *DB) describeTable(ref tableRef) (columns []string, rows [][]interface{
 		return
 	}
 	columns = []string{"Field", "Type", "Null", "Key", "Default", "Extra"}
-	for _, f := range t.meta.Fields {
+	for _, f := range t.Meta().Fields {
 		key := ""
-		if t.meta.PK == f.Name {
+		if t.Meta().PK == f.Name {
 			key = "PRI"
 		}
 		rows = append(rows, []interface{}{
@@ -495,19 +495,19 @@ func (db *DB) showIndex(ref tableRef) (columns []string, rows [][]interface{}, e
 		"Collation", "Cardinality", "Sub_part", "Packed", "Null", "Index_type",
 		"Comment", "Index_comment", "Visible",
 	}
-	show := strings.TrimPrefix(t.meta.Name, ref.DB+".")
+	show := strings.TrimPrefix(t.Meta().Name, ref.DB+".")
 	if ref.DB == "" || ref.DB == "tsumugi" {
-		show = strings.TrimPrefix(t.meta.Name, "tsumugi.")
+		show = strings.TrimPrefix(t.Meta().Name, "tsumugi.")
 	}
 	if i := strings.LastIndexByte(show, '.'); i >= 0 && ref.DB == "" {
 		show = show[i+1:]
 	}
 	seq := 0
-	if t.meta.PK != "" {
+	if t.Meta().PK != "" {
 		seq++
-		rows = append(rows, []interface{}{show, "0", "PRIMARY", seq, t.meta.PK, "A", "0", nil, nil, "", "BTREE", "", "", "YES"})
+		rows = append(rows, []interface{}{show, "0", "PRIMARY", seq, t.Meta().PK, "A", "0", nil, nil, "", "BTREE", "", "", "YES"})
 	}
-	for ixName, field := range t.meta.Indexes {
+	for ixName, field := range t.Meta().Indexes {
 		seq++
 		rows = append(rows, []interface{}{show, "1", ixName, seq, field, "A", "0", nil, nil, "", "BTREE", "", "", "YES"})
 	}
@@ -523,20 +523,20 @@ func (db *DB) createTableStmt(tblName string) string {
 	var sb strings.Builder
 	sb.WriteString("CREATE TABLE `" + tblName + "` (\n")
 	first := true
-	for _, f := range t.meta.Fields {
+	for _, f := range t.Meta().Fields {
 		if !first {
 			sb.WriteString(",\n")
 		}
 		first = false
 		sb.WriteString("  `" + f.Name + "` " + fieldTypeName(f.Type))
-		if t.meta.PK == f.Name {
+		if t.Meta().PK == f.Name {
 			sb.WriteString(" NOT NULL")
 		}
 	}
-	if t.meta.PK != "" {
-		sb.WriteString(",\n  PRIMARY KEY (`" + t.meta.PK + "`)")
+	if t.Meta().PK != "" {
+		sb.WriteString(",\n  PRIMARY KEY (`" + t.Meta().PK + "`)")
 	}
-	for ixName, field := range t.meta.Indexes {
+	for ixName, field := range t.Meta().Indexes {
 		sb.WriteString(",\n  KEY `" + ixName + "` (`" + field + "`)")
 	}
 	sb.WriteString("\n) ENGINE=InnoDB")
@@ -583,14 +583,14 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	// 物理表计数：遍历计数而非大 limit 预分配（避免 OOM）
+	// 树为写时复制结构，读者加载根指针后无锁遍历，无需加锁
 	var count int64
-	t.mu.RLock()
 	scan := func(key int64, value []byte) bool {
 		if e := decodeExpireAt(value); e > 0 && time.Now().UnixNano() > e {
 			return true
 		}
 		if len(conds) > 0 {
-			row, _, _ := decodeRow(t.meta, value)
+			row, _, _ := decodeRow(t.Meta(), value)
 			if !matchConditions(row, conds) {
 				return true
 			}
@@ -599,7 +599,6 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		return true
 	}
 	t.pkTree.scanRangeStop(nil, nil, scan)
-	t.mu.RUnlock()
 	columns = []string{"COUNT(*)"}
 	rows = [][]interface{}{{count}}
 	return

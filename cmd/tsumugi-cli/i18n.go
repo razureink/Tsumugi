@@ -26,6 +26,18 @@ var cliDict = map[string]map[string]string{
 		"ru": "Tsumugi CLI - инструмент управления из командной строки",
 		"vi": "Tsumugi CLI - công cụ quản trị dòng lệnh",
 	},
+	"promptPass": {
+		"zh": "密码: ",
+		"en": "Password: ",
+		"ja": "パスワード: ",
+		"ko": "비밀번호: ",
+		"fr": "Mot de passe : ",
+		"de": "Passwort: ",
+		"es": "Contraseña: ",
+		"pt": "Senha: ",
+		"ru": "Пароль: ",
+		"vi": "Mật khẩu: ",
+	},
 	"usageHead": {
 		"zh": "用法:",
 		"en": "Usage:",

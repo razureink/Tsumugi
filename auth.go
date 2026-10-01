@@ -28,12 +28,17 @@ func (db *DB) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	matched := false
 	if u != nil {
-		matched = u.Password == hashPasswd(req.Password)
+		matched = verifyPasswd(u, req.Password)
 	}
 	if !matched || u == nil {
 		time.Sleep(300 * time.Millisecond)
 		logf(LOG_WARN, "login FAILED from %s (user=%q)", clientIP(r), req.User)
 		writeJSON(w, map[string]interface{}{"ok": false, "error": trMsg(reqLang(r), "bad_credentials")})
+		return
+	}
+	// 密码库损坏时禁止登录建立新会话（防止损坏后空库被重新 setup 接管前的窗口期）
+	if userStoreCorrupt {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "user store corrupt; manual intervention required"})
 		return
 	}
 	u.LastLogin = time.Now().Unix()
@@ -46,24 +51,24 @@ func (db *DB) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (db *DB) handleLogout(w http.ResponseWriter, r *http.Request) {
-	tok := r.Header.Get("Authorization")
-	if len(tok) > 7 && tok[:7] == "Bearer " {
-		tok = tok[7:]
-	}
-	adminTokens.revoke(tok)
+	adminTokens.revoke(bearerToken(r))
 	writeJSON(w, map[string]interface{}{"ok": true})
+}
+
+// bearerToken 仅从 Authorization: Bearer 头提取令牌。
+// 不再接受 URL query 参数：令牌会落入访问日志 / 浏览器历史 / Referer，构成持久凭据泄漏。
+func bearerToken(r *http.Request) string {
+	tok := r.Header.Get("Authorization")
+	if len(tok) > 7 && strings.EqualFold(tok[:7], "Bearer ") {
+		return tok[7:]
+	}
+	return ""
 }
 
 // adminAuthRequired 包装需要认证的管理接口。
 func adminAuthRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := r.Header.Get("Authorization")
-		if len(tok) > 7 && tok[:7] == "Bearer " {
-			tok = tok[7:]
-		} else if tok == "" {
-			tok = r.URL.Query().Get("token")
-		}
-		if _, ok := adminTokens.valid(tok); !ok {
+		if _, ok := adminTokens.valid(bearerToken(r)); !ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": trMsg(reqLang(r), "session_expired")})
@@ -75,27 +80,13 @@ func adminAuthRequired(next http.HandlerFunc) http.HandlerFunc {
 
 // requireUser 提取当前登录用户名。
 func requireUser(r *http.Request) string {
-	tok := r.Header.Get("Authorization")
-	if len(tok) > 7 && tok[:7] == "Bearer " {
-		tok = tok[7:]
-	} else if tok == "" {
-		tok = r.URL.Query().Get("token")
-	}
-	u, _ := adminTokens.valid(tok)
+	u, _ := adminTokens.valid(bearerToken(r))
 	return u
 }
 
 // clientIP 提取请求的来源 IP。
+// 仅在显式配置了可信反代时才应信任 XFF；此处默认只用 RemoteAddr，避免伪造日志来源。
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		return strings.TrimSpace(xr)
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

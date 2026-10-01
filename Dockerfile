@@ -17,7 +17,10 @@ FROM alpine:3.20
 WORKDIR /app
 COPY --from=builder /build/tsumugi /usr/local/bin/tsumugi
 COPY --from=builder /build/tsumugi-cli /usr/local/bin/tsumugi-cli
-# 暴露二进制协议端口与监控/管理面板端口
-EXPOSE 9999 8080 3306
-VOLUME ["/app/data"]
+# 以非 root 运行：进程持有数据卷与配置写权限，不应需要 root
+RUN adduser -D -H -u 10001 tsumugi && mkdir -p /app/data /app/config /app/backup && chown -R tsumugi /app
+USER tsumugi
+# 端口与默认配置一致：二进制 9999、监控/管理面板 10232、MySQL 兼容 3309
+EXPOSE 9999 10232 3309
+VOLUME ["/app/data", "/app/config", "/app/backup"]
 ENTRYPOINT ["tsumugi"]

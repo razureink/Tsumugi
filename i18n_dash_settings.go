@@ -42,4 +42,6 @@ var dashDictSettings = map[string]map[string]string{
 	"mySqlOff":            {"zh": "未开启", "en": "OFF", "ja": "OFF", "ko": "꺼짐", "fr": "Désactivé", "de": "AUS", "es": "NO", "pt": "OFF", "ru": "Выкл", "vi": "Tắt"},
 	"settingsCardLang":    {"zh": "界面语言", "en": "Language", "ja": "言語", "ko": "언어", "fr": "Langue", "de": "Sprache", "es": "Idioma", "pt": "Idioma", "ru": "Язык", "vi": "Ngôn ngữ"},
 	"settingsLangSub":     {"zh": "界面将立即切换为所选语言", "en": "The interface switches immediately", "ja": "即座に切り替わります", "ko": "즉시 변경됩니다", "fr": "Bascule immédiate", "de": "Wechselt sofort", "es": "Cambia al instante", "pt": "Muda de imediato", "ru": "Сменится сразу", "vi": "Đổi ngay lập tức"},
+	"settingsCardTone":    {"zh": "色调", "en": "Color tone", "ja": "カラートーン", "ko": "색상 톤", "fr": "Couleur", "de": "Farbton", "es": "Color", "pt": "Cor", "ru": "Цвет", "vi": "Màu sắc"},
+	"settingsToneSub":     {"zh": "选择你喜欢的主题色调", "en": "Choose your preferred theme color", "ja": "お気に入りのカラーテーマを選択", "ko": "원하는 색상 테마를 선택하세요", "fr": "Choisissez votre couleur", "de": "Wählen Sie Ihren Farbton", "es": "Elige tu color", "pt": "Escolha sua cor", "ru": "Выберите цвет", "vi": "Chọn màu yêu thích"},
 }

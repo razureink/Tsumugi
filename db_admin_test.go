@@ -13,8 +13,13 @@ func TestAdminDBManage(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
+	// 设置测试用户
+	globalUsers.Add(&User{Username: "admin", Password: hashPasswd("test"), IsAdmin: true, CreatedAt: 1})
+	tok := adminTokens.issue("admin")
+
 	// 新建
 	req := httptest.NewRequest("POST", "/api/admin/db/create", bytes.NewReader([]byte(`{"name":"my_db"}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	rec := httptest.NewRecorder()
 	db.handleAdminDBCreate(rec, req)
 	var j map[string]interface{}
@@ -28,6 +33,7 @@ func TestAdminDBManage(t *testing.T) {
 
 	// 非法名拒绝（避免 SQL 注入经名称入径）
 	req = httptest.NewRequest("POST", "/api/admin/db/create", bytes.NewReader([]byte(`{"name":"bad name;DROP TABLE x"}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	rec = httptest.NewRecorder()
 	db.handleAdminDBCreate(rec, req)
 	json.Unmarshal(rec.Body.Bytes(), &j)
@@ -37,6 +43,7 @@ func TestAdminDBManage(t *testing.T) {
 
 	// 删除系统库被拒
 	req = httptest.NewRequest("POST", "/api/admin/db/drop", bytes.NewReader([]byte(`{"name":"information_schema"}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	rec = httptest.NewRecorder()
 	db.handleAdminDBDrop(rec, req)
 	json.Unmarshal(rec.Body.Bytes(), &j)
@@ -46,6 +53,7 @@ func TestAdminDBManage(t *testing.T) {
 
 	// 正常删除
 	req = httptest.NewRequest("POST", "/api/admin/db/drop", bytes.NewReader([]byte(`{"name":"my_db"}`)))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	rec = httptest.NewRecorder()
 	db.handleAdminDBDrop(rec, req)
 	json.Unmarshal(rec.Body.Bytes(), &j)

@@ -11,6 +11,10 @@ func TestWebDatabaseFilter(t *testing.T) {
 	db := newTestDB(t)
 	defer db.Close()
 
+	// 设置测试用户
+	globalUsers.Add(&User{Username: "admin", Password: hashPasswd("test"), IsAdmin: true, CreatedAt: 1})
+	tok := adminTokens.issue("admin")
+
 	// 建表：默认库 tsumugi + 虚拟库 myapp
 	if _, _, _, _, err := db.runSQL("CREATE TABLE base_t (id INT, PRIMARY KEY (id))"); err != nil {
 		t.Fatal(err)
@@ -26,7 +30,9 @@ func TestWebDatabaseFilter(t *testing.T) {
 
 	// 全量
 	rec := httptest.NewRecorder()
-	db.handleAdminTables(rec, httptest.NewRequest("GET", "/api/admin/tables", nil))
+	req := httptest.NewRequest("GET", "/api/admin/tables", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	db.handleAdminTables(rec, req)
 	var all map[string]interface{}
 	json.Unmarshal(rec.Body.Bytes(), &all)
 	tbls := all["tables"].([]interface{})
@@ -41,7 +47,9 @@ func TestWebDatabaseFilter(t *testing.T) {
 
 	// 按 myapp 过滤
 	rec = httptest.NewRecorder()
-	db.handleAdminTables(rec, httptest.NewRequest("GET", "/api/admin/tables?db=myapp", nil))
+	req = httptest.NewRequest("GET", "/api/admin/tables?db=myapp", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	db.handleAdminTables(rec, req)
 	json.Unmarshal(rec.Body.Bytes(), &all)
 	tbls = all["tables"].([]interface{})
 	if len(tbls) != 1 || tbls[0].(map[string]interface{})["name"] != "myapp.users" {
@@ -50,7 +58,9 @@ func TestWebDatabaseFilter(t *testing.T) {
 
 	// 按 tsumugi 过滤（无前缀表）
 	rec = httptest.NewRecorder()
-	db.handleAdminTables(rec, httptest.NewRequest("GET", "/api/admin/tables?db=tsumugi", nil))
+	req = httptest.NewRequest("GET", "/api/admin/tables?db=tsumugi", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	db.handleAdminTables(rec, req)
 	json.Unmarshal(rec.Body.Bytes(), &all)
 	tbls = all["tables"].([]interface{})
 	if len(tbls) != 1 || tbls[0].(map[string]interface{})["name"] != "base_t" {

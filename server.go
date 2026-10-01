@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -27,41 +29,41 @@ var bytesBufPool = sync.Pool{
 // ==================== 命令常量 ====================
 
 const (
-	CMD_AUTH           = 10
-	CMD_PING           = 11
-	CMD_CREATE_TABLE   = 20
-	CMD_DROP_TABLE     = 21
-	CMD_DESCRIBE       = 22
-	CMD_ALTER_TABLE    = 23
-	CMD_INSERT         = 30
-	CMD_SELECT         = 31
-	CMD_UPDATE         = 32
-	CMD_DELETE         = 33
-	CMD_QUERY_SQL      = 35
-	CMD_BEGIN          = 40
-	CMD_COMMIT         = 41
-	CMD_ROLLBACK       = 42
-	CMD_CREATE_INDEX   = 50
-	CMD_BATCH          = 55
-	CMD_BACKUP         = 56
-	CMD_STATUS         = 57
-	CMD_COMPACT        = 58
-	CMD_SET_DURABILITY = 59
-	CMD_CREATE_PROC    = 60
-	CMD_CALL_PROC      = 61
-	CMD_CREATE_VIEW    = 70
-	CMD_CREATE_TRIGGER = 80
-	CMD_GRANT          = 90
-	CMD_REVOKE         = 91
+	CmdAuth           = 10
+	CmdPing           = 11
+	CmdCreateTable   = 20
+	CmdDropTable     = 21
+	CmdDescribe       = 22
+	CmdAlterTable    = 23
+	CmdInsert         = 30
+	CmdSelect         = 31
+	CmdUpdate         = 32
+	CmdDelete         = 33
+	CmdQuerySQL      = 35
+	CmdBegin          = 40
+	CmdCommit         = 41
+	CmdRollback       = 42
+	CmdCreateIndex   = 50
+	CmdBatch          = 55
+	CmdBackup         = 56
+	CmdStatus         = 57
+	CmdCompact        = 58
+	CmdSetDurability = 59
+	CmdCreateProc    = 60
+	CmdCallProc      = 61
+	CmdCreateView    = 70
+	CmdCreateTrigger = 80
+	CmdGrant          = 90
+	CmdRevoke         = 91
 )
 
 const (
-	RESP_OK        = 1
-	RESP_ERR       = 2
-	RESP_VALUE     = 3
-	RESP_NOT_FOUND = 4
-	RESP_ROWS      = 5
-	RESP_TXN_ID    = 6
+	RespOK        = 1
+	RespErr       = 2
+	RespValue     = 3
+	RespNotFound = 4
+	RespRows      = 5
+	RespTxnID    = 6
 )
 
 // ==================== Server ====================
@@ -73,11 +75,27 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
+// serviceClosers 服务监听器注册表（name -> io.Closer）。
+// restart 需要在拉起子进程前关闭所有监听端口，否则子进程 bind 失败即服务全下线。
+var serviceClosers sync.Map
+
+func registerServiceCloser(name string, c io.Closer) { serviceClosers.Store(name, c) }
+
+func closeServiceListeners() {
+	serviceClosers.Range(func(key, value interface{}) bool {
+		if c, ok := value.(io.Closer); ok {
+			c.Close()
+		}
+		return true
+	})
+}
+
 func NewServer(addr string, db *DB) (*Server, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	registerServiceCloser("binary", ln)
 	return &Server{ln: ln, db: db, stopCh: make(chan struct{})}, nil
 }
 
@@ -115,7 +133,6 @@ type Session struct {
 	inTxn      bool
 	txnID      uint64
 	db         *DB
-	lastActive time.Time
 }
 
 // read 从会话缓冲读取指定字节数（优先用 bufio，减少 syscall）。
@@ -212,20 +229,46 @@ func wLenBytes(w io.Writer, data []byte) error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
+	// 修复: 添加 panic recover，防止单个连接 panic 影响整体
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			logf(LOG_ERR, "connection handler panic: %v\nstack: %s", r, buf[:n])
+		}
+	}()
 	session := &Session{
 		conn:       conn,
 		br:         bufio.NewReaderSize(conn, 32*1024),
 		bw:         bufio.NewWriterSize(conn, 32*1024),
-		db:         s.db,
-		auth:       false,
-		lastActive: time.Now(),
+		db:   s.db,
+		auth: false,
 	}
 	defer session.bw.Flush()
+	defer func() {
+		if session.inTxn {
+			s.db.RollbackTxn(session.txnID)
+			session.inTxn = false
+		}
+	}()
+
+	// 空闲超时按需刷新：每条命令一次 SetReadDeadline 是多余的系统调用，
+	// 只在超时窗口消耗过半时续期（认证状态变化时立即生效）。
+	deadline := s.db.config.IdleTimeout
+	if !session.auth && deadline > 30*time.Second {
+		deadline = 30 * time.Second
+	}
+	deadlineAt := time.Now().Add(deadline)
+	conn.SetReadDeadline(deadlineAt)
 
 	for {
-		if session.auth && time.Since(session.lastActive) > s.db.config.IdleTimeout {
-			logf(LOG_VERB, "idle timeout, closing connection")
-			return
+		if now := time.Now(); now.After(deadlineAt.Add(-deadline / 2)) {
+			d := deadline
+			if !session.auth && d > 30*time.Second {
+				d = 30 * time.Second
+			}
+			deadlineAt = now.Add(d)
+			conn.SetReadDeadline(deadlineAt)
 		}
 
 		cmd, err := session.br.ReadByte()
@@ -235,65 +278,63 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			return
 		}
-		session.lastActive = time.Now()
-
-		if !session.auth && cmd != CMD_AUTH {
+		if !session.auth && cmd != CmdAuth {
 			s.writeError(session, "authentication required")
 			return
 		}
 
 		switch cmd {
-		case CMD_AUTH:
+		case CmdAuth:
 			s.handleAuth(session)
-		case CMD_PING:
+		case CmdPing:
 			s.handlePing(session)
-		case CMD_CREATE_TABLE:
+		case CmdCreateTable:
 			s.handleCreateTable(session)
-		case CMD_DROP_TABLE:
+		case CmdDropTable:
 			s.handleDropTable(session)
-		case CMD_DESCRIBE:
+		case CmdDescribe:
 			s.handleDescribe(session)
-		case CMD_ALTER_TABLE:
+		case CmdAlterTable:
 			s.handleAlterTable(session)
-		case CMD_INSERT:
+		case CmdInsert:
 			s.handleInsert(session)
-		case CMD_SELECT:
+		case CmdSelect:
 			s.handleSelect(session)
-		case CMD_UPDATE:
+		case CmdUpdate:
 			s.handleUpdate(session)
-		case CMD_DELETE:
+		case CmdDelete:
 			s.handleDelete(session)
-		case CMD_QUERY_SQL:
+		case CmdQuerySQL:
 			s.handleQuerySQL(session)
-		case CMD_BEGIN:
+		case CmdBegin:
 			s.handleBegin(session)
-		case CMD_COMMIT:
+		case CmdCommit:
 			s.handleCommit(session)
-		case CMD_ROLLBACK:
+		case CmdRollback:
 			s.handleRollback(session)
-		case CMD_CREATE_INDEX:
+		case CmdCreateIndex:
 			s.handleCreateIndex(session)
-		case CMD_BATCH:
+		case CmdBatch:
 			s.handleBatch(session)
-		case CMD_BACKUP:
+		case CmdBackup:
 			s.handleBackup(session)
-		case CMD_STATUS:
+		case CmdStatus:
 			s.handleStatus(session)
-		case CMD_COMPACT:
+		case CmdCompact:
 			s.handleCompact(session)
-		case CMD_SET_DURABILITY:
+		case CmdSetDurability:
 			s.handleSetDurability(session)
-		case CMD_CREATE_PROC:
+		case CmdCreateProc:
 			s.handleCreateProc(session)
-		case CMD_CALL_PROC:
+		case CmdCallProc:
 			s.handleCallProc(session)
-		case CMD_CREATE_VIEW:
+		case CmdCreateView:
 			s.handleCreateView(session)
-		case CMD_CREATE_TRIGGER:
+		case CmdCreateTrigger:
 			s.handleCreateTrigger(session)
-		case CMD_GRANT:
+		case CmdGrant:
 			s.handleGrant(session)
-		case CMD_REVOKE:
+		case CmdRevoke:
 			s.handleRevoke(session)
 		default:
 			s.writeError(session, fmt.Sprintf("unknown command: %d", cmd))
@@ -307,14 +348,14 @@ func (s *Server) handleConn(conn net.Conn) {
 // ==================== 辅助函数 ====================
 
 func (s *Server) writeError(session *Session, msg string) {
-	session.bw.WriteByte(RESP_ERR)
+	session.bw.WriteByte(RespErr)
 	wU32(session.bw, uint32(len(msg)))
 	session.bw.WriteString(msg)
 	s.db.stats.IncErr()
 }
 
 func (s *Server) writeOK(session *Session) {
-	session.bw.WriteByte(RESP_OK)
+	session.bw.WriteByte(RespOK)
 }
 
 // ==================== 命令处理 ====================
@@ -342,7 +383,7 @@ func (s *Server) handleAuth(session *Session) {
 	passwd := string(pass)
 	// 验证用户凭据
 	u := globalUsers.Get(uname)
-	matched := u != nil && u.Password == hashPasswd(passwd)
+	matched := u != nil && verifyPasswd(u, passwd)
 	if matched {
 		session.auth = true
 		session.user = uname
@@ -476,22 +517,32 @@ func (s *Server) handleCreateTable(session *Session) {
 	logf(LOG_VERB, "table %s created", tableName)
 }
 
+// readTableName 从连接读取 u16 长度前缀的表名字符串。
+func readTableName(r *bufio.Reader) (string, error) {
+	n, err := rU16(r)
+	if err != nil {
+		return "", fmt.Errorf("read table name length: %w", err)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", fmt.Errorf("read table name: %w", err)
+	}
+	return string(buf), nil
+}
+
 // ---- DROP TABLE ----
 func (s *Server) handleDropTable(session *Session) {
 	s.db.stats.IncCmd("DROP_TABLE")
-	nameLen, err := rU16(session.br)
+	tableName, err := readTableName(session.br)
 	if err != nil {
-		s.writeError(session, "invalid name length")
+		s.writeError(session, err.Error())
 		return
 	}
-	name := make([]byte, nameLen)
-	if _, err := io.ReadFull(session.br, name); err != nil {
-		s.writeError(session, "read name failed")
+	if err := validateTableName([]byte(tableName)); err != nil {
+		s.writeError(session, err.Error())
 		return
 	}
-	tableName := string(name)
-
-	if !session.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != session.db.config.User {
+	if !s.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != s.db.config.User {
 		s.writeError(session, "permission denied")
 		return
 	}
@@ -503,6 +554,11 @@ func (s *Server) handleDropTable(session *Session) {
 		db.tables.Delete(tableName)
 		db.tablesCount.Add(-1)
 		delete(db.catalog, tableName)
+		// 修复: 写 catalog DROP 记录，确保重启后表不会复活
+		if err := db.writeCatalogDrop(tableName); err != nil {
+			s.writeError(session, err.Error())
+			return
+		}
 		s.writeOK(session)
 	} else {
 		s.writeError(session, "table not found")
@@ -512,18 +568,15 @@ func (s *Server) handleDropTable(session *Session) {
 // ---- DESCRIBE ----
 func (s *Server) handleDescribe(session *Session) {
 	s.db.stats.IncCmd("DESCRIBE")
-	nameLen, err := rU16(session.br)
+	tableName, err := readTableName(session.br)
 	if err != nil {
-		s.writeError(session, "invalid name length")
+		s.writeError(session, err.Error())
 		return
 	}
-	name := make([]byte, nameLen)
-	if _, err := io.ReadFull(session.br, name); err != nil {
-		s.writeError(session, "read name failed")
+	if err := validateTableName([]byte(tableName)); err != nil {
+		s.writeError(session, err.Error())
 		return
 	}
-	tableName := string(name)
-
 	db := session.db
 	db.mu.RLock()
 	meta, ok := db.catalog[tableName]
@@ -555,14 +608,13 @@ func (s *Server) handleDescribe(session *Session) {
 // ---- ALTER TABLE (ADD COLUMN) ----
 func (s *Server) handleAlterTable(session *Session) {
 	s.db.stats.IncCmd("ALTER_TABLE")
-	tableNameLen, err := rU16(session.br)
+	tableName, err := readTableName(session.br)
 	if err != nil {
-		s.writeError(session, "read table name length failed")
+		s.writeError(session, err.Error())
 		return
 	}
-	tableName := make([]byte, tableNameLen)
-	if _, err := io.ReadFull(session.br, tableName); err != nil {
-		s.writeError(session, "read table name failed")
+	if err := validateTableName([]byte(tableName)); err != nil {
+		s.writeError(session, err.Error())
 		return
 	}
 	fieldNameLen, err := rU16(session.br)
@@ -585,11 +637,11 @@ func (s *Server) handleAlterTable(session *Session) {
 		s.writeError(session, "read field length failed")
 		return
 	}
-	if !session.db.CheckPrivilege(session.user, string(tableName), PermDDL) && session.user != session.db.config.User {
+	if !session.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != session.db.config.User {
 		s.writeError(session, "permission denied")
 		return
 	}
-	if err := session.db.AlterTableAddColumn(string(tableName), string(fieldName), FieldType(fType), int(fLen)); err != nil {
+	if err := session.db.AlterTableAddColumn(tableName, string(fieldName), FieldType(fType), int(fLen)); err != nil {
 		s.writeError(session, err.Error())
 		return
 	}
@@ -742,7 +794,7 @@ func (s *Server) handleSelect(session *Session) {
 			s.writeError(session, err.Error())
 			return
 		}
-		session.bw.WriteByte(RESP_ROWS)
+		session.bw.WriteByte(RespRows)
 		wU32(session.bw, uint32(len(rows)))
 		buf := bytesBufPool.Get().(*bytes.Buffer)
 		defer func() {
@@ -825,7 +877,7 @@ func (s *Server) handleSelect(session *Session) {
 	// 无条件快速路径：直接返回 RBTree 原始字节，跳过 decodeRow → encodeRow 双重编解码
 	if condCount == 0 {
 		rawRows := table.SelectRaw(minKey, maxKey, 100)
-		session.bw.WriteByte(RESP_ROWS)
+		session.bw.WriteByte(RespRows)
 		wU32(session.bw, uint32(len(rawRows)))
 		for _, data := range rawRows {
 			wU32(session.bw, uint32(len(data)))
@@ -838,10 +890,10 @@ func (s *Server) handleSelect(session *Session) {
 		s.writeError(session, err.Error())
 		return
 	}
-	session.bw.WriteByte(RESP_ROWS)
+	session.bw.WriteByte(RespRows)
 	wU32(session.bw, uint32(len(rows)))
 	for _, row := range rows {
-		data := encodeRow(table.meta, row, 0, 0)
+		data := encodeRow(table.Meta(), row, 0, 0)
 		wU32(session.bw, uint32(len(data)))
 		session.bw.Write(data)
 	}
@@ -866,14 +918,14 @@ func (s *Server) handleQuerySQL(session *Session) {
 		return
 	}
 	if len(columns) == 0 {
-		// 非结果集语句：RESP_OK + affected + rawMsg
-		session.bw.WriteByte(RESP_OK)
+		// 非结果集语句：RespOK + affected + rawMsg
+		session.bw.WriteByte(RespOK)
 		binary.Write(session.bw, binary.BigEndian, uint64(affected))
 		wU16(session.bw, uint16(len(rawMsg)))
 		session.bw.WriteString(rawMsg)
 		return
 	}
-	// 结果集：RESP_ROWS + 列数 + 列名列表 + 行数 + 行数据。
+	// 结果集：RespRows + 列数 + 列名列表 + 行数 + 行数据。
 	// 先写入本地缓冲，一次 Write 发送，减少系统调用与 TCP 小包。
 	buf := bytesBufPool.Get().(*bytes.Buffer)
 	defer func() {
@@ -881,7 +933,7 @@ func (s *Server) handleQuerySQL(session *Session) {
 		bytesBufPool.Put(buf)
 	}()
 	buf.Reset()
-	buf.WriteByte(RESP_ROWS)
+	buf.WriteByte(RespRows)
 	wU32(buf, uint32(len(columns)))
 	for _, c := range columns {
 		wU16(buf, uint16(len(c)))
@@ -891,12 +943,58 @@ func (s *Server) handleQuerySQL(session *Session) {
 	for _, r := range rows {
 		wU32(buf, uint32(len(r)))
 		for _, v := range r {
-			sv := fmt.Sprintf("%v", v)
-			wU32(buf, uint32(len(sv)))
-			buf.WriteString(sv)
+			writeQueryCell(buf, v)
 		}
 	}
 	session.bw.Write(buf.Bytes())
+}
+
+// writeQueryCell 按"u32 长度 + 文本"编码一个单元格值。
+// 数值走 strconv 写入调用方的栈缓冲（零堆分配），字符串直写；
+// 取代旧的 fmt.Sprintf("%v")——反射 + 每格一次字符串分配是
+// CmdQuerySQL 结果集路径最大的分配源（对齐 mysql.go appendCell 的做法）。
+func writeQueryCell(buf *bytes.Buffer, v interface{}) {
+	var tmp [64]byte
+	switch val := v.(type) {
+	case nil:
+		buf.WriteString("")
+	case string:
+		wU32(buf, uint32(len(val)))
+		buf.WriteString(val)
+		return
+	case bool:
+		if val {
+			wU32(buf, 1)
+			buf.WriteByte('1')
+		} else {
+			wU32(buf, 1)
+			buf.WriteByte('0')
+		}
+		return
+	case int64:
+		b := strconv.AppendInt(tmp[:0], val, 10)
+		wU32(buf, uint32(len(b)))
+		buf.Write(b)
+		return
+	case int:
+		b := strconv.AppendInt(tmp[:0], int64(val), 10)
+		wU32(buf, uint32(len(b)))
+		buf.Write(b)
+		return
+	case float64:
+		b := strconv.AppendFloat(tmp[:0], val, 'g', -1, 64)
+		wU32(buf, uint32(len(b)))
+		buf.Write(b)
+		return
+	case []byte:
+		wU32(buf, uint32(len(val)))
+		buf.Write(val)
+		return
+	default:
+		sv := fmt.Sprintf("%v", val)
+		wU32(buf, uint32(len(sv)))
+		buf.WriteString(sv)
+	}
 }
 
 // ---- UPDATE ----
@@ -1039,10 +1137,15 @@ func (s *Server) handleDelete(session *Session) {
 // ---- BEGIN ----
 func (s *Server) handleBegin(session *Session) {
 	s.db.stats.IncCmd("BEGIN")
+	// 重复 BEGIN 会让旧事务失去会话引用而永久泄漏在 db.txns
+	if session.inTxn {
+		s.writeError(session, fmt.Sprintf("transaction %d already active", session.txnID))
+		return
+	}
 	txnID := session.db.BeginTxn()
 	session.inTxn = true
 	session.txnID = txnID
-	session.bw.WriteByte(RESP_TXN_ID)
+	session.bw.WriteByte(RespTxnID)
 	binary.Write(session.bw, binary.BigEndian, txnID)
 }
 
@@ -1124,12 +1227,12 @@ func (s *Server) handleCreateIndex(session *Session) {
 		s.writeError(session, "permission denied")
 		return
 	}
-	if _, exists := table.meta.Indexes[string(idxName)]; exists {
+	if _, exists := table.Meta().Indexes[string(idxName)]; exists {
 		s.writeError(session, "index exists")
 		return
 	}
 	found := false
-	for _, f := range table.meta.Fields {
+	for _, f := range table.Meta().Fields {
 		if f.Name == string(fieldName) {
 			found = true
 			break
@@ -1139,21 +1242,34 @@ func (s *Server) handleCreateIndex(session *Session) {
 		s.writeError(session, "field not found")
 		return
 	}
-	table.meta.Indexes[string(idxName)] = string(fieldName)
-	table.idxTrees[string(idxName)] = newBytesKeyTree[[]int64]()
-	table.pkTree.scanAll(func(key int64, value []byte) {
-		row, _, _ := decodeRow(table.meta, value)
-		val := row[string(fieldName)]
-		idxKey := table.encodeIndexValue(string(fieldName), val)
-		var list []int64
-		if v, ok := table.idxTrees[string(idxName)].Get(idxKey); ok {
-			list = v
+	// 写时复制：基于当前索引快照构建新快照（新索引离线回填），整体发布，
+	// 避免在共享 map 上边遍历边写（并发读者会触发运行时致命错误）。
+	idxNameStr := string(idxName)
+	fieldNameStr := string(fieldName)
+	newMeta := cloneMeta(table.Meta(), table.Meta().Name)
+	newMeta.Indexes[idxNameStr] = fieldNameStr
+	newIdx := make(idxTreeMap, len(newMeta.Indexes))
+	for name := range newMeta.Indexes {
+		if name == idxNameStr {
+			newIdx[name] = newStringKeyTree[[]int64]()
+			continue
 		}
-		list = append(list, key)
-		table.idxTrees[string(idxName)].Set(idxKey, list)
+		if old, ok := table.indexes()[name]; ok {
+			newIdx[name] = old
+		} else {
+			newIdx[name] = newStringKeyTree[[]int64]()
+		}
+	}
+	newTree := newIdx[idxNameStr]
+	table.pkTree.scanAll(func(key int64, value []byte) {
+		row, _, _ := decodeRow(newMeta, value)
+		table.indexAddPKTo(newTree, fieldNameStr, row[fieldNameStr], key)
 	})
-	db.catalog[string(tableName)] = table.meta
-	if err := db.writeCatalog(table.meta); err != nil {
+	table.setMeta(newMeta)
+	table.storeIndexes(newIdx)
+	db.catalog[string(tableName)] = newMeta
+	// 修复: 使用 writeCatalogID 保留原 tableID，而不是 writeCatalog（会重新分配 ID）
+	if err := db.writeCatalogID(newMeta, table.tableID); err != nil {
 		s.writeError(session, err.Error())
 		return
 	}
@@ -1182,7 +1298,7 @@ func (s *Server) handleBackup(session *Session) {
 
 // ---- 管理命令：状态 / 整理 / 持久化模式 ----
 
-// handleStatus 返回 JSON 状态快照（RESP_VALUE + len + json）。
+// handleStatus 返回 JSON 状态快照（RespValue + len + json）。
 func (s *Server) handleStatus(session *Session) {
 	s.db.stats.IncCmd("STATUS")
 	snap := s.db.stats.Snapshot()
@@ -1192,7 +1308,7 @@ func (s *Server) handleStatus(session *Session) {
 		s.writeError(session, err.Error())
 		return
 	}
-	session.bw.Write([]byte{RESP_VALUE})
+	session.bw.Write([]byte{RespValue})
 	wU32(session.bw, uint32(len(data)))
 	session.bw.Write(data)
 }
@@ -1200,6 +1316,10 @@ func (s *Server) handleStatus(session *Session) {
 // handleCompact 触发 WAL 整理：将 WAL 重写为仅含当前状态的精简 v2 快照。
 func (s *Server) handleCompact(session *Session) {
 	s.db.stats.IncCmd("COMPACT")
+	if session.user != session.db.config.User {
+		s.writeError(session, "only root can compact")
+		return
+	}
 	if err := s.db.Compact(); err != nil {
 		s.writeError(session, err.Error())
 		return
@@ -1210,6 +1330,10 @@ func (s *Server) handleCompact(session *Session) {
 // handleSetDurability 动态切换持久化模式（batch/fsync）。
 func (s *Server) handleSetDurability(session *Session) {
 	s.db.stats.IncCmd("SET_DURABILITY")
+	if session.user != session.db.config.User {
+		s.writeError(session, "only root can change durability")
+		return
+	}
 	l, err := rU16(session.br)
 	if err != nil {
 		s.writeError(session, "read durability length failed")
@@ -1225,11 +1349,9 @@ func (s *Server) handleSetDurability(session *Session) {
 		s.writeError(session, "durability must be batch or fsync")
 		return
 	}
-	// 先冲刷缓冲，确保此前的 batch 记录落盘后再切到 fsync 语义
-	s.db.flushWAL()
-	s.db.config.Durability = mode
-	walFsync.Store(mode.Fsync())
-	s.db.stats.durability = mode
+	s.db.cfgMu.Lock()
+	s.db.setDurability(mode)
+	s.db.cfgMu.Unlock()
 	s.writeOK(session)
 }
 
@@ -1328,3 +1450,22 @@ func (s *Server) handleRevoke(session *Session) {
 	}
 	s.writeOK(session)
 }
+
+// ==================== 输入验证函数 ====================
+
+// validateTableName 验证表名合法性
+func validateTableName(name []byte) error {
+	if len(name) == 0 {
+		return fmt.Errorf("empty table name")
+	}
+	if len(name) > 256 {
+		return fmt.Errorf("table name too long (max 256)")
+	}
+	for i, b := range name {
+		if b == '.' || b == '/' || b == '\\' || b == 0 {
+			return fmt.Errorf("invalid character in table name at position %d", i)
+		}
+	}
+	return nil
+}
+

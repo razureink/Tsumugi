@@ -15,13 +15,13 @@ Tsumugi（つむぎ，日语"纺线"）是一个用 Go 标准库从零写的内�
 - WAL 用 varint + 表 ID 压缩编码，小行写入固定开销从 ~38B 降到 ~10B；支持 `COMPACT` 重写 WAL 回收空间
 - 单写者 channel 队列串行落盘，消除热路径锁竞争；fsync 模式按批组提交
 - WAL 恢复一次读入内存解析 + 按表并行重放，124 万行 / 81MB 恢复约 3 秒
-- 事务：BEGIN / COMMIT / ROLLBACK，基于 MVCC 版本号冲突检测
+- 事务：BEGIN / COMMIT / ROLLBACK，乐观并发控制（版本号冲突检测，首写者获胜）
 - 行级 TTL，后台协程自动清理
 - GRANT / REVOKE 表级权限（SELECT / INSERT / UPDATE / DELETE / DDL）
 - 一键备份 WAL 与权限文件到备份目录
 - 实时监控：`/metrics`（Prometheus 格式）、`/api/stats`（JSON）、`/dashboard`（MD3 Expressive 面板，5 个可点击环形指标 + 实时曲线）
 - 数据管理面板 `/admin`：表列表、分页浏览、SQL 控制台、可视化建表，与 dashboard 共用侧边栏布局
-- MySQL 协议兼容：握手 + mysql_native_password 认证 + COM_QUERY，任意 MySQL 客户端可连
+- MySQL 协议兼容：握手 + mysql_native_password 认证（口令仅存 SHA1 摘要）+ COM_QUERY / COM_INIT_DB / 预处理语句，任意 MySQL 客户端可连
 - 内置压测：`/stress?duration=10&workers=4`，边压边看 QPS / TPS
 - 系统表：`__tables`、`__indexes`、`__stats` 可直接 SELECT
 
@@ -118,7 +118,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
 - **刷盘策略**：追求性能用 `durability=batch`（崩溃最多丢一个刷盘周期，默认 100ms）；数据不能丢用 `fsync`。写配置可热生效，不用重启。
 - **WAL 整理**：默认开启自动 `COMPACT`（低峰期、WAL 超 64MB 时触发），也可在设置页手动"立即整理 WAL"。
 - **反向代理**：面板走 HTTPS 时，把 `/`、`/dashboard`、`/admin`、`/api/*` 都转发到 10232 即可，无需额外配置。
-- **首次部署流程**：启动 → 访问 10232 → 安装向导创建管理员 → 进控制台。`data/users.json` 里存的是 SHA-256 哈希，不会出现默认口令。
+- **首次部署流程**：启动 → 访问 10232 → 安装向导创建管理员 → 进控制台。`data/users.json` 里存的是加盐 SHA-256 哈希；MySQL 协议认证所需的 `config/tsumugi.json` 中也只保存 SHA1 摘要（`password_sha1`），全程不落明文口令。会话令牌 24 小时过期，改密/删用户立即吊销。
 
 ### 监控面板
 
@@ -153,6 +153,7 @@ Dashboard 的 5 个环形指标（CPU / 内存 / QPS / TPS / 磁盘写入）都�
 | `durability` | `batch` | `batch` 定时批量 fsync，吞吐高，崩溃最多丢一个刷盘周期；`fsync` 每条写立即落盘，实时持久化 |
 | `mysql_enabled` | `false` | 是否开启 MySQL 兼容协议 |
 | `mysql_port` | `3309` | MySQL 协议监听端口 |
+| `password_sha1` | （空） | MySQL 协议认证用的 SHA1(password) 摘要；不落明文口令 |
 
 兼容旧的 `.env` 写法，启动时若发现 `.env` 会把它迁移进 `config/tsumugi.json` 然后删掉 `.env`，之后的配置统一走文件。
 
@@ -166,6 +167,9 @@ mysql -e "CREATE TABLE t(id INT PRIMARY KEY, name VARCHAR(20)); INSERT INTO t VA
 ```
 
 数据与 TCP 二进制协议共用同一存储引擎和 WAL，两边互相可见。
+
+SQL 方言支持：反引号引用标识符（phpMyAdmin 全程使用）、单/双引号字符串与反斜杠转义（`'it's'`、`
+`）、`--` `#` `/* */` 注释、`WHERE` 支持 `AND` / `OR` / `LIKE` / `BETWEEN` / `IS [NOT] NULL`、`ORDER BY` 真实排序、`LIMIT n` / `LIMIT offset,n` / `LIMIT n OFFSET m`、`NULL` 与浮点字面量；多行 `INSERT` 整体原子。`GROUP BY` / `HAVING` 暂不支持（显式报错，不会静默返回错误结果）。
 
 ## 二进制协议
 
@@ -246,7 +250,7 @@ mysql -e "CREATE TABLE t(id INT PRIMARY KEY, name VARCHAR(20)); INSERT INTO t VA
 ### 数据文件
 
 - `data/tsumugi.wal`：WAL 文件，文件头（magic `TSUMUGI` + version + reserved）+ 紧凑记录（varint 变长整数 + 表 ID + 主键 + 数据长度 + 数据 + CRC32），Catalog 记录用 cmd=100 标记
-- `data/users.json`：管理员账号（SHA-256 哈希存储）
+- `data/users.json`：管理员账号（加盐 SHA-256 哈希存储，0600 权限）
 - `data/privileges.json`：表权限
 - `backup/tsumugi_<时间戳>.wal`、`backup/privileges_<时间戳>.json`：备份快照
 
@@ -287,5 +291,6 @@ MIT，见 [LICENSE](LICENSE)。
 
 ## 说明
 
-- WAL 采用单写者队列：所有写记录经 FIFO 通道交给唯一 writer goroutine 串行落盘，热路径无全局互斥锁；fsync 模式下 writer 对并发写者做组提交（同批共享一次落盘）。实测 1000 并发读写 batch 模式 QPS ~90 万，fsync 模式比每写必落的朴素实现 QPS 提升约 30 倍。
+- WAL 采用单写者队列：所有写记录经 FIFO 通道交给唯一 writer goroutine 串行落盘，热路径无全局互斥锁；fsync 模式下 writer 对并发写者做组提交（同批共享一次落盘）。
+- 压测走真实客户端协议，可选两种：`/stress?protocol=native`（TCP 二进制协议，CmdAuth 认证 + CmdInsert/CmdSelect）或 `protocol=mysql`（MySQL 线缆协议，握手 + mysql_native_password 认证 + COM_QUERY）。每个 worker 与外部用户完全同路径，仪表盘统计真实命令计数（两种协议都计入 INSERT/SELECT），无专用压测命令。参考值（4 并发 rw，含全部协议栈开销）：native 约 8~9 万 QPS，mysql 约 0.6 万 QPS（文本协议 + SQL 解析开销更高）；纯引擎层基准见 `go test -bench .`。
 - 存储过程 / 视图 / 触发器为协议占位，可按需扩展。

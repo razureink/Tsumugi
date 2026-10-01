@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,10 +51,18 @@ func (db *DB) setCurDB(name string) {
 // qualifyTable 将表名解析为物理表名：
 // 已含 "." 前缀的原样返回；否则按当前数据库加前缀（默认库 tsumugi 不加前缀，保持兼容）。
 func (db *DB) qualifyTable(name string) string {
+	return db.qualifyTableIn(name, "")
+}
+
+// qualifyTableIn 同 qualifyTable，但使用显式指定的库名（空值回退到全局 curDB）。
+func (db *DB) qualifyTableIn(name, schema string) string {
 	if strings.Contains(name, ".") {
 		return name
 	}
-	cur := db.getCurDB()
+	cur := schema
+	if cur == "" {
+		cur = db.getCurDB()
+	}
 	if cur == "" || cur == "tsumugi" {
 		return name
 	}
@@ -141,8 +149,8 @@ func (db *DB) adminRows(tableName string, afterPK int64, limit int) (map[string]
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	cols := make([]string, 0, len(t.meta.Fields))
-	for _, f := range t.meta.Fields {
+	cols := make([]string, 0, len(t.Meta().Fields))
+	for _, f := range t.Meta().Fields {
 		cols = append(cols, f.Name)
 	}
 	var min *int64
@@ -153,9 +161,9 @@ func (db *DB) adminRows(tableName string, afterPK int64, limit int) (map[string]
 	rows := make([][]interface{}, 0, limit)
 	nextPK := int64(-1)
 	t.pkTree.scanRangeLimit(min, limit, func(key int64, value []byte) bool {
-		row, _, _ := decodeRow(t.meta, value)
-		vals := make([]interface{}, 0, len(t.meta.Fields))
-		for _, f := range t.meta.Fields {
+		row, _, _ := decodeRow(t.Meta(), value)
+		vals := make([]interface{}, 0, len(t.Meta().Fields))
+		for _, f := range t.Meta().Fields {
 			vals = append(vals, row[f.Name])
 		}
 		rows = append(rows, vals)
@@ -222,7 +230,8 @@ func denyJSON(w http.ResponseWriter, reason string) {
 
 // requireAdmin 校验管理员权限；不满足时写拒绝响应并返回 false。
 func requireAdmin(w http.ResponseWriter, r *http.Request, reason string) bool {
-	if currentUser(r).fullAccess() {
+	u := currentUser(r)
+	if u != nil && u.fullAccess() {
 		return true
 	}
 	denyJSON(w, reason)
@@ -332,6 +341,39 @@ type queryRequest struct {
 	SQL string `json:"sql"`
 }
 
+// webSchemaFor 取某令牌的 SQL 控制台会话库（USE 的作用域）。
+// 会话库按 token 隔离，不再写入全局 curDB——否则一个受限用户 USE 后，
+// 其他用户（含管理员）的未限定表名解析都会被带偏，且 canExecTableSQL
+// 按"未限定名属于默认库"校验可被 USE 绕过（回归 H3）。
+func (db *DB) webSchemaFor(token string) string {
+	if v, ok := db.webSchemas.Load(token); ok {
+		return v.(string)
+	}
+	return ""
+}
+
+// handleWebUse 处理 SQL 控制台的 USE：校验目标库后记到该 token 的会话上。
+func (db *DB) handleWebUse(u *User, token, sql string) (bool, string) {
+	toks, err := tokenizeSQL(sql)
+	if err != nil || len(toks) < 2 || (toks[1].kind != "ident" && toks[1].kind != "str") {
+		return false, "invalid USE statement"
+	}
+	name := toks[1].val
+	putSQLTokens(toks)
+	if !mysqlCfg.hasDatabase(name) {
+		return false, "unknown database " + name
+	}
+	if !u.canUseDB(name) {
+		return false, "permission denied: database " + name
+	}
+	if name == "tsumugi" {
+		db.webSchemas.Delete(token)
+	} else {
+		db.webSchemas.Store(token, name)
+	}
+	return true, ""
+}
+
 func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 	var req queryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -339,15 +381,28 @@ func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := currentUser(r)
+	tok := bearerToken(r)
+	schema := db.webSchemaFor(tok)
+	// USE 在会话层处理：校验后仅对本 token 生效
+	if firstWordUpper(strings.ToUpper(strings.TrimSpace(req.SQL))) == "USE" {
+		ok, msg := db.handleWebUse(u, tok, req.SQL)
+		if !ok {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": msg})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "message": "Database changed"})
+		return
+	}
 	if ok, reason := u.canExecSQL(strings.ToUpper(req.SQL)); !ok {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": reason})
 		return
 	}
-	if !u.canExecTableSQL(req.SQL) {
+	// 表级 ACL 按当前会话库限定：未限定名在 USE mydb 后指向 mydb.<name>
+	if !u.canExecTableSQLIn(req.SQL, schema) {
 		denyJSON(w, "statement references tables")
 		return
 	}
-	columns, rows, affected, rawMsg, err := db.runSQL(req.SQL)
+	columns, rows, affected, rawMsg, err := db.runSQLSchema(req.SQL, nil, 0, schema)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
@@ -382,7 +437,7 @@ func (db *DB) handleAdminInsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "table not found"})
 		return
 	}
-	pkVal, ok := req.Values[t.meta.PK]
+	pkVal, ok := req.Values[t.Meta().PK]
 	if !ok {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "missing primary key"})
 		return
@@ -448,19 +503,25 @@ func (db *DB) handleRootPage(w http.ResponseWriter, r *http.Request) {
 
 // handleSetupStatus 检查是否需要首次设置。
 func (db *DB) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
-	needSetup := globalUsers.Count() == 0
+	needSetup := globalUsers.Count() == 0 && !userStoreCorrupt
 	writeJSON(w, map[string]interface{}{"ok": true, "need_setup": needSetup})
 }
 
-// handleSetupRootPwd 返回 root 初始密码（仅首次安装有效）。
-func (db *DB) handleSetupRootPwd(w http.ResponseWriter, r *http.Request) {
-	if globalUsers.Count() > 0 {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": "setup already completed"})
-		return
+// setupDone 安装向导单次完成标记（原子 CAS，防并发重复建管理员）。
+var setupDone atomic.Bool
+
+// validUsername 校验用户名字符集：字母/数字/下划线/短横线，1~64 字节。
+// 用户名会被渲染进管理页 JS 上下文，收紧字符集从源头消除存储型 XSS。
+func validUsername(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
 	}
-	rootPwd := generatePassword()
-	os.WriteFile("data/.first_run_pwd", []byte(rootPwd), 0644)
-	writeJSON(w, map[string]interface{}{"ok": true, "password": rootPwd})
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // handleSetupComplete 完成首次设置：创建管理员账号。
@@ -469,11 +530,21 @@ func (db *DB) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "setup already completed"})
 		return
 	}
+	if userStoreCorrupt {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "user store corrupt; manual intervention required"})
+		return
+	}
+	// 单次安装：并发请求只有一个能通过 CAS，防止同时创建两个管理员
+	if !setupDone.CompareAndSwap(false, true) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "setup already completed"})
+		return
+	}
+	defer setupDone.Store(false)
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Password == "" || !validUsername(req.Username) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid request"})
 		return
 	}
@@ -498,13 +569,14 @@ func (db *DB) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().Unix(),
 	}
 	globalUsers.Add(root)
-	// 同步管理员凭据到配置（供 MySQL 协议认证使用）
+	// 同步管理员凭据到配置（供 MySQL 协议认证使用）：仅持久化 SHA1 摘要，不落明文
+	// cfgMu 与设置页的并发写入互斥（回归 M2）
+	db.cfgMu.Lock()
 	db.config.User = req.Username
-	db.config.Password = req.Password
+	db.config.PasswordSHA1 = passwordSHA1Hex(req.Password)
+	db.config.Password = req.Password // 仅驻内存，persistConfig 不写出该字段
 	persistConfig(db.config)
-	// 清理临时文件
-	os.Remove("data/.first_run_pwd")
-	os.Remove("data/.first_run")
+	db.cfgMu.Unlock()
 	logf(LOG_OK, "setup complete: admin=%s, root password regenerated", req.Username)
 	tok := adminTokens.issue(req.Username)
 	writeJSON(w, map[string]interface{}{"ok": true, "token": tok, "user": req.Username, "root_password": rootPwd})
@@ -561,14 +633,23 @@ func (db *DB) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid request"})
 		return
 	}
+	if !validUsername(req.Username) {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "invalid username (allowed: letters, digits, _, -, max 64)"})
+		return
+	}
 	if globalUsers.Get(req.Username) != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "user already exists"})
+		return
+	}
+	// 提权防护：只有管理员能创建管理员
+	if req.IsAdmin && !u.IsAdmin {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "only admins can create admins"})
 		return
 	}
 	nu := &User{
 		Username:  req.Username,
 		Password:  hashPasswd(req.Password),
-		IsAdmin:   req.IsAdmin,
+		IsAdmin:   u.IsAdmin && req.IsAdmin,
 		CanStress: req.CanStress,
 		CanManage: req.CanManage,
 		Databases: req.Databases,
@@ -596,6 +677,16 @@ func (db *DB) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Username == user {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "cannot delete yourself"})
+		return
+	}
+	target := globalUsers.Get(req.Username)
+	if target == nil {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "user not found"})
+		return
+	}
+	// 提权防护：CanManage 而非管理员不能删除管理员
+	if target.IsAdmin && !u.IsAdmin {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "only admins can delete admins"})
 		return
 	}
 	globalUsers.Delete(req.Username)
@@ -628,7 +719,14 @@ func (db *DB) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": "user not found"})
 		return
 	}
-	if req.IsAdmin != nil {
+	// 提权防护：CanManage 而非管理员不能修改管理员账号的任何属性
+	// （否则可重置管理员密码完成提权）。
+	if target.IsAdmin && !u.IsAdmin {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": "only admins can modify admins"})
+		return
+	}
+	pwdChanged := false
+	if req.IsAdmin != nil && u.IsAdmin {
 		target.IsAdmin = *req.IsAdmin
 	}
 	if req.CanStress != nil {
@@ -645,8 +743,13 @@ func (db *DB) handleUserUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Password != "" {
 		target.Password = hashPasswd(req.Password)
+		pwdChanged = true
 	}
 	globalUsers.Update(target)
+	// 改密后吊销该用户全部活动会话，旧令牌立即失效
+	if pwdChanged {
+		adminTokens.revokeAll(target.Username)
+	}
 	writeJSON(w, map[string]interface{}{"ok": true})
 }
 

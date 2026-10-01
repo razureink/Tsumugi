@@ -668,8 +668,7 @@ func dialMySQL(t *testing.T, db *DB) *mysqlTestClient {
 }
 
 func newTestDB(t *testing.T) *DB {
-	d := "C:\\Users\\Administrator\\AppData\\Local\\Temp\\opencode\\tsumugi_mysql_test"
-	_ = os.RemoveAll(d)
+	d := t.TempDir()
 	db, err := NewDB(&Config{
 		WALDir:              d,
 		WALFile:             "wal",

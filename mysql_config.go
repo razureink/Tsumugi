@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ==================== MySQL 模拟配置（config/mysql.json） ====================
@@ -96,9 +97,22 @@ func defaultMySQLConfig() MySQLConfig {
 }
 
 // loadMySQLConfig 从 config/mysql.json 加载；文件不存在则写入默认值。
-func (ms *mysqlConfigStore) load(_ string) {
-	ms.path = "config/mysql.json"
-	os.MkdirAll("config", 0755)
+// load 读取 mysql.json。路径跟随数据目录（dir 参数此前被忽略、硬编码 CWD 下的
+// config/，导致测试污染工作目录）；旧位置存在时自动迁移。
+func (ms *mysqlConfigStore) load(dir string) {
+	ms.path = dir + "/mysql.json"
+	if _, err := os.Stat(ms.path); err != nil {
+		if legacy, lerr := os.ReadFile("config/mysql.json"); lerr == nil {
+			// 旧部署迁移：config/mysql.json -> <数据目录>/mysql.json
+			if os.MkdirAll(dir, 0755) == nil {
+				if os.WriteFile(ms.path, legacy, 0600) == nil {
+					os.Remove("config/mysql.json")
+					logf(LOG_OK, "migrated config/mysql.json into %s", ms.path)
+				}
+			}
+		}
+	}
+	os.MkdirAll(dir, 0755)
 	def := defaultMySQLConfig()
 	data, err := os.ReadFile(ms.path)
 	if err == nil {
@@ -116,8 +130,12 @@ func (ms *mysqlConfigStore) load(_ string) {
 			ms.cfg = def
 			return
 		}
+		// 解析失败：保留损坏现场，等人工处理；静默用默认值覆盖会销毁用户配置
+		stamp := time.Now().Format("20060102_150405")
+		os.Rename(ms.path, ms.path+".corrupt-"+stamp)
+		logf(LOG_ERR, "mysql config is corrupt; moved to %s.corrupt-%s and reset to defaults", ms.path, stamp)
 	}
-	// 不存在或解析失败：写入默认
+	// 不存在：写入默认
 	ms.cfg = def
 	if err := ms.save(); err != nil {
 		logf(LOG_ERR, "write default mysql config: %v", err)
@@ -135,7 +153,7 @@ func (ms *mysqlConfigStore) saveLocked() error {
 			return err
 		}
 	}
-	return os.WriteFile(ms.path, data, 0644)
+	return os.WriteFile(ms.path, data, 0600)
 }
 
 func (ms *mysqlConfigStore) set(c MySQLConfig) error {

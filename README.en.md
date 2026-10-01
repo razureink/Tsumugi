@@ -146,7 +146,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
 - **Durability**: use `batch` for max throughput (may lose up to one flush interval, default 100ms, on crash); use `fsync` if you cannot afford to lose writes. Changes apply hot, no restart needed.
 - **WAL compaction**: auto `COMPACT` is on by default (idle periods, WAL over 64MB); you can also trigger it manually in the Settings page.
 - **Reverse proxy**: for HTTPS, forward `/`, `/dashboard`, `/admin` and `/api/*` to port 10232 — nothing extra to configure.
-- **First-run flow**: start → visit 10232 → create the admin via the wizard → sign in. `data/users.json` stores SHA-256 hashes; there is no default password.
+- **First-run flow**: start → visit 10232 → create the admin via the wizard → sign in. - `data/users.json`: panel accounts (salted SHA-256 hashes, mode 0600); `config/tsumugi.json` keeps only a SHA1 digest (`password_sha1`) for MySQL auth - plaintext passwords are never written to disk
 
 Expected output:
 

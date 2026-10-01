@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,6 +54,16 @@ const serverCapabilities = (1 << 3) | // CLIENT_PROTOCOL_41
 var errBadPacket = fmt.Errorf("bad packet")
 var errAccessDenied = fmt.Errorf("access denied")
 
+// maxMySQLPacket 单个请求包的最大字节数（与握手广告的 max_allowed_packet 一致）。
+// 超限直接断连，防止 16MB 分片无限续包把内存打爆。
+const maxMySQLPacket = 64 << 20
+
+// maxPreparedStmts 单连接打开的 prepared statement 上限。
+const maxPreparedStmts = 1024
+
+// maxMySQLConns 并发连接上限（与握手广告的 max_connections 一致）。
+const maxMySQLConns = 100
+
 func startMySQLServer(db *DB, port int) {
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
@@ -57,15 +71,28 @@ func startMySQLServer(db *DB, port int) {
 		logf(LOG_ERR, "mysql listen %s: %v", addr, err)
 		return
 	}
+	registerServiceCloser("mysql", ln)
 	defer ln.Close()
 	logf(LOG_VERB, "mysql server listening on %s", addr)
+	var active atomic.Int64
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			// 临时性 accept 错误（如 fd 暂时耗尽）不应终止整个监听
 			logf(LOG_ERR, "mysql accept: %v", err)
-			return
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-		go (&mysqlConn{db: db, conn: conn}).handle()
+		if active.Add(1) > maxMySQLConns {
+			active.Add(-1)
+			writeMysqlPacket(conn, new(uint8), []byte{0xff, 0x40, 0x10, '#', '0', '8', 'S', '0', '1'}) // ER_CON_COUNT_ERROR 1040
+			conn.Close()
+			continue
+		}
+		go func() {
+			defer active.Add(-1)
+			(&mysqlConn{db: db, conn: conn}).handle()
+		}()
 	}
 }
 
@@ -76,6 +103,7 @@ type mysqlConn struct {
 	bw       *bufio.Writer
 	seq      uint8
 	user     string
+	schema   string // 连接级默认数据库（USE / COM_INIT_DB / 连接串 db 名）
 	scramble []byte
 	nextStmt uint32 // 下一个可用的 prepared 语句 ID
 	prepared map[uint32]*mysqlPreparedStmt
@@ -108,8 +136,11 @@ func (mc *mysqlConn) handle() {
 	if err := mc.readAuth(); err != nil {
 		return
 	}
-	mc.conn.SetDeadline(time.Now().Add(24 * time.Hour))
+	// 每命令刷新读超时（等待超时取广告的 wait_timeout）：空闲连接最终会被回收，
+	// 活动连接不会像旧的"认证后一次性 24h deadline"那样被硬断。
+	waitTimeout := mysqlWaitTimeout()
 	for {
+		mc.conn.SetReadDeadline(time.Now().Add(waitTimeout))
 		cmd, payload, err := mc.readPacket()
 		if err != nil {
 			return
@@ -118,14 +149,17 @@ func (mc *mysqlConn) handle() {
 		case comQuit:
 			return
 		case comPing:
+			mc.db.stats.IncCmd("PING")
 			mc.writeOK()
 		case comInitDB:
-			mc.writeOK()
+			mc.handleInitDB(string(payload))
 		case comQuery:
 			mc.handleQuery(string(payload))
 		case comStmtPrepare:
+			mc.db.stats.IncCmd("PREPARE")
 			mc.handlePrepare(string(payload))
 		case comStmtExecute:
+			mc.db.stats.IncCmd("EXECUTE")
 			mc.handleExecute(payload)
 		case comStmtClose:
 			mc.handleStmtClose(payload)
@@ -142,6 +176,26 @@ func (mc *mysqlConn) handle() {
 			return
 		}
 	}
+}
+
+// mysqlWaitTimeout 从广告的变量里取 wait_timeout（秒），异常时退回 8 小时。
+func mysqlWaitTimeout() time.Duration {
+	if v := mysqlCfg.get().Variables["wait_timeout"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 8 * time.Hour
+}
+
+// handleInitDB 响应 COM_INIT_DB：真正切换连接级默认数据库（此前是静默 no-op）。
+func (mc *mysqlConn) handleInitDB(name string) {
+	if !mysqlCfg.hasDatabase(name) {
+		mc.sendError(1049, fmt.Sprintf("unknown database '%s'", name)) // ER_BAD_DB_ERROR
+		return
+	}
+	mc.schema = name
+	mc.writeOK()
 }
 
 // ---- 包收发 ----
@@ -189,6 +243,7 @@ func (mc *mysqlConn) readPacket() (byte, []byte, error) {
 }
 
 // readRawPacket 返回整包 payload（不带命令字节裁剪），用于握手响应等无命令字节的包。
+// 总长度受 maxMySQLPacket 钳制：多分片续包不设上限会被恶意客户端无限撑大内存。
 func (mc *mysqlConn) readRawPacket() (byte, []byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(mc.br, hdr[:]); err != nil {
@@ -202,6 +257,9 @@ func (mc *mysqlConn) readRawPacket() (byte, []byte, error) {
 	}
 	// 多分片拼接
 	for length == 0xffffff {
+		if len(payload)+0xffffff > maxMySQLPacket {
+			return 0, nil, fmt.Errorf("packet exceeds max_allowed_packet")
+		}
 		if _, err := io.ReadFull(mc.br, hdr[:]); err != nil {
 			return 0, nil, err
 		}
@@ -266,8 +324,8 @@ func readNulString(b []byte, pos *int) string {
 func (mc *mysqlConn) sendHandshake() error {
 	authData := make([]byte, 20)
 	if _, err := rand.Read(authData); err != nil {
-		// 极低概率失败：退回确定性 seed 保证功能可用
-		copy(authData, fixedSeed())
+		// 确定性 seed 会让 scramble 可预测（重放认证成为可能），直接拒绝服务
+		return fmt.Errorf("crypto/rand unavailable: %w", err)
 	}
 	// 首字节不能为 0（会被误判为长度编码结束符），确保非零
 	if authData[0] == 0 {
@@ -300,14 +358,6 @@ func (mc *mysqlConn) sendHandshake() error {
 	return mc.bw.Flush()
 }
 
-func fixedSeed() []byte {
-	seed := make([]byte, 20)
-	for i := range seed {
-		seed[i] = byte(i*7 + 3)
-	}
-	return seed
-}
-
 func randomThreadID() uint32 {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err == nil {
@@ -330,11 +380,26 @@ func (mc *mysqlConn) readAuth() error {
 	pos += 4 + 4 + 1 + 23 // capabilities + maxpacket + charset + reserved
 	user := readNulString(payload, &pos)
 	mc.user = user
-	// 认证响应：长度编码（CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA）
+	// 认证响应：长度编码（CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA 或 1 字节 / 0xfc 两字节形式）
 	authLen := 0
-	if pos < len(payload) && payload[pos] < 251 {
-		authLen = int(payload[pos])
-		pos++
+	if pos < len(payload) {
+		switch first := payload[pos]; {
+		case first < 251:
+			authLen = int(first)
+			pos++
+		case first == 0xfc:
+			if pos+3 > len(payload) {
+				mc.sendError(1045, "bad auth response length")
+				mc.bw.Flush()
+				return errBadPacket
+			}
+			authLen = int(payload[pos+1]) | int(payload[pos+2])<<8
+			pos += 3
+		default:
+			mc.sendError(1045, "unsupported auth response encoding")
+			mc.bw.Flush()
+			return errBadPacket
+		}
 		if pos+authLen > len(payload) {
 			mc.sendError(1045, "bad auth response length")
 			mc.bw.Flush()
@@ -343,26 +408,40 @@ func (mc *mysqlConn) readAuth() error {
 	}
 	authResp := payload[pos : pos+authLen]
 	pos += authLen
-	// 数据库名（如声明 CLIENT_CONNECT_WITH_DB，位于插件名之前）——仅消费不识别；
-	// 插件名（CLIENT_PLUGIN_AUTH）：尾部 null 结尾，仅当匹配已知插件才采用。
+	// 数据库名（CLIENT_CONNECT_WITH_DB 时位于插件名之前）；插件名（CLIENT_PLUGIN_AUTH）。
 	plugin := "mysql_native_password"
+	var clientDB string
+	sawStr := false
 	for pos < len(payload) {
 		p := readNulString(payload, &pos)
 		switch p {
 		case "mysql_native_password", "caching_sha2_password", "mysql_clear_password", "sha256_password":
 			plugin = p
+			sawStr = true
+		default:
+			if !sawStr {
+				clientDB = p
+			}
 		}
 	}
+	if clientDB != "" && mysqlCfg.hasDatabase(clientDB) {
+		mc.schema = clientDB
+	}
 	cfg := mc.db.config
-	if user != cfg.User {
-		mc.sendError(1045, fmt.Sprintf("access denied for user '%s'", user))
+	mc.db.cfgMu.RLock()
+	storedUser := cfg.User
+	storedSHA1 := cfg.PasswordSHA1
+	fallbackPwd := cfg.Password
+	mc.db.cfgMu.RUnlock()
+	if user != storedUser {
+		mc.sendError(1045, fmt.Sprintf("access denied for user '%s'", user)) // ER_ACCESS_DENIED_ERROR
 		mc.bw.Flush()
 		return errAccessDenied
 	}
 	// 客户端选择 native → 直接校验；否则走 auth switch 回退到 native。
 	if plugin == "mysql_native_password" {
-		if !checkNativePassword(cfg.Password, authResp, mc.scramble) {
-			mc.sendError(0, "access denied")
+		if !verifyNativePassword(storedSHA1, fallbackPwd, authResp, mc.scramble) {
+			mc.sendError(1045, "access denied")
 			mc.bw.Flush()
 			return errAccessDenied
 		}
@@ -375,17 +454,17 @@ func (mc *mysqlConn) readAuth() error {
 		if err := mc.bw.Flush(); err != nil {
 			return err
 		}
-		// 等待客户端回发 native 响应（可能带 command 0xfe 前缀）
-		seq, resp, err := mc.readRawPacket()
+		// 等待客户端回发 native 响应。个别客户端会多包一层 0xfe 前缀
+		//（此时总长 21）；原生 20 字节响应本身以 0xfe 开头属正常数据，不能误剥。
+		_, resp, err := mc.readRawPacket()
 		if err != nil {
 			return err
 		}
-		_ = seq
-		if len(resp) >= 1 && resp[0] == 0xfe {
+		if len(resp) == 21 && resp[0] == 0xfe {
 			resp = resp[1:]
 		}
-		if !checkNativePassword(cfg.Password, resp, mc.scramble) {
-			mc.sendError(0, "access denied")
+		if !verifyNativePassword(storedSHA1, fallbackPwd, resp, mc.scramble) {
+			mc.sendError(1045, "access denied")
 			mc.bw.Flush()
 			return errAccessDenied
 		}
@@ -408,13 +487,26 @@ func (mc *mysqlConn) writeAuthSwitch() error {
 	return mc.writePacket(buf)
 }
 
-// checkNativePassword 校验 mysql_native_password：
-// authResp = SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password)))
-func checkNativePassword(password string, authResp, scramble []byte) bool {
-	if len(authResp) == 0 {
-		return password == ""
+// verifyNativePassword 校验 mysql_native_password：
+// authResp = SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password)))。
+// 优先使用配置中持久化的 SHA1(password) 摘要（明文口令不再落盘），
+// 摘要缺失时回退为对明文口令现算（旧配置兼容）。比较为常量时间。
+func verifyNativePassword(sha1Hex, fallbackPwd string, authResp, scramble []byte) bool {
+	var sha1p [20]byte
+	if sha1Hex != "" {
+		b, err := hex.DecodeString(sha1Hex)
+		if err != nil || len(b) != 20 {
+			return false
+		}
+		copy(sha1p[:], b)
+	} else {
+		sha1p = sha1.Sum([]byte(fallbackPwd))
 	}
-	sha1p := sha1.Sum([]byte(password))
+	if len(authResp) == 0 {
+		// 空口令：存储摘要应恰为 SHA1("")；非空口令拒绝空响应
+		empty := sha1.Sum([]byte(""))
+		return bytes.Equal(sha1p[:], empty[:])
+	}
 	sha1p2 := sha1.Sum(sha1p[:])
 	h := sha1.New()
 	h.Write(scramble)
@@ -423,17 +515,16 @@ func checkNativePassword(password string, authResp, scramble []byte) bool {
 	if len(authResp) != len(expected) {
 		return false
 	}
+	out := make([]byte, len(expected))
 	for i := 0; i < len(expected); i++ {
-		if authResp[i] != sha1p[i]^expected[i] {
-			return false
-		}
+		out[i] = authResp[i] ^ expected[i]
 	}
-	return true
+	return subtle.ConstantTimeCompare(out, sha1p[:]) == 1
 }
 
 // ---- 命令处理 ----
 
-// handleQuery 响应 COM_QUERY（事务/SET 由连接级处理，其余进入引擎）。
+// handleQuery 响应 COM_QUERY（事务/SET/USE 由连接级处理，其余进入引擎）。
 func (mc *mysqlConn) handleQuery(sql string) {
 	sql = strings.TrimSpace(sql)
 	if sql == "" {
@@ -441,17 +532,32 @@ func (mc *mysqlConn) handleQuery(sql string) {
 		return
 	}
 	// 事务与 SET 语句：维护连接级事务状态，不进入数据引擎。
-	upper := strings.ToUpper(sql)
-	if kw := firstWordUpper(upper); kw == "BEGIN" || kw == "START" || kw == "COMMIT" || kw == "ROLLBACK" ||
+	// 命令分派只依赖首个单词：仅对首词做 ToUpper，避免整条 SQL 的大写拷贝
+	//（旧实现每条查询先整串 ToUpper，长语句下是热路径最大的一次分配）。
+	kw := strings.ToUpper(firstWordUpper(sql))
+	// 命令计数：按语句类型计入与二进制协议一致的命令名（此前 MySQL 路径
+	// 完全没有计数，QPS/TPS 对 MySQL 流量恒为 0）。
+	switch kw {
+	case "INSERT", "UPDATE", "DELETE", "SELECT", "CREATE", "DROP", "ALTER", "SHOW", "DESCRIBE", "DESC":
+		mc.db.stats.IncCmd(kw)
+	default:
+		mc.db.stats.IncCmd("QUERY")
+	}
+	if kw == "BEGIN" || kw == "START" || kw == "COMMIT" || kw == "ROLLBACK" ||
 		kw == "SET" || kw == "SETS" {
-		mc.handleTxCommand(upper, sql)
+		mc.handleTxCommand(strings.ToUpper(sql), sql)
+		return
+	}
+	// USE：切换本连接的默认数据库（连接级状态，不再污染全局 curDB）
+	if kw == "USE" {
+		mc.handleUse(sql)
 		return
 	}
 	var txnID uint64
 	if mc.inTxn {
 		txnID = mc.txnID
 	}
-	columns, rows, affected, _, err := mc.db.runSQLTx(sql, nil, txnID)
+	columns, rows, affected, _, err := mc.db.runSQLSchema(sql, nil, txnID, mc.schema)
 	if err != nil {
 		// 仅在出错时判断是否带表达式的 select（无 from），避免成功路径整串 ToLower 拷贝。
 		lower := strings.ToLower(sql)
@@ -469,13 +575,41 @@ func (mc *mysqlConn) handleQuery(sql string) {
 	mc.sendResultSet(columns, rows)
 }
 
-// firstWordUpper 返回 SQL 首个单词（大写形式）。
+// handleUse 处理 USE <db>：按分词解析库名（支持反引号/引号），校验后切换连接级 schema。
+func (mc *mysqlConn) handleUse(sql string) {
+	toks, err := tokenizeSQL(sql)
+	if err != nil {
+		mc.sendError(1064, "parse error in USE")
+		return
+	}
+	defer putSQLTokens(toks)
+	// toks[0]=USE
+	if len(toks) < 2 || (toks[1].kind != "ident" && toks[1].kind != "str") || (len(toks) > 3 && toks[2].kind != "eof") {
+		mc.sendError(1064, "invalid USE statement")
+		return
+	}
+	name := toks[1].val
+	if !mysqlCfg.hasDatabase(name) {
+		mc.sendError(1049, fmt.Sprintf("unknown database '%s'", name)) // ER_BAD_DB_ERROR
+		return
+	}
+	mc.schema = name
+	mc.writeOK()
+}
+
+// firstWordUpper 返回 SQL 首个单词（大小写保持原样，按任意空白截断）。
+// 注意它自身不转换大小写——旧实现接收预大写的整串 SQL；现改为对原始 SQL
+// 取首词后仅对该词做 ToUpper，避免每条查询一次整串大写拷贝。
 func firstWordUpper(upper string) string {
 	upper = strings.TrimSpace(upper)
-	if i := strings.IndexByte(upper, ' '); i >= 0 {
-		return upper[:i]
+	end := len(upper)
+	for i := 0; i < len(upper); i++ {
+		if upper[i] == ' ' || upper[i] == '\t' || upper[i] == '\n' || upper[i] == '\r' || upper[i] == '(' {
+			end = i
+			break
+		}
 	}
-	return upper
+	return upper[:end]
 }
 
 // handleTxCommand 处理 BEGIN/COMMIT/ROLLBACK/SET 等连接级事务与会话语句。
@@ -532,6 +666,17 @@ func (mc *mysqlConn) handlePrepare(sql string) {
 		return
 	}
 	n := countSQLTokens(toks)
+	// 参数计数写入响应包时是 uint16：超限会被静默截断导致协议错乱
+	if n > 65535 {
+		putSQLTokens(toks)
+		mc.sendError(1391, "too many parameters")
+		return
+	}
+	if len(mc.prepared) >= maxPreparedStmts {
+		putSQLTokens(toks)
+		mc.sendError(1461, "max prepared statement count reached")
+		return
+	}
 	mc.nextStmt++
 	id := mc.nextStmt
 	if mc.prepared == nil {
@@ -580,6 +725,9 @@ func (mc *mysqlConn) appendColumnDef(buf []byte, catalog, schema, table, orgTabl
 }
 
 func (mc *mysqlConn) schemaName() string {
+	if mc.schema != "" {
+		return mc.schema
+	}
 	if mc.db != nil {
 		if cur := mc.db.getCurDB(); cur != "" {
 			return cur
@@ -653,7 +801,7 @@ func (mc *mysqlConn) handleExecute(payload []byte) {
 	if mc.inTxn {
 		txnID = mc.txnID
 	}
-	columns, rows, affected, _, err := mc.db.runSQLTokens(st.toks, st.sql, params, txnID)
+	columns, rows, affected, _, err := mc.db.runSQLTokens(st.toks, st.sql, params, txnID, mc.schema)
 	if err != nil {
 		mc.sendError(1064, "you have an error in your SQL syntax near '"+firstWord(st.sql)+"': "+err.Error())
 		return
@@ -666,35 +814,57 @@ func (mc *mysqlConn) handleExecute(payload []byte) {
 }
 
 // parseBinaryParam 解析二进制协议的一个参数值，返回 Go 值。
+// 所有读取都做边界检查：畸形包返回错误（清洁的 1243 错误）而不是 panic。
 func parseBinaryParam(pType byte, payload []byte, pos *int) (interface{}, error) {
-	if *pos >= len(payload) {
-		return nil, fmt.Errorf("missing param value")
+	need := func(n int) error {
+		if *pos+n > len(payload) {
+			return fmt.Errorf("truncated param value")
+		}
+		return nil
 	}
 	switch pType {
 	case 0x00: // NULL
 		return nil, nil
 	case 0x01: // TINY
+		if err := need(1); err != nil {
+			return nil, err
+		}
 		v := int64(int8(payload[*pos]))
 		*pos++
 		return v, nil
 	case 0x02: // SHORT
+		if err := need(2); err != nil {
+			return nil, err
+		}
 		v := int64(int16(uint16(payload[*pos]) | uint16(payload[*pos+1])<<8))
 		*pos += 2
 		return v, nil
 	case 0x03: // LONG
+		if err := need(4); err != nil {
+			return nil, err
+		}
 		v := int64(uint32(payload[*pos]) | uint32(payload[*pos+1])<<8 | uint32(payload[*pos+2])<<16 | uint32(payload[*pos+3])<<24)
 		*pos += 4
 		return v, nil
 	case 0x08: // LONGLONG
+		if err := need(8); err != nil {
+			return nil, err
+		}
 		v := uint64(payload[*pos]) | uint64(payload[*pos+1])<<8 | uint64(payload[*pos+2])<<16 | uint64(payload[*pos+3])<<24 |
 			uint64(payload[*pos+4])<<32 | uint64(payload[*pos+5])<<40 | uint64(payload[*pos+6])<<48 | uint64(payload[*pos+7])<<56
 		*pos += 8
 		return int64(v), nil
 	case 0x04: // FLOAT
+		if err := need(4); err != nil {
+			return nil, err
+		}
 		v := math.Float32frombits(uint32(payload[*pos]) | uint32(payload[*pos+1])<<8 | uint32(payload[*pos+2])<<16 | uint32(payload[*pos+3])<<24)
 		*pos += 4
 		return v, nil
 	case 0x05: // DOUBLE
+		if err := need(8); err != nil {
+			return nil, err
+		}
 		v := math.Float64frombits(uint64(payload[*pos]) | uint64(payload[*pos+1])<<8 | uint64(payload[*pos+2])<<16 | uint64(payload[*pos+3])<<24 |
 			uint64(payload[*pos+4])<<32 | uint64(payload[*pos+5])<<40 | uint64(payload[*pos+6])<<48 | uint64(payload[*pos+7])<<56)
 		*pos += 8
@@ -765,6 +935,7 @@ func readLenEncByteSlice(payload []byte, pos *int) ([]byte, error) {
 }
 
 // readDateTimeParam / readDateParam / readTimeParam 解析 MySQL 日期时间类型参数。
+// 按长度决定可用分量（MySQL 语义），长度不足的分量取零值而非越界读取。
 func readDateTimeParam(payload []byte, pos *int) (interface{}, error) {
 	if *pos >= len(payload) {
 		return nil, fmt.Errorf("truncated datetime")
@@ -779,11 +950,13 @@ func readDateTimeParam(payload []byte, pos *int) (interface{}, error) {
 	}
 	b := payload[*pos : *pos+length]
 	*pos += length
-	y := int(b[0])<<8 | int(b[1])
-	mo := int(b[2])
-	d := int(b[3])
-	var h, mi, s int
-	if length >= 7 {
+	var y, mo, d, h, mi, s int
+	if len(b) >= 4 {
+		y = int(b[0])<<8 | int(b[1])
+		mo = int(b[2])
+		d = int(b[3])
+	}
+	if len(b) >= 7 {
 		h = int(b[4])
 		mi = int(b[5])
 		s = int(b[6])
@@ -805,9 +978,12 @@ func readDateParam(payload []byte, pos *int) (interface{}, error) {
 	}
 	b := payload[*pos : *pos+length]
 	*pos += length
-	y := int(b[0])<<8 | int(b[1])
-	mo := int(b[2])
-	d := int(b[3])
+	var y, mo, d int
+	if len(b) >= 4 {
+		y = int(b[0])<<8 | int(b[1])
+		mo = int(b[2])
+		d = int(b[3])
+	}
 	return fmt.Sprintf("%04d-%02d-%02d", y, mo, d), nil
 }
 
@@ -825,10 +1001,13 @@ func readTimeParam(payload []byte, pos *int) (interface{}, error) {
 	}
 	b := payload[*pos : *pos+length]
 	*pos += length
+	if len(b) < 8 {
+		return nil, fmt.Errorf("truncated time value")
+	}
 	neg := b[0] != 0
 	d := int(b[1])<<24 | int(b[2])<<16 | int(b[3])<<8 | int(b[4])
-	var h, mi, s int
-	if length >= 9 {
+	h, mi, s := 0, 0, 0
+	if len(b) >= 8 {
 		h = int(b[5])
 		mi = int(b[6])
 		s = int(b[7])
@@ -846,9 +1025,11 @@ func (mc *mysqlConn) handleStmtClose(payload []byte) {
 	}
 	stmtID := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16 | uint32(payload[3])<<24
 	if st := mc.prepared[stmtID]; st != nil && st.toks != nil {
-		sqlTokenPool.Put(st.toks[:0])
+		putSQLTokens(st.toks)
 	}
 	delete(mc.prepared, stmtID)
+	// long data 缓冲一并清理（此前只删 prepared，longData 泄漏到断连）
+	delete(mc.longData, stmtID)
 }
 
 func (mc *mysqlConn) handleStmtReset(payload []byte) {
@@ -866,15 +1047,22 @@ func (mc *mysqlConn) handleStmtReset(payload []byte) {
 }
 
 // handleSendLong 累积长数据到参数缓冲区（COM_STMT_SEND_LONG_DATA）。
+// 校验语句存在性并钳制总量（此前任意 stmtID 无上限累积，构成内存耗尽向量）。
 func (mc *mysqlConn) handleSendLong(payload []byte) {
 	if len(payload) < 6 {
 		return
 	}
 	stmtID := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16 | uint32(payload[3])<<24
+	if _, ok := mc.prepared[stmtID]; !ok {
+		return // 未知语句：静默丢弃（与 MySQL 行为一致）
+	}
 	if mc.longData == nil {
 		mc.longData = make(map[uint32][]byte)
 	}
 	chunk := payload[6:]
+	if len(mc.longData[stmtID])+len(chunk) > maxMySQLPacket {
+		return // 超过 max_allowed_packet：忽略多余数据
+	}
 	mc.longData[stmtID] = append(mc.longData[stmtID], chunk...)
 }
 
@@ -894,7 +1082,9 @@ func (mc *mysqlConn) sendResultSet(columns []string, rows [][]interface{}) {
 		}
 	}
 	schema := "tsumugi"
-	if mc.db != nil {
+	if mc.schema != "" {
+		schema = mc.schema
+	} else if mc.db != nil {
 		if cur := mc.db.getCurDB(); cur != "" {
 			schema = cur
 		}
@@ -1258,6 +1448,29 @@ func (p *exprParser) parseFactor() (int64, error) {
 
 func firstWord(sql string) string {
 	sql = strings.TrimSpace(sql)
+	for len(sql) > 0 {
+		if strings.HasPrefix(sql, "--") {
+			if i := strings.IndexByte(sql, '\n'); i >= 0 {
+				sql = strings.TrimSpace(sql[i+1:])
+			} else {
+				return ""
+			}
+		} else if strings.HasPrefix(sql, "/*") {
+			if i := strings.Index(sql, "*/"); i >= 0 {
+				sql = strings.TrimSpace(sql[i+2:])
+			} else {
+				return ""
+			}
+		} else if strings.HasPrefix(sql, "#") {
+			if i := strings.IndexByte(sql, '\n'); i >= 0 {
+				sql = strings.TrimSpace(sql[i+1:])
+			} else {
+				return ""
+			}
+		} else {
+			break
+		}
+	}
 	if i := strings.IndexByte(sql, ' '); i >= 0 {
 		return sql[:i]
 	}

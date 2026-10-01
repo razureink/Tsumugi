@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -118,17 +116,13 @@ func TestCleanExpired(t *testing.T) {
 		}
 	}
 	// 索引仍正确（仅 grp=b 含 3）
-	if list, ok := tbl.idxTrees["ix_grp"].Get(tbl.encodeIndexValue("grp", "b")); !ok || len(list) != 1 {
+	if list, ok := tbl.indexes()["ix_grp"].Get(tbl.encodeIndexValue("grp", "b")); !ok || len(list) != 1 {
 		t.Fatalf("index for b = %v, want [3]", list)
 	}
 }
 
 func TestSQLRange(t *testing.T) {
 	dir := t.TempDir()
-	// Windows 下 TempDir 偶尔触发"read <dir>/: Incorrect function"，改用固定子目录
-	dir = filepath.Join("C:\\Users\\Administrator\\AppData\\Local\\Temp\\opencode", "tsumugi_range_db")
-	_ = os.RemoveAll(dir)
-	_ = os.MkdirAll(dir, 0755)
 	db, err := NewDB(&Config{
 		WALDir:              dir,
 		WALFile:             "tsumugi.wal",

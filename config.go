@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"strconv"
@@ -10,6 +12,13 @@ import (
 )
 
 const tsumugiConfigPath = "config/tsumugi.json"
+
+// passwordSHA1Hex 计算 mysql_native_password 认证所需的 SHA1(password) 十六进制摘要。
+// 配置文件只持久化该摘要，不再落明文口令。
+func passwordSHA1Hex(password string) string {
+	h := sha1.Sum([]byte(password))
+	return hex.EncodeToString(h[:])
+}
 
 // Durability 持久化模式：batch（定时批量刷盘）/ fsync（每条写入立即落盘）。
 type Durability string
@@ -33,7 +42,8 @@ type Config struct {
 	WALFile             string
 	PrivilegeFile       string
 	User                string
-	Password            string
+	Password            string // 仅驻内存的兼容字段，不再持久化；认证一律走 PasswordSHA1
+	PasswordSHA1        string // SHA1(password) hex，mysql_native_password 校验用
 	FlushInterval       time.Duration
 	GroupCommitInterval time.Duration
 	TTLCleanInterval    time.Duration
@@ -80,13 +90,15 @@ func loadDotEnvKV() (map[string]string, bool) {
 // configFile 描述 /config/tsumugi.json 的持久化布局（单一事实源）。
 // loadConfigFile 读取它，settings.go 保存时也用它，避免两份 JSON 契约漂移。
 // 指针字段表示"文件中未提供时不覆盖"，便于增量合并。
+// 注意：不再写出明文 password；兼容读取旧文件的 password 字段并迁移为 SHA1。
 type configFile struct {
 	Port               *int    `json:"port"`
 	WALDir             *string `json:"wal_dir"`
 	WALFile            *string `json:"wal_file"`
 	PrivilegeFile      *string `json:"privilege_file"`
 	User               *string `json:"user"`
-	Password           *string `json:"password"`
+	PasswordSHA1       *string `json:"password_sha1,omitempty"`
+	Password           *string `json:"password,omitempty"` // 旧格式兼容读取，保存时不再写出
 	FlushIntervalMS    *int    `json:"flush_interval_ms"`
 	GroupCommitMS      *int    `json:"group_commit_ms"`
 	TTLCleanMS         *int    `json:"ttl_clean_ms"`
@@ -104,15 +116,16 @@ type configFile struct {
 }
 
 // loadConfigFile 从 /config/tsumugi.json 读取 Tsumugi 自身配置（若存在）。
-// 返回值为 true 表示文件存在且解析成功。
-func loadConfigFile(cfg *Config) bool {
+// 返回 (文件是否存在, 是否解析成功)。
+func loadConfigFile(cfg *Config) (bool, bool) {
 	data, err := os.ReadFile(tsumugiConfigPath)
 	if err != nil {
-		return false
+		return false, false
 	}
+	existed := true
 	var raw configFile
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return false
+		return existed, false
 	}
 	if raw.Port != nil {
 		cfg.Port = *raw.Port
@@ -129,8 +142,13 @@ func loadConfigFile(cfg *Config) bool {
 	if raw.User != nil {
 		cfg.User = *raw.User
 	}
-	if raw.Password != nil {
+	if raw.PasswordSHA1 != nil {
+		cfg.PasswordSHA1 = *raw.PasswordSHA1
+	} else if raw.Password != nil {
+		// 旧格式迁移：明文只在本次会话内存中保留（兼容尚未改完的认证路径），
+		// 摘要立即计算；下次保存起文件里只会有 password_sha1。
 		cfg.Password = *raw.Password
+		cfg.PasswordSHA1 = passwordSHA1Hex(*raw.Password)
 	}
 	if raw.FlushIntervalMS != nil {
 		cfg.FlushInterval = time.Duration(*raw.FlushIntervalMS) * time.Millisecond
@@ -174,10 +192,11 @@ func loadConfigFile(cfg *Config) bool {
 	if raw.CompactPeakRate != nil {
 		cfg.CompactPeakRate = *raw.CompactPeakRate
 	}
-	return true
+	return existed, true
 }
 
 // fillFromConfig 用运行时配置填充文件布局（用于保存）。
+// 明文 Password 一律不写出（仅 PasswordSHA1）；内存中的兼容值随保存自然淘汰。
 func (f *configFile) fillFromConfig(cfg *Config) {
 	str := func(s string) *string { return &s }
 	intp := func(i int) *int { return &i }
@@ -188,7 +207,7 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 		WALFile:            str(cfg.WALFile),
 		PrivilegeFile:      str(cfg.PrivilegeFile),
 		User:               str(cfg.User),
-		Password:           str(cfg.Password),
+		PasswordSHA1:       str(cfg.PasswordSHA1),
 		FlushIntervalMS:    intp(int(cfg.FlushInterval / time.Millisecond)),
 		GroupCommitMS:      intp(int(cfg.GroupCommitInterval / time.Millisecond)),
 		TTLCleanMS:         intp(int(cfg.TTLCleanInterval / time.Millisecond)),
@@ -211,19 +230,21 @@ func getenvBool(key string, def bool) bool {
 	if v == "" {
 		return def
 	}
-	return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes") || strings.EqualFold(v, "on")
+	if strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes") || strings.EqualFold(v, "on") {
+		return true
+	}
+	if strings.EqualFold(v, "false") || v == "0" || strings.EqualFold(v, "no") || strings.EqualFold(v, "off") {
+		return false
+	}
+	return def
 }
 
-func getenvInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+func parsePort(s string) (int, bool) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 || n >= 65536 {
+		return 0, false
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return def
-	}
-	return n
+	return n, true
 }
 
 // applyEnvToConfig 把环境变量叠加到 cfg（命令行/进程环境优先，.env 已于迁移阶段并入文件）。
@@ -231,80 +252,120 @@ func applyEnvToConfig(cfg *Config) {
 	if v := os.Getenv("TSUMUGI_DURABILITY"); Durability(v).Valid() {
 		cfg.Durability = Durability(v)
 	}
-	if v := os.Getenv("TSUMUGI_MYSQL"); v == "true" || v == "1" || strings.EqualFold(v, "on") {
-		cfg.MySQLEnabled = true
+	if v := os.Getenv("TSUMUGI_MYSQL"); v != "" {
+		cfg.MySQLEnabled = getenvBool("TSUMUGI_MYSQL", cfg.MySQLEnabled)
 	}
 	if p := os.Getenv("TSUMUGI_MYSQL_PORT"); p != "" {
-		if n, e := strconv.Atoi(p); e == nil && n > 0 && n < 65536 {
+		if n, ok := parsePort(p); ok {
 			cfg.MySQLPort = n
+		}
+	}
+	if p := os.Getenv("TSUMUGI_METRICS_PORT"); p != "" {
+		if n, ok := parsePort(p); ok {
+			cfg.MetricsPort = n
 		}
 	}
 	if v := os.Getenv("TSUMUGI_AUTO_COMPACT"); v != "" {
 		cfg.AutoCompact = getenvBool("TSUMUGI_AUTO_COMPACT", true)
 	}
-	if p := getenvInt("TSUMUGI_PORT", 0); p != 0 {
-		cfg.Port = p
-	}
-}
-
-// applyDotEnvToConfig 把 .env 解析出的 TSUMUGI_* 值写入 cfg（用于迁移）。
-func applyDotEnvToConfig(cfg *Config, kv map[string]string) {
-	get := func(k string) string { return kv[k] }
-	if v := get("TSUMUGI_DURABILITY"); Durability(v).Valid() {
-		cfg.Durability = Durability(v)
-	}
-	if v := get("TSUMUGI_MYSQL"); v == "true" || v == "1" || strings.EqualFold(v, "on") {
-		cfg.MySQLEnabled = true
-	}
-	if p := get("TSUMUGI_MYSQL_PORT"); p != "" {
-		if n, e := strconv.Atoi(p); e == nil && n > 0 && n < 65536 {
-			cfg.MySQLPort = n
-		}
-	}
-	if v := get("TSUMUGI_AUTO_COMPACT"); v != "" {
-		cfg.AutoCompact = strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
-	}
-	if p := get("TSUMUGI_PORT"); p != "" {
-		if n, e := strconv.Atoi(p); e == nil && n > 0 && n < 65536 {
+	if p := os.Getenv("TSUMUGI_PORT"); p != "" {
+		if n, ok := parsePort(p); ok {
 			cfg.Port = n
 		}
 	}
 }
 
-// ensureConfigFile 保证 config/tsumugi.json 存在：
-//   - 若文件缺失，用当前 cfg 自动创建（含全部默认值）；
-//   - 若存在 .env，把 TSUMUGI_* 迁移进 cfg 后重写文件，并移除 .env；
-//
-// 返回是否把（可能被迁移过的）配置已写盘。
-func ensureConfigFile(cfg *Config) {
-	os.MkdirAll("config", 0755)
-
-	// 1) .env 迁移：优先于已有文件记录，作为一次性的存量导入。
-	if kv, ok := loadDotEnvKV(); ok {
-		applyDotEnvToConfig(cfg, kv)
-		persistConfig(cfg)
-		// 迁移后移除 .env，此后配置只存在于 config/tsumugi.json
-		os.Remove(".env")
-		logf(LOG_OK, "migrated .env into %s (removed .env)", tsumugiConfigPath)
-		return
+// applyDotEnvToConfig 把 .env 解析出的 TSUMUGI_* 值写入 cfg（用于迁移）。
+// 返回是否包含至少一个 TSUMUGI_* 键。
+func applyDotEnvToConfig(cfg *Config, kv map[string]string) bool {
+	get := func(k string) string { return kv[k] }
+	found := false
+	if v := get("TSUMUGI_DURABILITY"); Durability(v).Valid() {
+		cfg.Durability = Durability(v)
+		found = true
 	}
+	if v := get("TSUMUGI_MYSQL"); v != "" {
+		cfg.MySQLEnabled = strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "on")
+		found = true
+	}
+	if p := get("TSUMUGI_MYSQL_PORT"); p != "" {
+		if n, ok := parsePort(p); ok {
+			cfg.MySQLPort = n
+			found = true
+		}
+	}
+	if v := get("TSUMUGI_AUTO_COMPACT"); v != "" {
+		cfg.AutoCompact = strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes") || strings.EqualFold(v, "on")
+		found = true
+	}
+	if p := get("TSUMUGI_PORT"); p != "" {
+		if n, ok := parsePort(p); ok {
+			cfg.Port = n
+			found = true
+		}
+	}
+	return found
+}
 
-	// 2) 已有配置文件存在：直接使用
+// ensureConfigFile 保证 config/tsumugi.json 存在：缺失时用当前 cfg 创建。
+// .env 迁移移到 loadConfig 中（先读已有文件再叠加 .env，避免覆盖用户自定义配置）。
+func ensureConfigFile(cfg *Config) {
 	if _, err := os.Stat(tsumugiConfigPath); err == nil {
 		return
 	}
-
-	// 3) 都没有：写一份含默认值的配置
+	if err := os.MkdirAll("config", 0755); err != nil {
+		logf(LOG_ERR, "create config dir: %v", err)
+		return
+	}
 	persistConfig(cfg)
 	logf(LOG_OK, "created default config %s", tsumugiConfigPath)
 }
 
-// persistConfig 把 cfg 落盘到 config/tsumugi.json。
+// persistConfig 把 cfg 落盘到 config/tsumugi.json（原子写，0600）。
 func persistConfig(cfg *Config) {
 	var f configFile
 	f.fillFromConfig(cfg)
 	if err := writeJSONFile(tsumugiConfigPath, &f); err != nil {
 		logf(LOG_ERR, "write %s: %v", tsumugiConfigPath, err)
+	}
+}
+
+// normalizeConfig 钳制所有数值字段到安全范围。手改的 config/tsumugi.json
+// 不经任何校验直达引擎：port 非法会让服务拒绝启动，间隔为 0 会让
+// time.NewTicker 直接 panic。环境变量与设置页有各自校验，此处兜底。
+func normalizeConfig(cfg *Config) {
+	if cfg.Port <= 0 || cfg.Port >= 65536 {
+		cfg.Port = 9999
+	}
+	if cfg.MetricsPort <= 0 || cfg.MetricsPort >= 65536 {
+		cfg.MetricsPort = 10232
+	}
+	if cfg.MySQLPort <= 0 || cfg.MySQLPort >= 65536 {
+		cfg.MySQLPort = 3309
+	}
+	if cfg.FlushInterval <= 0 {
+		cfg.FlushInterval = 100 * time.Millisecond
+	}
+	if cfg.GroupCommitInterval <= 0 {
+		cfg.GroupCommitInterval = 2 * time.Millisecond
+	}
+	if cfg.TTLCleanInterval <= 0 {
+		cfg.TTLCleanInterval = 30 * time.Second
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = 60 * time.Second
+	}
+	if cfg.CompactIdleSeconds <= 0 {
+		cfg.CompactIdleSeconds = 60
+	}
+	if cfg.CompactMinWALMB <= 0 {
+		cfg.CompactMinWALMB = 64
+	}
+	if cfg.CompactPeakRate <= 0 {
+		cfg.CompactPeakRate = 50
+	}
+	if !cfg.Durability.Valid() {
+		cfg.Durability = DuraBatch
 	}
 }
 
@@ -331,11 +392,31 @@ func loadConfig() *Config {
 		CompactMinWALMB:     64,
 		CompactPeakRate:     50,
 	}
-	// 迁移 .env 并保证 config/tsumugi.json 存在（自动创建）。
-	ensureConfigFile(cfg)
-	// 配置文件（含已迁移值）作为单一事实源。
-	loadConfigFile(cfg)
+	// 顺序很重要：先读已有配置文件（单一事实源），再把 .env 叠加其上。
+	// 旧实现先应用 .env 再读文件，升级用户带残留 .env 时自定义配置会被默认值覆盖。
+	existed, ok := loadConfigFile(cfg)
+	if existed && !ok {
+		logf(LOG_WARN, "%s is corrupt; using defaults (file left in place for inspection)", tsumugiConfigPath)
+	}
+	// .env 迁移：只叠加 TSUMUGI_* 键；含其他工具的变量时保留 .env 不删。
+	if kv, okEnv := loadDotEnvKV(); okEnv {
+		if applyDotEnvToConfig(cfg, kv) {
+			persistConfig(cfg)
+			if err := os.Remove(".env"); err != nil {
+				logf(LOG_WARN, "migrated .env but failed to remove it: %v", err)
+			} else {
+				logf(LOG_OK, "migrated .env into %s (removed .env)", tsumugiConfigPath)
+			}
+		}
+	} else if !existed {
+		ensureConfigFile(cfg)
+	}
 	// 进程环境变量可覆盖（不含 .env，.env 已迁移进文件）。
 	applyEnvToConfig(cfg)
+	normalizeConfig(cfg)
+	// 旧文件兼容迁移：明文 password 已换算为 SHA1，立即以新格式回写。
+	if existed && ok && cfg.Password != "" {
+		persistConfig(cfg)
+	}
 	return cfg
 }

@@ -61,7 +61,7 @@ func parseArgs() options {
 		host: envOr("TSUMUGI_HOST", "127.0.0.1"),
 		port: atoiOr(envOr("TSUMUGI_PORT", "9999"), 9999),
 		user: envOr("TSUMUGI_USER", "root"),
-		pass: envOr("TSUMUGI_PASS", "password"),
+		pass: envOr("TSUMUGI_PASS", ""),
 	}
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -79,11 +79,11 @@ func parseArgs() options {
 			os.Exit(0)
 		case "-host", "--host":
 			o.host = next()
-		case "-p", "--port":
+		case "-p", "-port", "--port":
 			o.port = atoiOr(next(), 9999)
-		case "-u", "--user":
+		case "-u", "-user", "--user":
 			o.user = next()
-		case "-P", "-pwd", "--pass":
+		case "-P", "-pass", "-pwd", "--pass":
 			o.pass = next()
 		case "-e", "--exec":
 			o.exec = next()
@@ -116,6 +116,13 @@ func printUsage() {
 
 func main() {
 	o := parseArgs()
+	// 密码来源优先级：-P 参数 > TSUMUGI_PASS 环境变量 > TTY 交互输入（关闭回显）。
+	// 默认密码已移除：命令行/环境缺失时不再静默尝试 "password"。
+	if o.pass == "" && o.user != "" {
+		if p, err := readPasswordTTY(tr("promptPass")); err == nil {
+			o.pass = p
+		}
+	}
 	// 非交互单次命令：-e 执行 SQL；-f 执行脚本
 	if o.exec != "" || o.file != "" {
 		c, err := connect(o)
@@ -704,7 +711,8 @@ func saveHistory(hist []string) {
 	if len(hist) > 1000 {
 		hist = hist[len(hist)-1000:]
 	}
-	f, err := os.OpenFile(historyPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// 历史可能包含带口令的 SQL（如 SET PASSWORD），仅属主可读
+	f, err := os.OpenFile(historyPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return
 	}

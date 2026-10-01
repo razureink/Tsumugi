@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"math/rand"
 	"sync"
 	"testing"
@@ -8,7 +9,7 @@ import (
 
 // rbInvariants checks LLRB key invariants: black root, no red-with-red-left child,
 // no red right child (left-leaning), and equal black-heights on every path.
-func rbInvariants[K any, V any](t *RBTree[K, V]) bool {
+func rbInvariants[K cmp.Ordered, V any](t *RBTree[K, V]) bool {
 	if t.Size() == 0 && t.root.Load() == nil {
 		return true
 	}
@@ -104,35 +105,32 @@ func TestRBTreeDifferentialInt(t *testing.T) {
 	}
 }
 
-func collectBytes(t *RBTree[[]byte, int64]) map[string]int64 {
+func collectBytes(t *RBTree[string, int64]) map[string]int64 {
 	m := make(map[string]int64)
-	t.scanAll(func(k []byte, v int64) { m[string(k)] = v })
+	t.scanAll(func(k string, v int64) { m[k] = v })
 	return m
 }
 
 func TestRBTreeDifferentialBytes(t *testing.T) {
 	rng := rand.New(rand.NewSource(970207))
-	idx := newBytesKeyTree[int64]()
+	idx := newStringKeyTree[int64]()
 	ref := make(map[string]int64)
 	next := int64(0)
-	keyPool := [][]byte{
-		{'a'}, {'b'}, {'c'}, {'a', 'a'}, {'b', 'b'},
-		{'c', 'c'}, {'z'}, {'x'}, {'k', 'k'}, {'m'},
-	}
+	keyPool := []string{"a", "b", "c", "aa", "bb", "cc", "z", "x", "kk", "m"}
 	for i := 0; i < 30000; i++ {
 		op := rng.Intn(100)
 		key := keyPool[rng.Intn(len(keyPool))]
 		switch {
 		case op < 55:
-			ref[string(key)] = next
+			ref[key] = next
 			idx.Set(key, next)
 			next++
 		case op < 75:
-			delete(ref, string(key))
+			delete(ref, key)
 			idx.Delete(key)
 		default:
 			gv, gok := idx.Get(key)
-			mv, mok := ref[string(key)]
+			mv, mok := ref[key]
 			if gok != mok || (gok && gv != mv) {
 				t.Fatalf("Get mismatch key=%q tree=%v/%v ref=%v/%v", key, gv, gok, mv, mok)
 			}

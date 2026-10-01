@@ -52,9 +52,39 @@ const (
 // buffer 足够大以吸收并发突发，避免发送者频繁阻塞。
 var walCh = make(chan walEntry, 16384)
 
-// walBufPool 复用 WAL 记录缓冲：writeLog 从池取、writer 写完 rec 后归还，
-// 消除每条写日志的堆分配（组提交高频写入场景收益明显）。
-var walBufPool = sync.Pool{New: func() interface{} { return make([]byte, 0, 64) }}
+// walBufPool 复用 WAL 记录缓冲：分层池化，按 size class 减少内存浪费。
+var (
+	walBufPoolSmall = sync.Pool{New: func() interface{} { return make([]byte, 0, 128) }}
+	walBufPoolMed   = sync.Pool{New: func() interface{} { return make([]byte, 0, 512) }}
+	walBufPoolLarge = sync.Pool{New: func() interface{} { return make([]byte, 0, 2048) }}
+)
+
+func walBufGet(size int) []byte {
+	switch {
+	case size <= 128:
+		return walBufPoolSmall.Get().([]byte)[:0]
+	case size <= 512:
+		return walBufPoolMed.Get().([]byte)[:0]
+	default:
+		buf := walBufPoolLarge.Get().([]byte)
+		if cap(buf) < size {
+			return make([]byte, 0, size)
+		}
+		return buf[:0]
+	}
+}
+
+func walBufPut(buf []byte) {
+	c := cap(buf)
+	switch {
+	case c <= 128:
+		walBufPoolSmall.Put(buf[:0])
+	case c <= 512:
+		walBufPoolMed.Put(buf[:0])
+	case c <= 2048:
+		walBufPoolLarge.Put(buf[:0])
+	}
+}
 
 // rowValsPool 复用 encodeRow 的瞬态取值切片，避免每行编码一次堆分配。
 var rowValsPool = sync.Pool{New: func() interface{} { return make([]interface{}, 0, 8) }}
@@ -80,6 +110,9 @@ var walFsync atomic.Bool
 
 // 关闭标记：Close 后 appendWAL/flushWAL 直接返回，避免阻塞在已退出的 writer 上
 var walClosed atomic.Bool
+
+// walCloseCh 关闭哨兵：Close 时关闭，阻塞发送通过 select 监听它避免永久挂起
+var walCloseCh = make(chan struct{})
 
 // 全局统计钩子：appendWAL 是包级函数，借该指针上报磁盘写入速率
 var statsHook *Stats
@@ -398,7 +431,9 @@ func decodeRow(meta *TableMeta, data []byte) (map[string]interface{}, int64, int
 		case TypeVarchar:
 			l, ok := readU16(data, &pos)
 			if ok && pos+int(l) <= len(data) {
-				row[f.Name] = string(data[pos : pos+int(l)])
+				// 树内行字节不可变（COW），别名零拷贝即可；字符串在 Go 中不可变，
+				// 调用方无法改写这些字节（回归 C：每行 varchar 省一次堆分配）。
+				row[f.Name] = unsafeString(data[pos : pos+int(l)])
 				pos += int(l)
 			} else {
 				row[f.Name] = ""
@@ -457,8 +492,10 @@ func decodeRowFlat(meta *TableMeta, data []byte, into []interface{}) []interface
 // selectRowsFlat 无 WHERE 条件的全表扫描：直接解码为 []interface{} 行，不建 map。
 // 过期行收集后锁外清理（与 SelectR 一致）。limit<0 表示不限制。
 func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{} {
+	// 预分配上限钳制：LIMIT 值客户端可控，直接用于 make 预分配会被
+	// LIMIT 999999999 之类一次打爆内存（fatal OOM）；大 limit 交给 append 摊还扩容。
 	capHint := 16
-	if limit > 0 {
+	if limit > 0 && limit <= 4096 {
 		capHint = limit
 	}
 	rows := make([][]interface{}, 0, capHint)
@@ -469,7 +506,7 @@ func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{}
 			expired = append(expired, key)
 			return true
 		}
-		rows = append(rows, decodeRowFlat(t.meta, value, nil))
+		rows = append(rows, decodeRowFlat(t.Meta(), value, nil))
 		if limit >= 0 && len(rows) >= limit {
 			return false
 		}
@@ -539,19 +576,41 @@ func (ps *PrivilegeStore) load() error {
 	return nil
 }
 func (ps *PrivilegeStore) save() error {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
+	// 修复: 使用写锁保护整个 save 操作
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// 复制数据，减少持锁时间
+	dataCopy := make(map[string]map[string]byte)
+	for k, v := range ps.data {
+		inner := make(map[string]byte, len(v))
+		for uk, uv := range v {
+			inner[uk] = uv
+		}
+		dataCopy[k] = inner
+	}
+
 	tmp := ps.filePath + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		f.Close()
+		// 如果写入失败，清理临时文件
+		if err != nil {
+			os.Remove(tmp)
+		}
+	}()
+
 	enc := json.NewEncoder(f)
-	if err := enc.Encode(ps.data); err != nil {
+	if err := enc.Encode(dataCopy); err != nil {
 		return err
 	}
 	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, ps.filePath)
@@ -574,6 +633,16 @@ func (ps *PrivilegeStore) Grant(user, table string, perm byte) error {
 	ps.mu.Unlock()
 	return ps.save()
 }
+
+// GrantNoSave 仅内存授权（压测临时用户用）：不落盘。
+func (ps *PrivilegeStore) GrantNoSave(user, table string, perm byte) {
+	ps.mu.Lock()
+	if ps.data[table] == nil {
+		ps.data[table] = make(map[string]byte)
+	}
+	ps.data[table][user] |= perm
+	ps.mu.Unlock()
+}
 func (ps *PrivilegeStore) Revoke(user, table string, perm byte) error {
 	ps.mu.Lock()
 	if ps.data[table] != nil {
@@ -588,13 +657,43 @@ func (ps *PrivilegeStore) Revoke(user, table string, perm byte) error {
 
 // ==================== 表结构 ====================
 
+// idxTreeMap 二级索引集合。作为不可变快照整体发布（写时复制）：
+// 读者原子加载一次即可安全访问；CREATE/DROP INDEX 构建新快照后整体替换。
+// 索引键为 string（string 的 < 即逐字节字典序，与 bytes.Compare 排序一致）。
+type idxTreeMap map[string]*RBTree[string, []int64]
+
+// Table 的 meta 与 idxTrees 均为写时复制快照：读者无锁，写者整体替换后原子发布。
+// TableMeta（含 Fields/Indexes）一旦发布即视为不可变；ALTER/CREATE INDEX 必须构建新副本。
 type Table struct {
-	meta     *TableMeta
+	meta     atomic.Pointer[TableMeta]
 	pkTree   *RBTree[int64, []byte]
-	idxTrees map[string]*RBTree[[]byte, []int64]
+	idxTrees atomic.Pointer[idxTreeMap]
 	walFile  *os.File
 	tableID  uint32
-	mu       sync.RWMutex
+}
+
+func (t *Table) Meta() *TableMeta     { return t.meta.Load() }
+func (t *Table) setMeta(m *TableMeta) { t.meta.Store(m) }
+
+// indexes 返回当前二级索引快照。快照本身不可变，内部各 RBTree 自身线程安全。
+func (t *Table) indexes() idxTreeMap { return *t.idxTrees.Load() }
+func (t *Table) storeIndexes(m idxTreeMap) {
+	t.idxTrees.Store(&m)
+}
+
+// cloneMeta 深拷贝表元数据（可选替换表名），供 ALTER / RENAME / CREATE INDEX 写时复制。
+func cloneMeta(src *TableMeta, newName string) *TableMeta {
+	m := &TableMeta{
+		Name:    newName,
+		PK:      src.PK,
+		Fields:  make([]Field, len(src.Fields)),
+		Indexes: make(map[string]string, len(src.Indexes)),
+	}
+	copy(m.Fields, src.Fields)
+	for k, v := range src.Indexes {
+		m.Indexes[k] = v
+	}
+	return m
 }
 
 func NewTable(meta *TableMeta, walFile *os.File) *Table {
@@ -603,29 +702,33 @@ func NewTable(meta *TableMeta, walFile *os.File) *Table {
 	if walRegByName == nil {
 		walRegReset()
 	}
+	idx := make(idxTreeMap, len(meta.Indexes))
+	for idxName := range meta.Indexes {
+		idx[idxName] = newStringKeyTree[[]int64]()
+	}
 	t := &Table{
-		meta:     meta,
 		pkTree:   newIntKeyTree[[]byte](),
-		idxTrees: make(map[string]*RBTree[[]byte, []int64]),
 		walFile:  walFile,
 		tableID:  walRegRegister(meta.Name),
 	}
-	for idxName := range meta.Indexes {
-		t.idxTrees[idxName] = newBytesKeyTree[[]int64]()
-	}
+	t.meta.Store(meta)
+	t.idxTrees.Store(&idx)
 	return t
 }
 
-func (t *Table) encodeIndexValue(fieldName string, val interface{}) []byte {
+// encodeIndexValue 将索引列值编码为可排序的索引键。
+// int64 用大端 8 字节保证数值序 == 字节序；string 直接零拷贝返回
+//（字符串不可变，树内可安全持有；旧版 []byte(v) 每次更新索引要拷贝一次）。
+func (t *Table) encodeIndexValue(fieldName string, val interface{}) string {
 	switch v := val.(type) {
 	case int64:
-		b := make([]byte, 8)
-		binary.BigEndian.PutUint64(b, uint64(v))
-		return b
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(v))
+		return string(b[:])
 	case string:
-		return []byte(v)
+		return v
 	default:
-		return []byte{}
+		return ""
 	}
 }
 
@@ -643,22 +746,30 @@ func (t *Table) updateIndex(fieldName, idxName string, oldVal, newVal interface{
 
 // indexAddPK 将 pk 追加到索引 key 的倒排列表。写时复制：避免与共享底层数组的
 // 并发读者/写者竞态覆盖，同时避免污染树内存储的列表。
-func (t *Table) indexAddPK(idxName string, idxKey []byte, pk int64) {
-	list, _ := t.idxTrees[idxName].Get(idxKey)
+func (t *Table) indexAddPK(idxName string, idxKey string, pk int64) {
+	tree, ok := t.indexes()[idxName]
+	if !ok || tree == nil {
+		return
+	}
+	list, _ := tree.Get(idxKey)
 	newList := make([]int64, len(list), len(list)+1)
 	copy(newList, list)
 	newList = append(newList, pk)
-	t.idxTrees[idxName].Set(idxKey, newList)
+	tree.Set(idxKey, newList)
 }
 
 // indexRemovePK 从索引 key 的倒排列表移除 pk。只剩一个元素时直接删除 key。
-func (t *Table) indexRemovePK(idxName string, idxKey []byte, pk int64) {
-	list, ok := t.idxTrees[idxName].Get(idxKey)
+func (t *Table) indexRemovePK(idxName string, idxKey string, pk int64) {
+	tree, ok := t.indexes()[idxName]
+	if !ok || tree == nil {
+		return
+	}
+	list, ok := tree.Get(idxKey)
 	if !ok {
 		return
 	}
 	if len(list) <= 1 {
-		t.idxTrees[idxName].Delete(idxKey)
+		tree.Delete(idxKey)
 		return
 	}
 	newList := make([]int64, 0, len(list)-1)
@@ -668,20 +779,20 @@ func (t *Table) indexRemovePK(idxName string, idxKey []byte, pk int64) {
 		}
 	}
 	if len(newList) == 0 {
-		t.idxTrees[idxName].Delete(idxKey)
+		tree.Delete(idxKey)
 		return
 	}
-	t.idxTrees[idxName].Set(idxKey, newList)
+	tree.Set(idxKey, newList)
 }
 
 func (t *Table) Insert(pk int64, row map[string]interface{}, expireAt int64, txnID uint64, replay bool) error {
-	rowData := encodeRow(t.meta, row, 0, expireAt)
+	rowData := encodeRow(t.Meta(), row, 0, expireAt)
 	// 先改内存状态，再写 WAL：Compact 持有 walWriteMu 扫描时快照必然一致，
 	// 扫描期完成的写会在压缩换文件后追加到新 WAL（重放幂等，不会丢失）。
 	if !t.pkTree.SetNX(pk, rowData) {
 		return fmt.Errorf("primary key %d already exists", pk)
 	}
-	for idxName, fieldName := range t.meta.Indexes {
+	for idxName, fieldName := range t.Meta().Indexes {
 		t.indexAddPK(idxName, t.encodeIndexValue(fieldName, row[fieldName]), pk)
 	}
 	if !replay {
@@ -697,18 +808,18 @@ func (t *Table) Insert(pk int64, row map[string]interface{}, expireAt int64, txn
 // InsertOrdered 按 meta.Fields 顺序传入值的快速路径：跳过 map 构建与按名回查，
 // 用于 SQL 位置参数形式（INSERT INTO t VALUES (...)）。
 func (t *Table) InsertOrdered(pk int64, values []interface{}, expireAt int64, txnID uint64, replay bool) error {
-	rowData := encodeRowOrdered(t.meta, values, 0, expireAt)
+	rowData := encodeRowOrdered(t.Meta(), values, 0, expireAt)
 	if !t.pkTree.SetNX(pk, rowData) {
 		return fmt.Errorf("primary key %d already exists", pk)
 	}
-	if len(t.meta.Indexes) > 0 {
+	if len(t.Meta().Indexes) > 0 {
 		byName := make(map[string]interface{}, len(values))
-		for i, f := range t.meta.Fields {
+		for i, f := range t.Meta().Fields {
 			if i < len(values) {
 				byName[f.Name] = values[i]
 			}
 		}
-		for idxName, fieldName := range t.meta.Indexes {
+		for idxName, fieldName := range t.Meta().Indexes {
 			t.indexAddPK(idxName, t.encodeIndexValue(fieldName, byName[fieldName]), pk)
 		}
 	}
@@ -727,12 +838,12 @@ func (t *Table) Update(pk int64, row map[string]interface{}, expireAt int64, txn
 	if !ok {
 		return fmt.Errorf("row not found")
 	}
-	oldRow, oldVersion, _ := decodeRow(t.meta, oldData)
+	oldRow, oldVersion, _ := decodeRow(t.Meta(), oldData)
 	newVersion := oldVersion + 1
-	newData := encodeRow(t.meta, row, newVersion, expireAt)
+	newData := encodeRow(t.Meta(), row, newVersion, expireAt)
 
 	t.pkTree.Set(pk, newData)
-	for idxName, fieldName := range t.meta.Indexes {
+	for idxName, fieldName := range t.Meta().Indexes {
 		oldVal := oldRow[fieldName]
 		newVal := row[fieldName]
 		t.updateIndex(fieldName, idxName, oldVal, newVal, pk)
@@ -752,9 +863,9 @@ func (t *Table) Delete(pk int64, txnID uint64, replay bool) error {
 	if !ok {
 		return fmt.Errorf("row not found")
 	}
-	oldRow, _, _ := decodeRow(t.meta, oldData)
+	oldRow, _, _ := decodeRow(t.Meta(), oldData)
 	t.pkTree.Delete(pk)
-	for idxName, fieldName := range t.meta.Indexes {
+	for idxName, fieldName := range t.Meta().Indexes {
 		t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), pk)
 	}
 	if !replay {
@@ -774,11 +885,11 @@ func (t *Table) replayInsert(pk int64, data []byte) {
 	if !t.pkTree.SetNX(pk, data) {
 		return
 	}
-	if len(t.meta.Indexes) == 0 {
+	if len(t.Meta().Indexes) == 0 {
 		return
 	}
-	row, _, _ := decodeRow(t.meta, data)
-	for idxName, fieldName := range t.meta.Indexes {
+	row, _, _ := decodeRow(t.Meta(), data)
+	for idxName, fieldName := range t.Meta().Indexes {
 		t.indexAddPK(idxName, t.encodeIndexValue(fieldName, row[fieldName]), pk)
 	}
 }
@@ -788,20 +899,20 @@ func (t *Table) replayUpdate(pk int64, data []byte) {
 	if !ok {
 		return
 	}
-	if len(t.meta.Indexes) == 0 {
+	if len(t.Meta().Indexes) == 0 {
 		t.pkTree.Set(pk, data)
 		return
 	}
-	oldRow, _, _ := decodeRow(t.meta, oldData)
-	newRow, _, _ := decodeRow(t.meta, data)
+	oldRow, _, _ := decodeRow(t.Meta(), oldData)
+	newRow, _, _ := decodeRow(t.Meta(), data)
 	t.pkTree.Set(pk, data)
-	for idxName, fieldName := range t.meta.Indexes {
+	for idxName, fieldName := range t.Meta().Indexes {
 		t.updateIndex(fieldName, idxName, oldRow[fieldName], newRow[fieldName], pk)
 	}
 }
 
 func (t *Table) replayDelete(pk int64) {
-	if len(t.meta.Indexes) == 0 {
+	if len(t.Meta().Indexes) == 0 {
 		t.pkTree.Delete(pk)
 		return
 	}
@@ -809,9 +920,9 @@ func (t *Table) replayDelete(pk int64) {
 	if !ok {
 		return
 	}
-	oldRow, _, _ := decodeRow(t.meta, oldData)
+	oldRow, _, _ := decodeRow(t.Meta(), oldData)
 	t.pkTree.Delete(pk)
-	for idxName, fieldName := range t.meta.Indexes {
+	for idxName, fieldName := range t.Meta().Indexes {
 		t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), pk)
 	}
 }
@@ -845,7 +956,7 @@ type RangeCond struct {
 // - limit<0 表示不限制数量；否则凑够即停止，避免全表物化
 func (t *Table) SelectR(conditions map[string]interface{}, filters []RangeCond, minKey, maxKey *int64, limit int) ([]map[string]interface{}, error) {
 	// 主键点查优先：等值 + 精确范围
-	if pkVal, ok := conditions[t.meta.PK]; ok {
+	if pkVal, ok := conditions[t.Meta().PK]; ok {
 		if pk, ok := pkVal.(int64); ok {
 			rowData, found := t.pkTree.Get(pk)
 			if !found {
@@ -855,7 +966,7 @@ func (t *Table) SelectR(conditions map[string]interface{}, filters []RangeCond, 
 				t.pkTree.Delete(pk)
 				return nil, nil
 			}
-			row, _, _ := decodeRow(t.meta, rowData)
+			row, _, _ := decodeRow(t.Meta(), rowData)
 			if matchConditions(row, conditions) && matchRange(row, filters) {
 				return []map[string]interface{}{row}, nil
 			}
@@ -863,33 +974,37 @@ func (t *Table) SelectR(conditions map[string]interface{}, filters []RangeCond, 
 		}
 	}
 	// 二级索引等值路径
-	for idxName, fieldName := range t.meta.Indexes {
+	for idxName, fieldName := range t.Meta().Indexes {
 		if val, ok := conditions[fieldName]; ok {
 			idxKey := t.encodeIndexValue(fieldName, val)
-			if pkList, ok := t.idxTrees[idxName].Get(idxKey); ok {
-				result := make([]map[string]interface{}, 0, len(pkList))
-				for _, pk := range pkList {
-					if rowData, ok := t.pkTree.Get(pk); ok {
-						if e := decodeExpireAt(rowData); e > 0 && time.Now().UnixNano() > e {
-							t.pkTree.Delete(pk)
-							continue
-						}
-						row, _, _ := decodeRow(t.meta, rowData)
-						if matchConditions(row, conditions) && matchRange(row, filters) {
-							result = append(result, row)
-							if limit >= 0 && len(result) >= limit {
-								break
+				if tree, ok := t.indexes()[idxName]; ok && tree != nil {
+					if pkList, ok := tree.Get(idxKey); ok {
+						result := make([]map[string]interface{}, 0, len(pkList))
+						for _, pk := range pkList {
+							if rowData, ok := t.pkTree.Get(pk); ok {
+								if e := decodeExpireAt(rowData); e > 0 && time.Now().UnixNano() > e {
+									t.pkTree.Delete(pk)
+									continue
+								}
+								row, _, _ := decodeRow(t.Meta(), rowData)
+								if matchConditions(row, conditions) && matchRange(row, filters) {
+									result = append(result, row)
+									if limit >= 0 && len(result) >= limit {
+										break
+									}
+								}
 							}
 						}
+						return result, nil
 					}
 				}
-				return result, nil
 			}
 		}
-	}
 	// 全范围扫描（可被主键范围裁剪）
+	// 预分配上限钳制：LIMIT 值客户端可控，直接用于 make 预分配会被
+	// LIMIT 999999999 之类一次打爆内存（fatal OOM）；大 limit 交给 append 摊还扩容。
 	capHint := 16
-	if limit > 0 {
+	if limit > 0 && limit <= 4096 {
 		capHint = limit
 	}
 	result := make([]map[string]interface{}, 0, capHint)
@@ -900,7 +1015,7 @@ func (t *Table) SelectR(conditions map[string]interface{}, filters []RangeCond, 
 			expired = append(expired, key)
 			return true
 		}
-		row, _, _ := decodeRow(t.meta, value)
+		row, _, _ := decodeRow(t.Meta(), value)
 		if matchConditions(row, conditions) && matchRange(row, filters) {
 			result = append(result, row)
 			if limit >= 0 && len(result) >= limit {
@@ -920,8 +1035,10 @@ func (t *Table) SelectR(conditions map[string]interface{}, filters []RangeCond, 
 // SelectRBytes 范围查询的零分配快速路径：返回原始行字节，跳过 decodeRow 的 map 分配。
 // 仅适用于 conditions==nil && filters==nil 的纯范围扫描场景（如压测）。
 func (t *Table) SelectRBytes(minKey, maxKey *int64, limit int) [][]byte {
+	// 预分配上限钳制：LIMIT 值客户端可控，直接用于 make 预分配会被
+	// LIMIT 999999999 之类一次打爆内存（fatal OOM）；大 limit 交给 append 摊还扩容。
 	capHint := 16
-	if limit > 0 {
+	if limit > 0 && limit <= 4096 {
 		capHint = limit
 	}
 	result := make([][]byte, 0, capHint)
@@ -1023,7 +1140,7 @@ func (t *Table) SelectByPK(pk int64) (map[string]interface{}, bool) {
 	if !found {
 		return nil, false
 	}
-	row, _, expireAt := decodeRow(t.meta, rowData)
+	row, _, expireAt := decodeRow(t.Meta(), rowData)
 	if expireAt > 0 && time.Now().UnixNano() > expireAt {
 		t.pkTree.Delete(pk)
 		return nil, false
@@ -1039,10 +1156,7 @@ func (t *Table) writeLog(cmd byte, txnID uint64, pk int64, data []byte) error {
 	}
 	// v1 紧凑记录（varint + 表 ID）：小行写入固定开销从 ~38B 降到 ~10B。
 	// 编码在锁外完成；落盘由单写者 writer goroutine 串行处理，此处无并发锁，避免高并发锁风暴。
-	buf := walBufPool.Get().([]byte)[:0]
-	if cap(buf) < 24+len(data) {
-		buf = make([]byte, 0, 24+len(data))
-	}
+	buf := walBufGet(24 + len(data))
 	buf = append(buf, cmd)
 	isTxnCmd := cmd == WALBegin || cmd == WALCommit || cmd == WALRollback
 	if !isTxnCmd {
@@ -1066,22 +1180,35 @@ func appendWAL(rec []byte) error {
 	if walClosed.Load() {
 		return nil
 	}
+	entry := walEntry{rec: rec}
 	if walFsync.Load() {
 		done := make(chan error, 1)
-		walCh <- walEntry{rec: rec, sync: true, done: done}
-		return <-done
+		entry.sync = true
+		entry.done = done
 	}
-	walCh <- walEntry{rec: rec}
+	// 先试非阻塞入队（热路径零开销）；队列满时转入阻塞等待，
+	// 关闭哨兵兜底——自旋 + Gosched 会在突发写满时烧满一个核。
+	select {
+	case walCh <- entry:
+	case <-walCloseCh:
+		return nil
+	}
+	if entry.sync {
+		return <-entry.done
+	}
 	return nil
 }
 
 // 通知 writer 冲刷缓冲并同步落盘（供 DDL/Backup/Close/ticker 使用），完成后返回。
+// select 同时监听关闭哨兵：若 Close 发生在"检查 walClosed 之后、发送之前"，
+// 此处不会永久阻塞（回归 L3）。
 func (db *DB) flushWAL() error {
-	if walClosed.Load() {
+	done := make(chan error, 1)
+	select {
+	case walCh <- walEntry{flush: true, done: done}:
+	case <-walCloseCh:
 		return nil
 	}
-	done := make(chan error, 1)
-	walCh <- walEntry{flush: true, done: done}
 	return <-done
 }
 
@@ -1093,7 +1220,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
-	bw := bufio.NewWriterSize(file, 64*1024)
+	bw := bufio.NewWriterSize(file, 256*1024)
 	for {
 		e := <-walCh
 		switch {
@@ -1118,7 +1245,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 		if statsHook != nil {
 			statsHook.IncWalWrite(len(e.rec))
 		}
-		walBufPool.Put(e.rec[:0])
+		walBufPut(e.rec)
 		if !e.sync {
 			continue
 		}
@@ -1142,7 +1269,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 					if statsHook != nil {
 						statsHook.IncWalWrite(len(e2.rec))
 					}
-					walBufPool.Put(e2.rec[:0])
+					walBufPut(e2.rec)
 					if e2.sync {
 						waiters = append(waiters, e2.done)
 					}
@@ -1179,14 +1306,22 @@ func walSignal(d chan error) {
 // （写者先改树后入队，故其内存态先于入队），快照必然覆盖它们；barrier 之后入队的记录
 // 在换文件后追加到新 WAL（重放幂等，不丢失）。因此压缩期间写入无需全局锁。
 func (db *DB) Compact() error {
+	if walClosed.Load() {
+		return fmt.Errorf("wal is closed")
+	}
 	compactMu.Lock()
 	defer compactMu.Unlock()
 	compactBusy.Store(true)
 	defer compactBusy.Store(false)
 
 	// 1) barrier：等待 writer 把此前所有已入队记录冲刷并同步到当前文件
+	// 带超时：与 Close 竞争时阻塞发送可能永久挂起（回归 M4）
 	bdone := make(chan error, 1)
-	walCh <- walEntry{flush: true, done: bdone}
+	select {
+	case walCh <- walEntry{flush: true, done: bdone}:
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("compact: wal writer busy")
+	}
 	if err := <-bdone; err != nil {
 		return err
 	}
@@ -1227,19 +1362,19 @@ func (db *DB) Compact() error {
 
 	for _, t := range tables {
 		// v1 紧凑 catalog 记录：[100][subop=1][varint tableID]...
-		rec := make([]byte, 0, 96+len(t.meta.Name)*3)
+		rec := make([]byte, 0, 96+len(t.Meta().Name)*3)
 		rec = append(rec, 100, 1)
-		rec = appendVarUint(rec, uint64(walRegRegister(t.meta.Name)))
-		rec = appendVarLenStr(rec, t.meta.Name)
-		rec = appendVarLenStr(rec, t.meta.PK)
-		rec = appendVarUint(rec, uint64(len(t.meta.Fields)))
-		for _, fld := range t.meta.Fields {
+		rec = appendVarUint(rec, uint64(walRegRegister(t.Meta().Name)))
+		rec = appendVarLenStr(rec, t.Meta().Name)
+		rec = appendVarLenStr(rec, t.Meta().PK)
+		rec = appendVarUint(rec, uint64(len(t.Meta().Fields)))
+		for _, fld := range t.Meta().Fields {
 			rec = appendVarLenStr(rec, fld.Name)
 			rec = append(rec, byte(fld.Type))
 			rec = appendVarUint(rec, uint64(fld.Len))
 		}
-		rec = appendVarUint(rec, uint64(len(t.meta.Indexes)))
-		for idxName, idxField := range t.meta.Indexes {
+		rec = appendVarUint(rec, uint64(len(t.Meta().Indexes)))
+		for idxName, idxField := range t.Meta().Indexes {
 			rec = appendVarLenStr(rec, idxName)
 			rec = appendVarLenStr(rec, idxField)
 		}
@@ -1287,14 +1422,18 @@ func (db *DB) Compact() error {
 	}
 	if err := os.Rename(tmpPath, walPath); err != nil {
 		nf, e2 := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0644)
-		if e2 == nil {
-			nf.Seek(0, 2)
-			db.walFile = nf
+		if e2 != nil {
+			// 无法重建可写句柄：禁止 writer 在已关闭的文件上静默丢数据
+			walClosed.Store(true)
+			return fmt.Errorf("compact: rename failed and reopen failed: %v (reopen: %v)", err, e2)
 		}
+		nf.Seek(0, 2)
+		db.walFile = nf
 		return err
 	}
 	nf, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
+		walClosed.Store(true)
 		return err
 	}
 	// 压缩后文件已含完整内容，新句柄须定位到末尾以支持后续追加
@@ -1309,14 +1448,29 @@ func (db *DB) Compact() error {
 	return nil
 }
 
+// rebuildIndexes 基于当前主键树重建全部二级索引：离线构建新快照后整体发布，
+// 避免边遍历边修改共享 map（写时复制，读者不受影响）。
 func (t *Table) rebuildIndexes() {
-	for idxName, fieldName := range t.meta.Indexes {
-		t.idxTrees[idxName] = newBytesKeyTree[[]int64]()
+	newIdx := make(idxTreeMap, len(t.Meta().Indexes))
+	for idxName, fieldName := range t.Meta().Indexes {
+		tree := newStringKeyTree[[]int64]()
+		newIdx[idxName] = tree
 		t.pkTree.scanAll(func(key int64, value []byte) {
-			row, _, _ := decodeRow(t.meta, value)
-			t.indexAddPK(idxName, t.encodeIndexValue(fieldName, row[fieldName]), key)
+			row, _, _ := decodeRow(t.Meta(), value)
+			t.indexAddPKTo(tree, fieldName, row[fieldName], key)
 		})
 	}
+	t.storeIndexes(newIdx)
+}
+
+// indexAddPKTo 将 pk 追加到指定树（离线构建索引用，不经过快照查找）。
+func (t *Table) indexAddPKTo(tree *RBTree[string, []int64], fieldName string, val interface{}, pk int64) {
+	idxKey := t.encodeIndexValue(fieldName, val)
+	list, _ := tree.Get(idxKey)
+	newList := make([]int64, len(list), len(list)+1)
+	copy(newList, list)
+	newList = append(newList, pk)
+	tree.Set(idxKey, newList)
 }
 
 func (t *Table) CleanExpired(now int64) {
@@ -1329,7 +1483,7 @@ func (t *Table) CleanExpired(now int64) {
 	if len(expired) == 0 {
 		return
 	}
-	if len(t.meta.Indexes) == 0 {
+	if len(t.Meta().Indexes) == 0 {
 		for _, k := range expired {
 			t.pkTree.Delete(k)
 		}
@@ -1340,12 +1494,25 @@ func (t *Table) CleanExpired(now int64) {
 		if !ok {
 			continue
 		}
-		oldRow, _, _ := decodeRow(t.meta, oldData)
+		oldRow, _, _ := decodeRow(t.Meta(), oldData)
 		t.pkTree.Delete(k)
-		for idxName, fieldName := range t.meta.Indexes {
+		for idxName, fieldName := range t.Meta().Indexes {
 			t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), k)
 		}
 	}
+}
+
+// setDurability 切换持久化模式：落盘语义（walFsync）与统计口径即时生效。
+// 调用方需持有 cfgMu（或处于单写者上下文）。
+func (db *DB) setDurability(mode Durability) {
+	if !mode.Valid() {
+		return
+	}
+	// fsync 语义切换前先冲刷，确保此前的 batch 记录落盘
+	db.flushWAL()
+	db.config.Durability = mode
+	db.stats.durability = mode
+	walFsync.Store(mode.Fsync())
 }
 
 // ==================== 数据库引擎 ====================
@@ -1360,8 +1527,6 @@ type DB struct {
 	tables            sync.Map // map[string]*Table，无锁并发安全
 	tablesCount       atomic.Int64
 	catalog           map[string]*TableMeta
-	catalogMu         sync.RWMutex
-	users             map[string]string
 	privileges        *PrivilegeStore
 	walFile           *os.File
 	mu                sync.RWMutex // 保护 catalog、users 等
@@ -1379,6 +1544,12 @@ type DB struct {
 	backupDir         string
 	autoCompactTicker *time.Ticker
 	metricsServer     atomic.Pointer[http.Server]
+	closed            atomic.Bool
+	// cfgMu 串行化设置页对 db.config 的热更新写入；读路径为高频只读字段，
+	// 写入全部收敛到 cfgMu 持有者（settings/setup/durability）。
+	cfgMu sync.RWMutex
+	// webSchemas SQL 控制台按 token 的会话库（USE 作用域），token -> dbname
+	webSchemas sync.Map
 }
 
 type Transaction struct {
@@ -1393,15 +1564,9 @@ func NewDB(cfg *Config) (*DB, error) {
 	if err := os.MkdirAll(cfg.WALDir, 0755); err != nil {
 		return nil, err
 	}
-	os.MkdirAll("data", 0755)
-	initUserStore("data")
-
-	// 首次安装标记：若用户库为空，写入标记文件供安装向导检测
-	// 不在此处自动创建 root 用户，由安装向导完成首次设置
-	if globalUsers.Count() == 0 {
-		os.WriteFile("data/.first_run", []byte("1"), 0644)
-		logf(LOG_OK, "first install detected, setup wizard will be shown")
-	}
+	// 用户库跟随数据目录：硬编码 "data" 会让测试/非默认部署把 users.json
+	// 写到工作目录下的 data/，造成测试互相污染、部署目录不一致。
+	initUserStore(cfg.WALDir)
 	walPath := cfg.WALDir + "/" + cfg.WALFile
 	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -1429,7 +1594,6 @@ func NewDB(cfg *Config) (*DB, error) {
 	db := &DB{
 		config:     cfg,
 		catalog:    make(map[string]*TableMeta),
-		users:      map[string]string{},
 		privileges: privStore,
 		walFile:    walFile,
 		txns:       make(map[uint64]*Transaction),
@@ -1469,7 +1633,12 @@ func NewDB(cfg *Config) (*DB, error) {
 	walFsync.Store(cfg.Durability.Fsync())
 	walCRC.Store(cfg.EnableChecksum)
 	walClosed.Store(false)
-	walRegReset()
+	// 重建关闭哨兵：上一轮 Close 已 close 过。全局 WAL 生命周期一次只允许
+	// 一个活跃 DB（既有设计约束，见 walCh 等包级全局注释）。
+	walCloseCh = make(chan struct{})
+	// 注意：此处绝不能 walRegReset()——loadWAL 已通过 catalog 重放把注册表
+	// 绑定到文件中的表 ID；清空会让重启后新建的表从 1 重新编号，与既有表
+	// 的 tableID 冲突，下次重放时数据会串表（回归测试见 walreg_repro_test.go）。
 	db.walFile = walFile
 	// 启动唯一 WAL writer：此后所有 appendWAL/flushWAL 经通道交给它串行落盘
 	db.wg.Add(1)
@@ -1603,6 +1772,10 @@ func (db *DB) cleanExpired() {
 }
 
 func (db *DB) Close() {
+	// 幂等保护：Close 可能被 defer 与显式调用各触发一次
+	if !db.closed.CompareAndSwap(false, true) {
+		return
+	}
 	// 阻止自动整理在关闭期间并发执行
 	compactBusy.Store(true)
 	close(db.stopCh)
@@ -1614,12 +1787,22 @@ func (db *DB) Close() {
 	if srv := db.metricsServer.Load(); srv != nil {
 		srv.Close()
 	}
-	// 标记关闭：此后 appendWAL/flushWAL 直接返回，避免阻塞在已退出的 writer 上
+	// 标记关闭并广播哨兵：此后 appendWAL/flushWAL 直接返回/退出等待，
+	// 避免阻塞在已退出的 writer 上
 	walClosed.Store(true)
+	close(walCloseCh)
 	// 停止 writer：冲刷并同步所有已入队记录后退出
 	done := make(chan error, 1)
-	walCh <- walEntry{stop: true, done: done}
-	<-done
+	select {
+	case walCh <- walEntry{stop: true, done: done}:
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			logf(LOG_ERR, "WAL writer did not stop within timeout")
+		}
+	case <-time.After(5 * time.Second):
+		logf(LOG_ERR, "failed to send stop signal to WAL writer")
+	}
 	db.wg.Wait()
 	db.walFile.Close()
 }
@@ -1686,17 +1869,30 @@ type walReplayCtx struct {
 	pending     map[string][]walOp
 	pendingTxns map[uint64][]walOp
 	loadedRows  int64
+	totalRows   int64
 	lastPct     int
 	barDone     bool
 }
 
 // walProgressBar 渲染并刷新一条 Minecraft 风味的加载进度条（\r 原地刷新，不换行）。
 // 仅在解析推进时更新，避免打字风暴；返回是否真正打印过。
-func (c *walReplayCtx) walProgressBar(pos, total int, rows int64) bool {
-	if total <= 0 {
+func (c *walReplayCtx) walProgressBar(rows int64) bool {
+	total := c.totalRows
+	// 小 WAL（<10 万行）瞬时即可完成：进度条反而刷屏（污染基准/CI 输出）
+	if total < 100000 {
 		return false
 	}
-	pct := pos * 100 / total
+	var pct int
+	if rows >= total {
+		pct = 100
+	} else if total > 100 {
+		pct = int(rows / (total / 100))
+	} else {
+		pct = int(rows * 100 / total)
+	}
+	if pct > 100 {
+		pct = 100
+	}
 	if pct < c.lastPct+1 {
 		return false
 	}
@@ -1710,18 +1906,13 @@ func (c *walReplayCtx) walProgressBar(pos, total int, rows int64) bool {
 
 // walProgressFinish 在加载完成时显示 100% 并换行，避免进度条与后续日志粘连。
 func (c *walReplayCtx) walProgressFinish() {
-	if c.barDone {
+	if c.barDone || c.totalRows < 100000 {
 		return
 	}
-	total := len(c.buf)
 	width := 24
 	bar := strings.Repeat("#", width)
-	var pct int
-	if total > 0 {
-		pct = 100
-	}
 	rows := atomic.LoadInt64(&c.loadedRows)
-	fmt.Printf("\r[INFO] Loading databases... [%s] %3d%% (%d rows)\n", bar, pct, rows)
+	fmt.Printf("\r[INFO] Loading databases... [%s] 100%% (%d rows)\n", bar, rows)
 	c.barDone = true
 }
 
@@ -1752,6 +1943,7 @@ func (c *walReplayCtx) flushPending() {
 	if len(c.pending) == 0 {
 		return
 	}
+	c.walProgressBar(c.loadedRows)
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 	var wg sync.WaitGroup
 	for tableName, ops := range c.pending {
@@ -1770,6 +1962,7 @@ func (c *walReplayCtx) flushPending() {
 		}(table, ops)
 	}
 	wg.Wait()
+	c.walProgressBar(c.loadedRows)
 	c.pending = make(map[string][]walOp)
 }
 
@@ -1798,14 +1991,113 @@ func (c *walReplayCtx) tailOrErr(recordStart int, pos int, format string, args .
 // ---- v1 紧凑格式解析（varint + 表 ID + 每记录 CRC）----
 
 func (c *walReplayCtx) loadV2() error {
-	// 解析循环内可能因残缺尾部提前退出，因此在此统一收尾：
-	// 任何情况下都必须先把已解析的有效记录重放完，再算统计。
+	c.totalRows = c.estimateRows()
 	err := c.parseV2()
 	c.flushPending()
 	walLoadRows = c.loadedRows
-	// 进度条收尾：显示 100% 后换行，让随后的 "WAL loaded" 日志另起一行。
 	c.walProgressFinish()
 	return err
+}
+
+// estimateRows 快速估算 WAL 中的总行数（仅扫描 varint 跳过数据）。
+// 用于进度条分母，精度不需要100%，只需给出合理的上限。
+func (c *walReplayCtx) estimateRows() int64 {
+	buf := c.buf
+	pos := 0
+	count := int64(0)
+	skipVarint := func() {
+		for pos < len(buf) && buf[pos]&0x80 != 0 {
+			pos++
+		}
+		if pos < len(buf) {
+			pos++
+		}
+	}
+	skipNVarints := func(n int) {
+		for i := 0; i < n && pos < len(buf); i++ {
+			skipVarint()
+		}
+	}
+	for pos < len(buf) {
+		startPos := pos
+		if pos+1 > len(buf) {
+			break
+		}
+		cmd := buf[pos]
+		pos++
+		if cmd == 100 { // catalog
+			if pos >= len(buf) {
+				break
+			}
+			pos++ // sub
+			skipNVarints(2) // id + name
+			// skip meta: pkLen + fieldCount + fields
+			if pos < len(buf) {
+				skipVarint() // pkLen
+				if pos < len(buf) {
+					fc := int(buf[pos])
+					pos++
+					for f := 0; f < fc && pos < len(buf); f++ {
+						skipVarint() // nameLen
+						if pos < len(buf) {
+							nl := pos
+							skipVarint() // name bytes
+							nl = pos - nl - 1
+							if pos+nl > len(buf) {
+								pos = len(buf)
+							} else {
+								pos += nl
+							}
+						}
+						if pos < len(buf) {
+							pos++ // type
+						}
+						skipVarint() // len
+					}
+				}
+			}
+			if pos <= startPos {
+				break
+			}
+			continue
+		}
+		// 数据记录
+		isTxnCmd := cmd == WALBegin || cmd == WALCommit || cmd == WALRollback
+		fields := 1
+		if !isTxnCmd {
+			fields = 3
+		}
+		skipNVarints(fields)
+		if !isTxnCmd {
+			var dataLen uint64
+			shift := 0
+			for pos < len(buf) {
+				b := buf[pos]
+				pos++
+				dataLen |= uint64(b&0x7f) << shift
+				shift += 7
+				if b&0x80 == 0 {
+					break
+				}
+				if shift > 63 {
+					break
+				}
+			}
+			if int(dataLen) > len(buf)-pos {
+				pos = len(buf)
+			} else {
+				pos += int(dataLen)
+			}
+		}
+		if c.enableCRC && pos+4 <= len(buf) {
+			pos += 4
+		}
+		if pos <= startPos {
+			break
+		}
+		count++
+	}
+	return count
 }
 
 func (c *walReplayCtx) parseV2() error {
@@ -1824,7 +2116,7 @@ func (c *walReplayCtx) parseV2() error {
 
 loop:
 	for pos < len(buf) {
-		c.walProgressBar(pos, len(buf), c.loadedRows)
+		c.walProgressBar(c.loadedRows)
 		recordStart := pos
 		cmd := buf[pos]
 		pos++
@@ -1988,7 +2280,9 @@ loop:
 				}
 				return fmt.Errorf("incomplete record data")
 			}
-			data = buf[pos : pos+int(dataLen)]
+			// 拷贝出记录数据：整个 WAL 在启动时一次性读入内存，若行值直接引用
+			// 该缓冲，载入后大文件字节将随行数据永久驻留无法回收。
+			data = append([]byte(nil), buf[pos:pos+int(dataLen)]...)
 			pos += int(dataLen)
 		}
 
@@ -2112,13 +2406,13 @@ func (db *DB) createTableFromMeta(meta *TableMeta) {
 }
 
 // applyCatalogV2 恢复建表/改表：将注册表绑定到文件中的 ID。若同名表已存在（如 ALTER ADD COLUMN 追加列），
-// 更新其 meta 使新列生效（旧行按零值解码，向后兼容），否则新建。
+// 以写时复制方式发布新 meta 使新列生效（旧行按零值解码，向后兼容），否则新建。
 func (db *DB) applyCatalogV2(id uint32, meta *TableMeta) {
 	walRegRebind(id, meta.Name)
 	db.mu.Lock()
 	if v, ok := db.tables.Load(meta.Name); ok {
-		// 既有表（如 ALTER ADD COLUMN）：更新其 meta 使新列在 SELECT 解码时生效。
-		v.(*Table).meta = meta
+		// 既有表（如 ALTER ADD COLUMN）：整体替换 meta 快照，使新列在 SELECT 解码时生效。
+		v.(*Table).setMeta(meta)
 		db.catalog[meta.Name] = meta
 		db.mu.Unlock()
 		return
@@ -2147,13 +2441,13 @@ func (db *DB) applyCatalogRenameV2(id uint32, newName string) {
 	}
 	val, exists := db.tables.Load(oldName)
 	if exists {
-		mt := val.(*Table).meta
-		mt.Name = newName
+		tbl := val.(*Table)
+		// 写时复制：发布改名后的新 meta 快照，避免原地修改共享的 TableMeta
+		tbl.setMeta(cloneMeta(tbl.Meta(), newName))
 		db.tables.Delete(oldName)
 		db.tables.Store(newName, val)
 	} else if m, ok := db.catalog[oldName]; ok {
-		m.Name = newName
-		db.catalog[newName] = m
+		db.catalog[newName] = cloneMeta(m, newName)
 	}
 	delete(db.catalog, oldName)
 	walRegRename(oldName, newName, id)
@@ -2165,9 +2459,9 @@ func (db *DB) getOrCreateTable(name string) *Table {
 	if v, ok := db.tables.Load(name); ok {
 		return v.(*Table)
 	}
-	db.catalogMu.RLock()
+	db.mu.RLock()
 	meta, ok := db.catalog[name]
-	db.catalogMu.RUnlock()
+	db.mu.RUnlock()
 	if !ok {
 		return nil
 	}
@@ -2292,57 +2586,109 @@ func (db *DB) CommitTxn(id uint64) error {
 		db.txnMu.Unlock()
 		return fmt.Errorf("transaction not active")
 	}
-	db.txnMu.Unlock()
+	// 修复: 不立即解锁 txnMu，防止并发提交/回滚
 
-	for tableName, changes := range txn.Changes {
-		db.mu.RLock()
-		val, ok := db.tables.Load(tableName)
-		db.mu.RUnlock()
-		if !ok {
+	// 预收集所有表引用（单次 RLock）
+	type tableRef struct {
+		name  string
+		table *Table
+	}
+	var tables []tableRef
+	seen := make(map[string]bool)
+	for tableName := range txn.Changes {
+		if seen[tableName] {
 			continue
 		}
-		table := val.(*Table)
+		seen[tableName] = true
+	}
+	db.mu.RLock()
+	for tableName := range seen {
+		if val, ok := db.tables.Load(tableName); ok {
+			tables = append(tables, tableRef{tableName, val.(*Table)})
+		}
+	}
+	db.mu.RUnlock()
+
+	// 冲突检测（无锁窗口）
+	for _, tr := range tables {
+		changes := txn.Changes[tr.name]
 		for pk, oldData := range changes {
-			currentData, ok := table.pkTree.Get(pk)
+			currentData, ok := tr.table.pkTree.Get(pk)
 			if !ok {
 				if oldData != nil {
-					db.RollbackTxn(id)
+					txn.Active = false
+					delete(db.txns, id)
+					db.txnMu.Unlock()
+					db.rollbackTxnData(txn)
 					return fmt.Errorf("conflict: row %d deleted", pk)
 				}
 				continue
 			}
 			currentVersion := decodeVersion(currentData)
 			var oldVersion int64
-			if txn.ReadVersions[tableName] != nil {
-				oldVersion = txn.ReadVersions[tableName][pk]
+			if txn.ReadVersions[tr.name] != nil {
+				oldVersion = txn.ReadVersions[tr.name][pk]
 			}
 			if currentVersion != oldVersion {
-				db.RollbackTxn(id)
+				txn.Active = false
+				delete(db.txns, id)
+				db.txnMu.Unlock()
+				db.rollbackTxnData(txn)
 				return fmt.Errorf("conflict: row %d version changed", pk)
 			}
 		}
 	}
 
-	for tableName := range txn.Tables {
-		db.mu.RLock()
-		val, ok := db.tables.Load(tableName)
-		db.mu.RUnlock()
-		if ok {
-			table := val.(*Table)
-			table.writeLog(WALCommit, id, 0, nil)
+	// 写 WAL COMMIT
+	for _, tr := range tables {
+		if err := tr.table.writeLog(WALCommit, id, 0, nil); err != nil {
+			txn.Active = false
+			delete(db.txns, id)
+			db.txnMu.Unlock()
+			db.rollbackTxnData(txn)
+			return err
 		}
 	}
 	// batch 模式下经 GroupCommitter 合并等待一次定时刷盘保证提交持久化；
 	// fsync 模式下 appendWAL 已在 writer 中同步落盘，无需再等（避免双重等待）。
+	// 等待在锁外进行：Join 仅登记等待者（微秒级），真正的刷盘等待（毫秒级）
+	// 不占 txnMu，让其他事务的冲突检测/落盘登记得以并行——冲突检测本身
+	// 已在上方临界区内完成，等待挪出锁外不削弱正确性。
+	var done <-chan struct{}
 	if !walFsync.Load() {
-		<-db.groupCommit.Join()
+		done = db.groupCommit.Join()
 	}
 
-	db.txnMu.Lock()
+	// 清理事务
 	txn.Active = false
 	delete(db.txns, id)
 	db.txnMu.Unlock()
+
+	if done != nil {
+		<-done
+	}
 	return nil
+}
+
+// rollbackTxnData 回滚事务数据（调用方已从 db.txns 中移除该事务）
+func (db *DB) rollbackTxnData(txn *Transaction) {
+	for tableName, changes := range txn.Changes {
+		if val, ok := db.tables.Load(tableName); ok {
+			table := val.(*Table)
+			needRebuild := false
+			for pk, oldData := range changes {
+				if oldData == nil {
+					table.Delete(pk, txn.ID, true)
+				} else {
+					table.pkTree.Set(pk, oldData)
+					needRebuild = true
+				}
+			}
+			if needRebuild {
+				table.rebuildIndexes()
+			}
+		}
+	}
 }
 
 func (db *DB) RollbackTxn(id uint64) error {
@@ -2460,9 +2806,15 @@ func (db *DB) AlterTableAddColumn(tableName, fieldName string, fieldType FieldTy
 			return fmt.Errorf("field %s already exists", fieldName)
 		}
 	}
-	meta.Fields = append(meta.Fields, Field{Name: fieldName, Type: fieldType, Len: fieldLen})
-	if err := db.writeCatalog(meta); err != nil {
+	// 写时复制：构建新 meta 快照整体发布，读者可能正在遍历旧 Fields 切片
+	newMeta := cloneMeta(meta, meta.Name)
+	newMeta.Fields = append(newMeta.Fields, Field{Name: fieldName, Type: fieldType, Len: fieldLen})
+	if err := db.writeCatalog(newMeta); err != nil {
 		return err
+	}
+	db.catalog[tableName] = newMeta
+	if v, ok := db.tables.Load(tableName); ok {
+		v.(*Table).setMeta(newMeta)
 	}
 	return nil
 }
@@ -2472,6 +2824,10 @@ func (db *DB) Backup() error {
 	if err := os.MkdirAll(db.backupDir, 0755); err != nil {
 		return err
 	}
+	// 与 Compact 互斥：压缩期间会关闭/改名 WAL 文件，
+	// 并发备份会拷到截断（Windows）或陈旧 inode（Linux）
+	compactMu.Lock()
+	defer compactMu.Unlock()
 	db.mu.Lock()
 	// 先冲刷 WAL 缓冲并落盘，确保备份文件完整
 	if err := db.flushWAL(); err != nil {
