@@ -1,0 +1,52 @@
+# Tsumugi systemd 单元示例
+#
+#   sudo useradd --system --home /var/lib/tsumugi --shell /usr/sbin/nologin tsumugi
+#   sudo install -d -o tsumugi -g tsumugi -m 0700 /var/lib/tsumugi
+#   sudo install -m 0755 tsumugi /usr/local/bin/tsumugi
+#   sudo install -m 0644 deploy/tsumugi.service /etc/systemd/system/tsumugi.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tsumugi
+#
+# 工作目录即配置与数据根目录：config/tsumugi.json、data/、backup/ 都在 /var/lib/tsumugi 下。
+
+[Unit]
+Description=Tsumugi in-memory database
+Documentation=https://github.com/your-org/tsumugi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tsumugi
+Group=tsumugi
+WorkingDirectory=/var/lib/tsumugi
+ExecStart=/usr/local/bin/tsumugi
+Restart=on-failure
+RestartSec=3s
+
+# 优雅退出：SIGTERM 后冲刷 WAL 再退出，超时由程序自身 20s 兜底
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# 文件句柄：每个连接 1 个，按 max_conns 留足余量
+LimitNOFILE=65536
+
+# 沙箱：只允许写数据目录，其余文件系统只读
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tsumugi
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# 资源上限（按机器规格调整）
+# MemoryMax=8G
+# CPUQuota=400%
+
+[Install]
+WantedBy=multi-user.target

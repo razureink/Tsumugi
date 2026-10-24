@@ -1,20 +1,21 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"time"
 	"hash/crc32"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ==================== SQL 解析与执行 ====================
 
 // sqlTokenKind token 类别（byte 常量：取代 string 比较并把结构体从 72B
-// 压到 48B——token 追加/消费是分词与解析热路径上最大的 memcpy）。
+// 压到 40B——token 追加/消费是分词与解析热路径上最大的 memcpy）。
 type sqlTokenKind uint8
 
 const (
@@ -32,7 +33,6 @@ type sqlToken struct {
 	kind  sqlTokenKind
 	val   string
 	upper string // 仅对 ident/kw 非空
-	pos   int
 }
 
 // sqlTokenPool 复用 []sqlToken 切片，减少 tokenizeSQL 热路径分配。
@@ -184,12 +184,12 @@ func tokenizeSQL(sql string) ([]sqlToken, error) {
 			i++
 		}
 	}
-	toks = append(toks, sqlToken{kind: kindEof, val: "", pos: n})
+	toks = append(toks, sqlToken{kind: kindEof, val: ""})
 	return toks, nil
 }
 
 // scanQuoted 扫描单/双引号字符串，处理反斜杠转义与
-// 引号 doubling（'' 或 ""），返回解码后的值与结束后的下一个下标。
+// 引号 doubling（连续两个相同引号表示字面引号），返回解码后的值与结束后的下一个下标。
 func scanQuoted(sql string, i int) (string, int, error) {
 	quote := sql[i]
 	n := len(sql)
@@ -311,7 +311,9 @@ var sqlKeywords = []string{
 
 // asciiEq ASCII 专用的大小写不敏感比较（关键字词表全为大写 ASCII，语义与
 // strings.EqualFold 一致：非 ASCII 字节不可能折叠进纯 ASCII 词表）。
-// 取代 EqualFold 的 Unicode 逐字符折叠——分词/解析热路径上每 token 都要走。
+// 折叠仅限 'a'~'z'——无上界的 >= 'a' 会把 '{'|'~' 等标点折叠成 '['|'^'，
+// 与词表字节发生假相等。取代 EqualFold 的 Unicode 逐字符折叠——分词/解析
+// 热路径上每 token 都要走。
 func asciiEq(a, b string) bool {
 	if len(a) != len(b) {
 		return false
@@ -319,10 +321,10 @@ func asciiEq(a, b string) bool {
 	for i := 0; i < len(a); i++ {
 		ca, cb := a[i], b[i]
 		if ca != cb {
-			if ca >= 'a' {
+			if ca >= 'a' && ca <= 'z' {
 				ca -= 'a' - 'A'
 			}
-			if cb >= 'a' {
+			if cb >= 'a' && cb <= 'z' {
 				cb -= 'a' - 'A'
 			}
 			if ca != cb {
@@ -389,6 +391,16 @@ type sqlParser struct {
 	paramIdx int           // 已消费的参数下标
 	txnID    uint64        // 当前事务 ID（0 表示自动提交）
 	schema   string        // 连接级默认数据库（MySQL 会话）；空表示沿用全局 curDB（Web 控制台）
+	user     string        // 执行账号（空 = 内部可信调用，不做表级授权）
+	// out：语句级输出容器（自增主键等）。协议层用它回填 LastInsertId。
+	out *sqlOut
+	// lastInsertID：本语句由引擎分配的自增主键（0 = 未分配）
+	lastInsertID int64
+}
+
+// sqlOut 承载语句级输出，供协议层填充响应（如 MySQL OK 包里的 last insert id）。
+type sqlOut struct {
+	LastInsertID int64
 }
 
 // curSchema 返回本语句的默认数据库：连接级 schema 优先，其次全局 curDB。
@@ -507,9 +519,60 @@ func (db *DB) runSQLSchema(sql string, params []interface{}, txnID uint64, schem
 	return db.runSQLTokens(toks, sql, params, txnID, schema)
 }
 
+// runSQLAs 以指定账号执行 SQL：内部统一做表级权限校验（二进制 / MySQL 协议入口）。
+func (db *DB) runSQLAs(user, sql string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	return db.runSQLSchemaAs(user, sql, nil, 0, "")
+}
+
+// runSQLAsOut 与 runSQLAs 相同，但把语句级输出（自增主键）写进 out。
+func (db *DB) runSQLAsOut(user, sql string, out *sqlOut) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	return db.runSQLSchemaAsOut(user, sql, nil, 0, "", out)
+}
+
+// runSQLSchemaAs 以指定账号执行 SQL（带连接级默认库）。user=="" 表示内部可信调用。
+func (db *DB) runSQLSchemaAs(user, sql string, params []interface{}, txnID uint64, schema string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	return db.runSQLSchemaAsOut(user, sql, params, txnID, schema, nil)
+}
+
+// runSQLSchemaAsOut 与 runSQLSchemaAs 相同，但把语句级输出（自增主键）写进 out。
+func (db *DB) runSQLSchemaAsOut(user, sql string, params []interface{}, txnID uint64, schema string, out *sqlOut) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	toks, terr := tokenizeSQL(sql)
+	if terr != nil {
+		err = terr
+		return
+	}
+	defer putSQLTokens(toks)
+	return db.runSQLTokensAsOut(user, toks, sql, params, txnID, schema, out)
+}
+
 // runSQLTokens 使用调用方提供的已分词 tokens 执行（prepared 复用，避免每次 EXECUTE 重新分词）。
 func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, txnID uint64, schema string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
-	p := &sqlParser{toks: toks, params: params, txnID: txnID, schema: schema}
+	return db.runSQLTokensAs("", toks, sql, params, txnID, schema)
+}
+
+// runSQLTokensAs 是 runSQLTokens 的带账号版本：user 非空时先做表级授权检查。
+func (db *DB) runSQLTokensAs(user string, toks []sqlToken, sql string, params []interface{}, txnID uint64, schema string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	return db.runSQLTokensAsOut(user, toks, sql, params, txnID, schema, nil)
+}
+
+// runSQLTokensAsOut 与 runSQLTokensAs 相同，但把语句级输出（自增主键）写进 out。
+// 协议层用它回填 MySQL OK 包的 last insert id（GORM 等 ORM 依赖它取自增主键）。
+func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params []interface{}, txnID uint64, schema string, out *sqlOut) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	if user != "" {
+		if aerr := db.authorizeSQLTokensFast(user, toks); aerr != nil {
+			err = aerr
+			return
+		}
+	}
+	// UNION [ALL]：按 token 拆成左右两个 SELECT 分别执行后合并
+	if idx, all, hasUnion := findTopLevelUnion(toks); hasUnion {
+		return db.runUnionAs(user, toks, idx, all, sql, params, txnID, schema)
+	}
+	p := &sqlParser{toks: toks, params: params, txnID: txnID, schema: schema, user: user, out: out}
+	if out != nil {
+		// 语句结束后把自增主键回填给协议层（MySQL OK 包的 last insert id）
+		defer func() { out.LastInsertID = p.lastInsertID }()
+	}
 	// 去除开头的空/分号
 	for p.peek().kind == kindSym && p.peek().val == ";" {
 		p.next()
@@ -519,7 +582,9 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		err = fmt.Errorf("empty query")
 		return
 	}
-	switch first.canonical() {
+	// 语句首词归一：JOIN/BEGIN/REPLACE/TRUNCATE 等不在关键字表里（避免占用
+	// 标识符命名空间），必须按 token 原文比较，否则这些语句会落到 default 报错。
+	switch strings.ToUpper(first.val) {
 	case "SHOW":
 		if !p.matchKeyword("SHOW") {
 			break
@@ -639,6 +704,49 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 				rows = append(rows, []interface{}{strings.ToUpper(k), snap[k]})
 			}
 			sortRowsByFirst(rows)
+			return
+		}
+		// SHOW MASTER STATUS / SHOW BINARY LOGS / SHOW SLAVE STATUS
+		if p.matchKeyword("MASTER") {
+			p.matchKeyword("STATUS")
+			columns = []string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}
+			rows = [][]interface{}{{"tsumugi-bin.000001", int64(4), "", "", ""}}
+			return
+		}
+		if p.matchKeyword("BINARY") {
+			p.matchKeyword("LOGS")
+			columns = []string{"Log_name", "File_size"}
+			rows = [][]interface{}{{"tsumugi-bin.000001", int64(0)}}
+			return
+		}
+		if p.matchKeyword("SLAVE") {
+			p.matchKeyword("STATUS")
+			p.matchKeyword("HOSTS")
+			columns = []string{"Slave_IO_State", "Master_Host", "Master_Port"}
+			rows = nil
+			return
+		}
+		if p.matchKeyword("PRIVILEGES") {
+			columns = []string{"Privilege", "Context", "Comment"}
+			rows = [][]interface{}{{"Select", "Tables", ""}, {"Insert", "Tables", ""}, {"Update", "Tables", ""}, {"Delete", "Tables", ""}, {"Create", "Databases,Tables,Indexes", ""}, {"Drop", "Databases,Tables", ""}, {"Alter", "Tables", ""}, {"Index", "Tables", ""}, {"Grant option", "Databases,Tables", ""}}
+			return
+		}
+		if p.matchKeyword("PROCEDURE") {
+			p.matchKeyword("STATUS")
+			columns = []string{"Db", "Name", "Type", "Definer", "Modified", "Created"}
+			rows = nil
+			return
+		}
+		if p.matchKeyword("FUNCTION") {
+			p.matchKeyword("STATUS")
+			columns = []string{"Db", "Name", "Type", "Definer", "Modified", "Created"}
+			rows = nil
+			return
+		}
+		if p.matchKeyword("OPEN") {
+			p.matchKeyword("TABLES")
+			columns = []string{"Database", "Table", "In_use", "Name_locked"}
+			rows = nil
 			return
 		}
 		if p.matchKeyword("PROCESSLIST") {
@@ -809,13 +917,23 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 			}
 			rows = append(rows, []interface{}{f.Name, fieldTypeName(f.Type), f.Len, key})
 		}
-		for idxName, fieldName := range dmeta.Indexes {
-			rows = append(rows, []interface{}{fieldName, "INDEX(" + idxName + ")", "", "MUL"})
+		// map 遍历顺序随机，按索引名排序保证 DESCRIBE 输出确定性
+		//（phpMyAdmin 每次浏览都发 DESCRIBE，行序不稳定会在页面间闪变）。
+		idxNames := make([]string, 0, len(dmeta.Indexes))
+		for idxName := range dmeta.Indexes {
+			idxNames = append(idxNames, idxName)
+		}
+		sort.Strings(idxNames)
+		for _, idxName := range idxNames {
+			rows = append(rows, []interface{}{dmeta.Indexes[idxName], "INDEX(" + idxName + ")", "", "MUL"})
 		}
 		return
 	case "SELECT":
 		return db.parseSelect(p)
 	case "INSERT":
+		return db.parseInsert(p)
+	case "REPLACE":
+		// REPLACE INTO：与 INSERT 同一解析路径（replaceMode）
 		return db.parseInsert(p)
 	case "UPDATE":
 		return db.parseUpdate(p)
@@ -823,8 +941,19 @@ func (db *DB) runSQLTokens(toks []sqlToken, sql string, params []interface{}, tx
 		return db.parseDelete(p)
 	case "ALTER":
 		return db.parseAlterTable(p)
-	case "SET", "SETS":
-		rawMsg = "Query OK"
+	case "TRUNCATE":
+		return db.parseTruncate(p)
+	case "RENAME":
+		return db.parseRenameTable(p)
+	case "BEGIN", "START", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE":
+		// 语句级原子性由写语句自身的隐式事务保证；这里保持客户端语义兼容
+		return db.parseTxnControl(p)
+	case "FLUSH", "ANALYZE", "OPTIMIZE", "CHECK", "REPAIR", "LOCK", "UNLOCK",
+		"KILL", "DO", "HELP", "RESET", "SET", "SETS":
+		// SET 的完整语义（autocommit 等）由协议层处理；这里统一返回 OK
+		return db.parseNoOpStmt(p)
+	case "CALL":
+		err = fmt.Errorf("stored procedures are not supported")
 		return
 	}
 	err = fmt.Errorf("unsupported statement: %s", first.val)
@@ -920,6 +1049,10 @@ func (p *sqlParser) parseEqConds() (map[string]interface{}, error) {
 		}
 		conds[f] = v
 		if !p.matchKeyword("AND") {
+			// OR / 其它连接词：明确报错，别让 COUNT 静默只按第一个条件计数
+			if t := p.peek(); t.kind == kindKw && t.upper == "OR" {
+				return nil, fmt.Errorf("OR conditions are not supported in COUNT(*)")
+			}
 			break
 		}
 	}
@@ -991,6 +1124,16 @@ type andGroup []rawCond
 
 func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	p.next() // SELECT
+	// 无 FROM 的标量查询（SELECT @@version / SELECT VERSION() 等）保持原快路径
+	if c, r, e := db.queryScalarSelect(p); r != nil {
+		columns, rows, err = c, r, e
+		return
+	}
+	// 表达式投影 / JOIN / GROUP BY / DISTINCT / UNION 等走通用路径，
+	// 简单查询继续走下面的字节级快路径（性能不受影响）。
+	if p.selectNeedsGeneral() {
+		return db.parseSelectGeneral(p)
+	}
 	// 无 FROM 的标量查询（SELECT @@version, SELECT VERSION(), SELECT NOW() 等）
 	if c, r, e := db.queryScalarSelect(p); r != nil {
 		columns, rows, err = c, r, e
@@ -1118,6 +1261,10 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 					return
 				}
 				// tokenizer 会把 >= <= <> != 拆成两个单字符符号，这里合并
+				if op.val == "<" && p.peek().kind == kindSym && p.peek().val == ">" {
+					p.next()
+					op.val = "<>"
+				}
 				if (op.val == ">" || op.val == "<" || op.val == "!") && p.peek().kind == kindSym && p.peek().val == "=" {
 					p.next() // 消费 "="，组成 ">=" "<=" "!="
 					if op.val == "!" {
@@ -1291,6 +1438,12 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		columns, rows, err = db.queryInfoSchema(it, conds, selectCols, colSrc)
 		return
 	}
+	// 系统表（__tables / __indexes / __stats）：此前只有二进制协议能查，
+	// README 却写着"可直接 SELECT"，这里补齐 SQL 路径。
+	if base := tableName[strings.LastIndexByte(tableName, '.')+1:]; strings.HasPrefix(base, "__") {
+		columns, rows, err = db.systemTableSelect(base, selectCols, colSrc)
+		return
+	}
 	t := db.getTable(tableName)
 	if t == nil {
 		err = fmt.Errorf("table not found: %s", tableName)
@@ -1315,8 +1468,17 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	var conds map[string]interface{}
 	var minKey, maxKey *int64
 	var filters []RangeCond
+	// contradiction 表示本 AND 组恒不命中（任一端值为 NULL，SQL 里与 NULL
+	// 比较结果是 UNKNOWN）。用反向主键区间让扫描直接空转，
+	// 而不是把 NULL 当 0 下推（旧实现 `id > NULL` / `id > '500'` 会返回全表）。
+	contradiction := false
 	if len(orGroups) == 1 && !pkPoint {
 		for _, c := range orGroups[0] {
+			if c.op != "ISNULL" && c.op != "ISNOTNULL" &&
+				(c.val == nil || (c.op == "BETWEEN" && c.val2 == nil)) {
+				contradiction = true
+				continue
+			}
 			if c.op == "=" {
 				if conds == nil {
 					conds = make(map[string]interface{})
@@ -1325,9 +1487,31 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 				continue
 			}
 			if strings.EqualFold(c.field, meta.PK) {
+				if c.op == "LIKE" || c.op == "ISNULL" || c.op == "ISNOTNULL" {
+					hasOR = true
+					continue
+				}
+				if c.op == "<>" {
+					// 单区间无法表达"不等于"：退化为全表扫描 + ne 过滤
+					hasOR = true
+					if c.val != nil {
+						filters = append(filters, RangeCond{Field: c.field, Op: "ne", Val: c.val})
+					}
+					continue
+				}
+				iv, iok := toInt64OK(c.val)
+				var iv2 int64
+				if c.op == "BETWEEN" {
+					iv2, iok = toInt64OK(c.val2)
+				}
+				if !iok {
+					// 非数值界值（如 'abc'）：不下推，交给通用过滤，避免静默错结果
+					hasOR = true
+					filters = append(filters, RangeCond{Field: c.field, Op: rangeOp(c.op), Val: c.val, Val2: c.val2})
+					continue
+				}
 				switch c.op {
 				case ">":
-					iv := toInt64(c.val)
 					var lo int64
 					if iv >= math.MaxInt64 {
 						lo = math.MaxInt64
@@ -1338,12 +1522,10 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 						minKey = &lo
 					}
 				case ">=":
-					iv := toInt64(c.val)
 					if minKey == nil || *minKey < iv {
 						minKey = &iv
 					}
 				case "<":
-					iv := toInt64(c.val)
 					var hi int64
 					if iv <= math.MinInt64 {
 						hi = math.MinInt64
@@ -1354,21 +1536,15 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 						maxKey = &hi
 					}
 				case "<=":
-					iv := toInt64(c.val)
 					if maxKey == nil || *maxKey > iv {
 						maxKey = &iv
 					}
-				case "<>":
-					err = fmt.Errorf("unable to use <> on primary key")
-					return
 				case "BETWEEN":
-					lo := toInt64(c.val)
-					hi := toInt64(c.val2)
-					if minKey == nil || *minKey < lo {
-						minKey = &lo
+					if minKey == nil || *minKey < iv {
+						minKey = &iv
 					}
-					if maxKey == nil || *maxKey > hi {
-						maxKey = &hi
+					if maxKey == nil || *maxKey > iv2 {
+						maxKey = &iv2
 					}
 				}
 				continue
@@ -1380,6 +1556,11 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			}
 			filters = append(filters, RangeCond{Field: c.field, Op: rangeOp(c.op), Val: c.val, Val2: c.val2})
 		}
+	}
+	// 恒不命中：反向主键区间让所有扫描路径直接空转（比扫全表再过滤更快）
+	if contradiction {
+		zero, one := int64(0), int64(1)
+		minKey, maxKey = &one, &zero
 	}
 	// 列投影准备：SELECT * 返回全部列（colIdx 为 nil 表示恒等投影，行值直接
 	// copy）；否则只返回指定的列（AS 别名映射到源列），colIdx 记录各输出列
@@ -1467,7 +1648,9 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		var expired []int64
 		now := time.Now().UnixNano()
 		var flat []interface{}
-		arena := newRowArena(len(colIdx))
+		// stride 用 len(cols)：SELECT * 时 colIdx 为 nil（恒等投影），len(colIdx)=0
+		// 会把行缓冲钳成 1 列、命中行被截断；len(cols) 在两种投影下都是正确行宽。
+		arena := newRowArena(len(cols))
 		rows = make([][]interface{}, 0, 64)
 		t.pkTree.scanRangeStop(minKey, maxKey, func(key int64, value []byte) bool {
 			if e := decodeExpireAt(value); e > 0 && now > e {
@@ -1493,7 +1676,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			rows = flat
 		} else {
 			// 列投影：flat 行按 meta.Fields 顺序排列，按下标取值
-			arena := newRowArena(len(colIdx))
+			arena := newRowArena(len(cols))
 			rows = make([][]interface{}, 0, len(flat))
 			for _, r := range flat {
 				row := arena.row()
@@ -1506,7 +1689,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		//（主键点查/二级索引/全表扫描三级分发），命中行 flat 解码后
 		// 按 colIdx 直接投影，全程不物化行 map。
 		rawRows := t.selectRBytes(conds, filters, minKey, maxKey, scanLimit)
-		arena := newRowArena(len(colIdx))
+		arena := newRowArena(len(cols))
 		var flat []interface{}
 		rows = make([][]interface{}, 0, len(rawRows))
 		for _, data := range rawRows {
@@ -1598,7 +1781,7 @@ func condsFromGroups(orGroups []andGroup) map[string]interface{} {
 }
 
 // cmpCell 结果集排序比较：数值按大小、字符串按字典序、类型不可比视为相等
-//（稳定排序保持原顺序），nil 视为最小。
+// （稳定排序保持原顺序），nil 视为最小。
 func cmpCell(a, b interface{}) int {
 	if a == nil && b == nil {
 		return 0
@@ -1608,6 +1791,19 @@ func cmpCell(a, b interface{}) int {
 	}
 	if b == nil {
 		return 1
+	}
+	// 整数一律先按整数比较：统一转 float64 会让超过 2^53 的主键
+	//（雪花 ID / 纳秒时间戳）比较成"相等"，ORDER BY 静默失效。
+	if ai, ok := toIntCell(a); ok {
+		if bi, ok2 := toIntCell(b); ok2 {
+			switch {
+			case ai < bi:
+				return -1
+			case ai > bi:
+				return 1
+			}
+			return 0
+		}
 	}
 	av, aok := toNum(a)
 	bv, bok := toNum(b)
@@ -1626,6 +1822,36 @@ func cmpCell(a, b interface{}) int {
 		return strings.Compare(as, bs)
 	}
 	return 0
+}
+
+// toIntCell 取出整数值（用于排序比较），非整数返回 false。
+func toIntCell(v interface{}) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case uint:
+		return int64(n), true
+	case uint8:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint64:
+		if n > math.MaxInt64 {
+			return math.MaxInt64, true
+		}
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // rowMatchGroupsFlat 按预解析字段下标求值 OR 连接的 AND 条件组（flat 行值）。
@@ -1719,15 +1945,34 @@ func evalCond(v interface{}, c *rawCond) bool {
 
 // toInt64 将接口值转为 int64。数字直接取，其他返回 0。
 func toInt64(v interface{}) int64 {
+	n, _ := toInt64OK(v)
+	return n
+}
+
+// toInt64OK 尝试把条件值转成整数，并返回是否成功。
+// 主键范围下推必须用这个版本：旧实现无脑回落 0，`id > '500'` / `id > NULL`
+// 会被下推成 `id >= 1` 且不再回验条件，静默返回全表。
+func toInt64OK(v interface{}) (int64, bool) {
 	switch n := v.(type) {
 	case int64:
-		return n
+		return n, true
 	case int:
-		return int64(n)
+		return int64(n), true
 	case float64:
-		return int64(n)
+		return int64(n), true
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, false
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i, true
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return int64(f), true
+		}
 	}
-	return 0
+	return 0, false
 }
 
 // rangeOp 将 SQL 比较符映射为 RangeCond 使用的 op 常量。
@@ -1806,8 +2051,120 @@ func (db *DB) queryMysqlTable(name string, conds map[string]interface{}, selectC
 	return
 }
 
+// findTopLevelUnion 查找深度 0 的 UNION（不在括号内），返回其下标与是否 ALL。
+func findTopLevelUnion(toks []sqlToken) (idx int, all bool, ok bool) {
+	depth := 0
+	for i, t := range toks {
+		if t.kind == kindSym {
+			switch t.val {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			}
+			continue
+		}
+		if depth == 0 && t.is("UNION") {
+			next := i + 1
+			isAll := next < len(toks) && toks[next].is("ALL")
+			return i, isAll, true
+		}
+	}
+	return 0, false, false
+}
+
+// runUnionAs 执行 UNION [ALL] 两侧并合并结果。左侧决定列名。
+func (db *DB) runUnionAs(user string, toks []sqlToken, idx int, all bool, sql string, params []interface{}, txnID uint64, schema string) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	eof := sqlToken{kind: kindEof, val: ""}
+	left := make([]sqlToken, 0, idx+1)
+	left = append(left, toks[:idx]...)
+	left = append(left, eof)
+
+	start := idx + 1
+	if all {
+		start++
+	}
+	if start >= len(toks) {
+		err = fmt.Errorf("expected SELECT after UNION")
+		return
+	}
+	right := append([]sqlToken{}, toks[start:]...)
+	if len(right) == 0 || right[len(right)-1].kind != kindEof {
+		right = append(right, eof)
+	}
+	colsL, rowsL, _, _, e1 := db.runSQLTokensAs(user, left, sql, params, txnID, schema)
+	if e1 != nil {
+		err = e1
+		return
+	}
+	_, rowsR, _, _, e2 := db.runSQLTokensAs(user, right, sql, params, txnID, schema)
+	if e2 != nil {
+		err = e2
+		return
+	}
+	columns = colsL
+	rows = append(rowsL, rowsR...)
+	if !all {
+		seen := make(map[string]struct{}, len(rows))
+		dedup := rows[:0]
+		for _, r := range rows {
+			key := fmt.Sprint(r)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			dedup = append(dedup, r)
+		}
+		rows = dedup
+	}
+	rawMsg = fmt.Sprintf("%d rows in set", len(rows))
+	return
+}
+
+// findOnDuplicate 在 token 流中查找 ON DUPLICATE KEY UPDATE 的起始下标。
+func findOnDuplicate(toks []sqlToken, from int) int {
+	for i := from; i+3 < len(toks); i++ {
+		if toks[i].is("ON") && toks[i+1].is("DUPLICATE") && toks[i+2].is("KEY") && toks[i+3].is("UPDATE") {
+			return i
+		}
+	}
+	return -1
+}
+
+// dupAssign ON DUPLICATE KEY UPDATE 的一条赋值。
+type dupAssign struct {
+	col string
+	e   *expr
+}
+
 func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
-	p.next() // INSERT
+	replaceMode := false
+	if p.peek().is("REPLACE") {
+		p.next()
+		replaceMode = true
+	} else {
+		p.next() // INSERT
+	}
+	// 修饰符：IGNORE / LOW_PRIORITY / HIGH_PRIORITY / DELAYED
+	ignore := false
+	for {
+		switch {
+		case p.peek().is("IGNORE"):
+			ignore = true
+			p.next()
+		case p.peek().is("LOW_PRIORITY"), p.peek().is("HIGH_PRIORITY"), p.peek().is("DELAYED"):
+			p.next()
+		default:
+		}
+		if p.peek().is("INTO") {
+			break
+		}
+		if !p.peek().is("IGNORE") && !p.peek().is("LOW_PRIORITY") && !p.peek().is("HIGH_PRIORITY") && !p.peek().is("DELAYED") {
+			break
+		}
+	}
 	if !p.matchKeyword("INTO") {
 		err = fmt.Errorf("expected INTO")
 		return
@@ -1847,6 +2204,52 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 	if !p.matchKeyword("VALUES") {
 		err = fmt.Errorf("expected VALUES")
 		return
+	}
+	// ON DUPLICATE KEY UPDATE 语法上位于 VALUES 行列表之后，但行循环的冲突
+	// 处理需要它，因此先扫描预解析，再回到行列表位置执行。
+	var onDup []dupAssign
+	onDupParsed := false
+	if k := findOnDuplicate(p.toks, p.i); k >= 0 {
+		save := p.i
+		savedParam := p.paramIdx
+		// 预解析会消费 ?：先跳过 VALUES 行列表里的占位符，
+		// 让 ON DUPLICATE 的 ? 绑定到正确参数，解析完再把游标回滚。
+		for i := save; i < k; i++ {
+			if p.toks[i].kind == kindSym && p.toks[i].val == "?" {
+				p.paramIdx++
+			}
+		}
+		p.i = k
+		p.next() // ON
+		p.matchKeyword("DUPLICATE")
+		p.matchKeyword("KEY")
+		p.matchKeyword("UPDATE")
+		for {
+			colTok := p.next()
+			if colTok.kind != kindIdent && colTok.kind != kindKw {
+				p.i = save
+				err = fmt.Errorf("expected column in ON DUPLICATE KEY UPDATE")
+				return
+			}
+			if !p.matchSym("=") {
+				p.i = save
+				err = fmt.Errorf("expected = in ON DUPLICATE KEY UPDATE")
+				return
+			}
+			ae, e := p.parseExpr()
+			if e != nil {
+				p.i = save
+				err = e
+				return
+			}
+			onDup = append(onDup, dupAssign{col: colTok.val, e: ae})
+			if !p.matchSym(",") {
+				break
+			}
+		}
+		p.i = save // 回到 VALUES 行列表继续执行
+		p.paramIdx = savedParam
+		onDupParsed = true
 	}
 	// 多行 INSERT 整体原子：包一个隐式事务，任一行失败即整体回滚
 	//（MySQL 语句级原子性）；会话已在事务中（p.txnID != 0）时沿用外层事务。
@@ -1895,11 +2298,53 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 			}
 		}
 		// 提交单行
-		if e := db.insertRow(p, t, fields, colsExplicit, values); e != nil {
+		pk, e := db.insertRow(p, t, fields, colsExplicit, values)
+		if e != nil {
+			if !errors.Is(e, errPKExists) {
+				if !colsExplicit {
+					interfaceSlicePool.Put(values[:0])
+				}
+				return rollback(e)
+			}
+			// 主键冲突：按语句语义分流
+			switch {
+			case ignore:
+				// INSERT IGNORE：跳过该行
+			case replaceMode:
+				if de := t.Delete(pk, p.txnID, false); de != nil {
+					if !colsExplicit {
+						interfaceSlicePool.Put(values[:0])
+					}
+					return rollback(de)
+				}
+				if _, ie := db.insertRow(p, t, fields, colsExplicit, values); ie != nil {
+					if !colsExplicit {
+						interfaceSlicePool.Put(values[:0])
+					}
+					return rollback(ie)
+				}
+				affected++
+			case onDup != nil:
+				if ue := db.applyOnDuplicate(p, t, pk, onDup, fields, values); ue != nil {
+					if !colsExplicit {
+						interfaceSlicePool.Put(values[:0])
+					}
+					return rollback(ue)
+				}
+				affected++
+			default:
+				if !colsExplicit {
+					interfaceSlicePool.Put(values[:0])
+				}
+				return rollback(e)
+			}
 			if !colsExplicit {
 				interfaceSlicePool.Put(values[:0])
 			}
-			return rollback(e)
+			if p.matchSym(",") {
+				continue
+			}
+			break
 		}
 		if !colsExplicit {
 			interfaceSlicePool.Put(values[:0])
@@ -1913,6 +2358,9 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 			continue
 		}
 		break
+	}
+	if onDupParsed {
+		p.i = len(p.toks) - 1 // ON DUPLICATE 子句已消费
 	}
 	if e := p.expectEnd(); e != nil {
 		return rollback(e)
@@ -1928,13 +2376,18 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 	if affected > 1 {
 		rawMsg = fmt.Sprintf("%d rows inserted", affected)
 	}
+	if p.lastInsertID > 0 {
+		// 引擎分配的自增主键：回显给客户端（MySQL 协议另走 OK 包 last insert id）
+		rawMsg = fmt.Sprintf("%s (id=%d)", rawMsg, p.lastInsertID)
+	}
 	return
 }
 
 // insertRow 提交 INSERT 的单行：优先位置参数快速路径，否则按列名映射。
 // 事务模式下记录 read-version 与 Changes——CommitTxn 依赖 Changes 写出
 // COMMIT 记录并在冲突时回滚，缺失会让重放丢行。
-func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bool, values []interface{}) error {
+// 返回行的主键（供 INSERT IGNORE / REPLACE / ON DUPLICATE 处理冲突）。
+func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bool, values []interface{}) (int64, error) {
 	// 快速路径：位置参数（字段序即表字段序）直接编码，跳过 map 构建。
 	// 显式列清单仅在列名与表字段序完全一致时才可走快速路径，否则 values 与
 	// meta.Fields 错位会静默串列写坏数据（含 WAL，重放后同样错）。
@@ -1951,7 +2404,7 @@ func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bo
 	pkIdx := -1
 	if orderedPath {
 		if len(values) != len(t.Meta().Fields) {
-			return fmt.Errorf("column count mismatch")
+			return 0, fmt.Errorf("column count mismatch")
 		}
 		for i, f := range t.Meta().Fields {
 			if f.Name == t.Meta().PK {
@@ -1961,7 +2414,7 @@ func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bo
 		}
 	} else {
 		if len(fields) != len(values) {
-			return fmt.Errorf("column count mismatch")
+			return 0, fmt.Errorf("column count mismatch")
 		}
 		for i, f := range fields {
 			if f == t.Meta().PK {
@@ -1971,12 +2424,22 @@ func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bo
 		}
 	}
 	var pk int64
+	// autoAssign：主键缺省 / 为 0 / 为 NULL 时由引擎分配（MySQL AUTO_INCREMENT 语义）。
+	// 多客户端各自"MAX(pk)+1"播种会撞主键（实测 37% 插入失败），因此交给引擎分配。
+	autoAssign := false
 	if pkIdx >= 0 && pkIdx < len(values) {
-		v, ok := values[pkIdx].(int64)
-		if !ok {
-			return fmt.Errorf("primary key must be integer")
+		switch v := values[pkIdx].(type) {
+		case int64:
+			if v == 0 {
+				autoAssign = true
+			} else {
+				pk = v
+			}
+		case nil:
+			autoAssign = true
+		default:
+			return 0, fmt.Errorf("primary key must be integer")
 		}
-		pk = v
 	} else if colsExplicit {
 		rowMap := make(map[string]interface{}, len(fields))
 		for i, f := range fields {
@@ -1984,192 +2447,243 @@ func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bo
 		}
 		pkVal, ok := rowMap[t.Meta().PK]
 		if !ok {
-			return fmt.Errorf("missing primary key field %s", t.Meta().PK)
-		}
-		pkv, ok := pkVal.(int64)
-		if !ok {
-			return fmt.Errorf("primary key must be integer")
-		}
-		pk = pkv
-	} else {
-		return fmt.Errorf("missing primary key field %s", t.Meta().PK)
-	}
-	if p.txnID != 0 {
-		var oldData []byte
-		if d, ok := t.pkTree.Get(pk); ok {
-			oldData = d
-			db.recordReadVersion(p.txnID, t.Meta().Name, pk, decodeVersion(d))
-		}
-		db.txnMu.Lock()
-		if txn, ok := db.txns[p.txnID]; ok {
-			tname := t.Meta().Name
-			if txn.Changes[tname] == nil {
-				txn.Changes[tname] = make(map[int64][]byte)
+			// 未给出主键列：引擎分配
+			autoAssign = true
+		} else {
+			switch v := pkVal.(type) {
+			case int64:
+				if v == 0 {
+					autoAssign = true
+				} else {
+					pk = v
+				}
+			case nil:
+				autoAssign = true
+			default:
+				return 0, fmt.Errorf("primary key must be integer")
 			}
-			txn.Changes[tname][pk] = oldData
-			txn.Tables[tname] = true
 		}
-		db.txnMu.Unlock()
-	}
-	if orderedPath && pkIdx >= 0 && pkIdx < len(values) {
-		return t.InsertOrdered(pk, values, 0, p.txnID, false)
+	} else {
+		// 位置参数形式未覆盖主键列：同样由引擎分配
+		autoAssign = true
 	}
 	rowMap := make(map[string]interface{}, len(fields))
 	for i, f := range fields {
 		rowMap[f] = values[i]
 	}
-	return t.Insert(pk, rowMap, 0, p.txnID, false)
+	if autoAssign {
+		pk = t.allocPK()
+		if orderedPath && pkIdx >= 0 && pkIdx < len(values) {
+			values[pkIdx] = pk
+		}
+		rowMap[t.Meta().PK] = pk
+		p.lastInsertID = pk
+	}
+	if err := db.txnApply(p.txnID, t, pk, func() error {
+		if orderedPath && pkIdx >= 0 && pkIdx < len(values) {
+			return t.InsertOrdered(pk, values, 0, p.txnID, false)
+		}
+		return t.Insert(pk, rowMap, 0, p.txnID, false)
+	}); err != nil {
+		return pk, err
+	}
+	return pk, nil
 }
 
-func (db *DB) parseUpdate(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
-	p.next() // UPDATE
-	tableName, e := p.readQualifiedTable()
-	if e != nil {
-		err = e
-		return
+// applyOnDuplicate 执行 ON DUPLICATE KEY UPDATE：在既有行上求值赋值表达式。
+// 表达式可引用既有列与 VALUES(col)（本次待插入的值）。
+func (db *DB) applyOnDuplicate(p *sqlParser, t *Table, pk int64, assigns []dupAssign, fields []string, values []interface{}) error {
+	cur, ok := t.pkTree.Get(pk)
+	if !ok {
+		return fmt.Errorf("row not found")
 	}
-	tableName = db.qualifyTableIn(tableName, p.curSchema(db))
-	t := db.getTable(tableName)
-	if t == nil {
-		err = fmt.Errorf("table not found: %s", tableName)
-		return
+	row, _, _ := decodeRow(t.Meta(), cur)
+	// VALUES(col) → 合成列 __values_<col>
+	evalRow := make(map[string]interface{}, len(row)+len(fields))
+	for k, v := range row {
+		evalRow[k] = v
 	}
-	if !p.matchKeyword("SET") {
-		err = fmt.Errorf("expected SET")
-		return
+	cols := fields
+	if len(cols) == 0 {
+		// 位置参数形式（无显式列清单）：列序即表字段序
+		for _, f := range t.Meta().Fields {
+			cols = append(cols, f.Name)
+		}
 	}
-	updates := map[string]interface{}{}
+	for i, f := range cols {
+		if i < len(values) {
+			evalRow[lowerKey("__values_"+f)] = values[i]
+		}
+	}
+	for _, a := range assigns {
+		row[a.col] = rewriteValuesFunc(a.e).eval(evalRow)
+	}
+	return db.txnApply(p.txnID, t, pk, func() error {
+		return t.Update(pk, row, 0, p.txnID, false)
+	})
+}
+
+// rewriteValuesFunc 把 VALUES(col) 改写成对合成列的引用。
+func rewriteValuesFunc(e *expr) *expr {
+	if e == nil {
+		return nil
+	}
+	if e.kind == exFunc && e.fn == "VALUES" && len(e.args) == 1 && e.args[0].kind == exCol {
+		return &expr{kind: exCol, col: "__values_" + e.args[0].col, raw: "VALUES(" + e.args[0].col + ")"}
+	}
+	out := *e
+	out.args = mapExprSlice(e.args, rewriteValuesFunc)
+	out.when = mapExprSlice(e.when, rewriteValuesFunc)
+	out.els = rewriteValuesFunc(e.els)
+	return &out
+}
+
+// 返回索引首列与索引名（未命名时用首列名）。不是索引定义则消费完并返回 ok=false。
+func readTableIndexDef(p *sqlParser) (col, name string, ok bool) {
+	isIndex := false
 	for {
-		f, e := p.parseIdent()
-		if e != nil {
-			err = e
-			return
+		t := p.peek()
+		switch {
+		case t.is("UNIQUE"), t.is("FULLTEXT"), t.is("SPATIAL"):
+			p.next()
+		case t.is("KEY"), t.is("INDEX"):
+			p.next()
+			isIndex = true
+		default:
 		}
-		if op := p.next(); op.kind != kindSym || op.val != "=" {
-			err = fmt.Errorf("expected =")
-			return
-		}
-		v, e := p.parseValue()
-		if e != nil {
-			err = e
-			return
-		}
-		updates[f] = v
-		if !p.matchSym(",") {
+		if isIndex || !(p.peek().is("UNIQUE") || p.peek().is("FULLTEXT") || p.peek().is("SPATIAL")) {
 			break
 		}
 	}
-	if !p.matchKeyword("WHERE") {
-		err = fmt.Errorf("UPDATE requires WHERE pk=...")
-		return
+	if !isIndex {
+		consumeTableLevelConstraint(p)
+		return "", "", false
 	}
-	pkField, e := p.parseIdent()
-	if e != nil {
-		err = e
-		return
+	if n := p.peek(); n.kind == kindIdent || n.kind == kindKw {
+		if !(n.is("USING") || n.is("ON") || n.kind == kindSym) {
+			name = n.val
+			p.next()
+		}
 	}
-	if op := p.next(); op.kind != kindSym || op.val != "=" {
-		err = fmt.Errorf("expected =")
-		return
+	c, got := readIndexColumns(p)
+	// 尾部（USING BTREE / COMMENT ...）交给消费函数
+	for {
+		t := p.peek()
+		if t.kind == kindEof || (t.kind == kindSym && (t.val == "," || t.val == ")")) {
+			break
+		}
+		p.next()
 	}
-	pkVal, e := p.parseValue()
-	if e != nil {
-		err = e
-		return
+	if !got {
+		return "", "", false
 	}
-	if pkField != t.Meta().PK {
-		err = fmt.Errorf("UPDATE WHERE must use primary key %s", t.Meta().PK)
-		return
+	if name == "" {
+		name = c
 	}
-	pk, ok := pkVal.(int64)
-	if !ok {
-		err = fmt.Errorf("primary key must be integer")
-		return
-	}
-	if e := p.expectEnd(); e != nil {
-		err = e
-		return
-	}
-	old, e := t.Select(map[string]interface{}{t.Meta().PK: pk}, nil, nil)
-	if e != nil {
-		err = e
-		return
-	}
-	if len(old) == 0 {
-		err = fmt.Errorf("row not found")
-		return
-	}
-	full := map[string]interface{}{}
-	for k, v := range old[0] {
-		full[k] = v
-	}
-	for k, v := range updates {
-		full[k] = v
-	}
-	if e := t.Update(pk, full, 0, p.txnID, false); e != nil {
-		err = e
-		return
-	}
-	affected = 1
-	rawMsg = "1 row updated"
-	return
+	return c, name, true
 }
 
-func (db *DB) parseDelete(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
-	p.next() // DELETE
-	if !p.matchKeyword("FROM") {
-		err = fmt.Errorf("expected FROM")
-		return
+// readIndexColumns 读取索引列清单 "(col[, ...])"，返回第一列。
+func readIndexColumns(p *sqlParser) (string, bool) {
+	if !(p.peek().kind == kindSym && p.peek().val == "(") {
+		return "", false
 	}
-	tableName, e := p.readQualifiedTable()
-	if e != nil {
-		err = e
-		return
+	p.next()
+	first := ""
+	for {
+		t := p.next()
+		if t.kind == kindIdent || t.kind == kindKw {
+			if first == "" {
+				first = t.val
+			}
+		}
+		if p.matchSym(")") {
+			break
+		}
+		if !p.matchSym(",") {
+			// 异常形态：跳过到 )
+			for !p.peek().is(")") && p.peek().kind != kindEof {
+				p.next()
+			}
+			p.matchSym(")")
+			break
+		}
 	}
-	tableName = db.qualifyTableIn(tableName, p.curSchema(db))
-	t := db.getTable(tableName)
-	if t == nil {
-		err = fmt.Errorf("table not found: %s", tableName)
-		return
+	return first, first != ""
+}
+
+// isTableLevelConstraint 判断 token 是否是表级约束/索引关键字。
+func isTableLevelConstraint(t sqlToken) bool {
+	if t.kind != kindKw && t.kind != kindIdent {
+		return false
 	}
-	if !p.matchKeyword("WHERE") {
-		err = fmt.Errorf("DELETE requires WHERE pk=...")
-		return
+	switch strings.ToUpper(t.val) {
+	case "KEY", "INDEX", "UNIQUE", "FULLTEXT", "SPATIAL", "CONSTRAINT", "FOREIGN", "CHECK":
+		return true
 	}
-	pkField, e := p.parseIdent()
-	if e != nil {
-		err = e
-		return
+	return false
+}
+
+// consumeTableLevelConstraint 吃掉一条表级约束/索引定义（含可选的 (cols)）。
+func consumeTableLevelConstraint(p *sqlParser) {
+	p.next() // 关键字
+	switch {
+	default:
 	}
-	if op := p.next(); op.kind != kindSym || op.val != "=" {
-		err = fmt.Errorf("expected =")
-		return
+	if p.peek().is("KEY") || p.peek().is("INDEX") {
+		p.next()
 	}
-	pkVal, e := p.parseValue()
-	if e != nil {
-		err = e
-		return
+	if n := p.peek(); n.kind == kindIdent || n.kind == kindKw {
+		p.next()
 	}
-	if pkField != t.Meta().PK {
-		err = fmt.Errorf("DELETE WHERE must use primary key %s", t.Meta().PK)
-		return
+	skipOptionalParenList(p)
+	// REFERENCES ... / CHECK (...) 等尾巴
+	for {
+		t := p.peek()
+		if t.kind == kindEof {
+			return
+		}
+		if t.kind == kindSym && (t.val == "," || t.val == ")") {
+			return
+		}
+		if t.kind == kindSym && t.val == "(" {
+			p.next()
+			skipToParen(p)
+			continue
+		}
+		p.next()
 	}
-	pk, ok := pkVal.(int64)
-	if !ok {
-		err = fmt.Errorf("primary key must be integer")
-		return
+}
+
+// skipOptionalParenList 跳过可选的 "(a,b)" 列表（索引列清单等）。
+func skipOptionalParenList(p *sqlParser) {
+	if p.peek().kind == kindSym && p.peek().val == "(" {
+		p.next()
+		skipToParen(p)
 	}
-	if e := p.expectEnd(); e != nil {
-		err = e
-		return
+}
+
+// skipToParen 跳过直到配对的 ")"（当前已消费 "("）。
+func skipToParen(p *sqlParser) {
+	depth := 1
+	for {
+		t := p.peek()
+		if t.kind == kindEof {
+			return
+		}
+		if t.kind == kindSym && t.val == "(" {
+			depth++
+		}
+		if t.kind == kindSym && t.val == ")" {
+			depth--
+			p.next()
+			if depth == 0 {
+				return
+			}
+			continue
+		}
+		p.next()
 	}
-	if e := t.Delete(pk, p.txnID, false); e != nil {
-		err = e
-		return
-	}
-	affected = 1
-	rawMsg = "1 row deleted"
-	return
 }
 
 func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
@@ -2203,7 +2717,33 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 	var fields []Field
 	var pkName string
 	pkNameSet := false
+	// 表级索引定义（KEY/INDEX [name] (col)）：真实注册进 meta.Indexes
+	var tableIndexes map[string]string
 	for {
+		// 分隔符与语句结束统一在循环开头处理
+		if p.peek().kind == kindSym && p.peek().val == "," {
+			p.next()
+			continue
+		}
+		if p.peek().kind == kindSym && p.peek().val == ")" {
+			p.next()
+			break
+		}
+		if p.peek().kind == kindEof {
+			err = fmt.Errorf("expected )")
+			return
+		}
+		// 表级约束/索引定义：KEY/INDEX/UNIQUE/FULLTEXT/SPATIAL/CONSTRAINT/FOREIGN/CHECK
+		if t := p.peek(); isTableLevelConstraint(t) {
+			// KEY/INDEX/UNIQUE 定义要真实注册；其余（CONSTRAINT/FOREIGN/CHECK）跳过
+			if col, name, ok := readTableIndexDef(p); ok {
+				if tableIndexes == nil {
+					tableIndexes = map[string]string{}
+				}
+				tableIndexes[name] = col
+			}
+			continue
+		}
 		// 允许 PRIMARY KEY (col)
 		if p.matchKeyword("PRIMARY") {
 			if !p.matchKeyword("KEY") {
@@ -2221,11 +2761,15 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 			}
 			pkName = pk
 			pkNameSet = true
-			if p.matchSym(")") {
-				break
+			// 复合主键只取第一列（存储层仅支持单列主键）
+			for p.matchSym(",") {
+				if _, e := p.parseIdent(); e != nil {
+					err = e
+					return
+				}
 			}
-			if q := p.next(); q.kind != kindSym || q.val != "," {
-				err = fmt.Errorf("expected ,")
+			if !p.matchSym(")") {
+				err = fmt.Errorf("expected )")
 				return
 			}
 			continue
@@ -2263,33 +2807,175 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 		} else {
 			p.i-- // 回退已读符号
 		}
-		// 行内 PRIMARY KEY
-		if p.peek().kind == kindKw && p.peek().upper == "PRIMARY" {
-			p.next()
-			p.next() // KEY
-			if !pkNameSet {
-				pkName = fname
-				pkNameSet = true
+		// 行内 PRIMARY KEY / 其它列属性（NOT NULL、DEFAULT、AUTO_INCREMENT、
+		// UNIQUE、KEY、COMMENT、COLLATE、CHARACTER SET、ON UPDATE ...）一律容忍并跳过，
+		// 只有 PRIMARY KEY 会生效（存储层没有约束引擎，见 README「已知限制」）。
+		for {
+			t := p.peek()
+			if t.kind == kindEof {
+				break
+			}
+			if t.kind == kindSym && (t.val == "," || t.val == ")") {
+				break
+			}
+			switch strings.ToUpper(t.val) {
+			case "PRIMARY":
+				p.next()
+				p.matchKeyword("KEY")
+				if !pkNameSet {
+					pkName = fname
+					pkNameSet = true
+				}
+			case "UNIQUE":
+				p.next()
+				p.matchKeyword("KEY")
+				p.matchKeyword("INDEX")
+				skipOptionalParenList(p)
+			case "KEY", "INDEX":
+				p.next()
+				if t2 := p.peek(); t2.kind == kindIdent || t2.kind == kindKw {
+					p.next()
+				}
+				skipOptionalParenList(p)
+			case "NOT":
+				p.next()
+				p.matchKeyword("NULL")
+			case "NULL":
+				p.next()
+			case "DEFAULT":
+				p.next()
+				if p.peek().kind == kindSym && p.peek().val == "(" {
+					p.next()
+					skipToParen(p)
+				} else {
+					p.next()
+				}
+			case "AUTO_INCREMENT":
+				p.next()
+			case "COMMENT":
+				p.next()
+				p.next()
+			case "COLLATE", "CHARACTER":
+				p.next()
+				if p.peek().is("SET") {
+					p.next()
+				}
+				p.next()
+			case "ON":
+				p.next()
+				p.matchKeyword("UPDATE")
+				p.next()
+			case "REFERENCES", "CHECK", "CONSTRAINT", "FOREIGN", "SPATIAL", "FULLTEXT":
+				for {
+					t2 := p.peek()
+					if t2.kind == kindEof {
+						break
+					}
+					if t2.kind == kindSym && (t2.val == "," || t2.val == ")") {
+						break
+					}
+					p.next()
+				}
+			default:
+				p.next()
 			}
 		}
 		fields = append(fields, Field{Name: fname, Type: ftype, Len: flen})
-		if p.matchSym(")") {
-			break
-		}
-		if q := p.next(); q.kind != kindSym || q.val != "," {
-			err = fmt.Errorf("expected , or )")
-			return
-		}
+		continue
 	}
 	if !pkNameSet {
 		err = fmt.Errorf("table must have a PRIMARY KEY")
 		return
 	}
+	// 表级索引定义：KEY/INDEX [name] (col[, ...])
+	for {
+		t := p.peek()
+		if t.kind != kindKw && t.kind != kindIdent {
+			break
+		}
+		switch strings.ToUpper(t.val) {
+		case "KEY", "INDEX":
+			p.next()
+			idxName := ""
+			if n := p.peek(); n.kind == kindIdent || n.kind == kindKw {
+				idxName = n.val
+				p.next()
+			}
+			if col, ok := readIndexColumns(p); ok && idxName != "" {
+				if tableIndexes == nil {
+					tableIndexes = map[string]string{}
+				}
+				tableIndexes[idxName] = col
+			} else {
+				skipOptionalParenList(p)
+			}
+		case "UNIQUE":
+			p.next()
+			p.matchKeyword("KEY")
+			p.matchKeyword("INDEX")
+			idxName := ""
+			if n := p.peek(); n.kind == kindIdent || n.kind == kindKw {
+				idxName = n.val
+				p.next()
+			}
+			if col, ok := readIndexColumns(p); ok && idxName != "" {
+				if tableIndexes == nil {
+					tableIndexes = map[string]string{}
+				}
+				tableIndexes[idxName] = col
+			} else {
+				skipOptionalParenList(p)
+			}
+		case "FULLTEXT", "SPATIAL":
+			p.next()
+			p.matchKeyword("KEY")
+			p.matchKeyword("INDEX")
+			if n := p.peek(); n.kind == kindIdent || n.kind == kindKw {
+				p.next()
+			}
+			skipOptionalParenList(p)
+		case "CONSTRAINT", "FOREIGN", "CHECK":
+			for {
+				t2 := p.peek()
+				if t2.kind == kindEof {
+					break
+				}
+				if t2.kind == kindSym && (t2.val == "," || t2.val == ")") {
+					break
+				}
+				p.next()
+			}
+		default:
+			// 引擎/字符集等表选项：KEY=VALUE 或单关键字（DEFAULT CHARSET=utf8mb4 等）
+			p.next()
+			if p.peek().kind == kindSym && p.peek().val == "=" {
+				p.next()
+				p.next()
+			}
+		}
+		// 选项之间可以没有逗号（ENGINE=InnoDB DEFAULT CHARSET=utf8mb4）
+		if p.peek().kind == kindEof {
+			break
+		}
+		if p.peek().kind == kindSym && p.peek().val == ")" {
+			break
+		}
+		if !p.matchSym(",") {
+			continue
+		}
+	}
+	if e := p.expectEnd(); e != nil {
+		err = e
+		return
+	}
+	if tableIndexes == nil {
+		tableIndexes = map[string]string{}
+	}
 	meta := &TableMeta{
 		Name:    name,
 		PK:      pkName,
 		Fields:  fields,
-		Indexes: map[string]string{},
+		Indexes: tableIndexes,
 	}
 	db.mu.Lock()
 	if _, ok := db.tables.Load(name); ok {
@@ -2371,6 +3057,10 @@ func (db *DB) dropTableByName(name string) error {
 	delete(db.catalog, name)
 	walRegUnregister(name)
 	db.mu.Unlock()
+	// 授权记录以表名为键：不清理会让同名重建表自动继承旧授权
+	if err := db.privileges.DropTable(name); err != nil {
+		logf(LOG_WARN, "drop privileges for %s: %v", name, err)
+	}
 	return db.flushWAL()
 }
 
@@ -2396,7 +3086,170 @@ func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interfac
 		err = fmt.Errorf("table not found: %s", name)
 		return
 	}
+	if p.peek().is("DROP") {
+		p.next()
+		if p.matchKeyword("INDEX") || p.matchKeyword("KEY") {
+			idxName, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			if e := p.expectEnd(); e != nil {
+				err = e
+				return
+			}
+			if e := db.AlterTableDropIndex(name, idxName); e != nil {
+				err = e
+				return
+			}
+			rawMsg = fmt.Sprintf("index %s dropped", idxName)
+			affected = 1
+			return
+		}
+		if p.matchKeyword("PRIMARY") {
+			p.matchKeyword("KEY")
+			err = fmt.Errorf("dropping the primary key is not supported")
+			return
+		}
+		p.matchKeyword("COLUMN")
+		col, e := p.parseIdent()
+		if e != nil {
+			err = e
+			return
+		}
+		p.matchKeyword("RESTRICT")
+		p.matchKeyword("CASCADE")
+		if e := p.expectEnd(); e != nil {
+			err = e
+			return
+		}
+		if e := db.AlterTableDropColumn(name, col); e != nil {
+			err = e
+			return
+		}
+		rawMsg = fmt.Sprintf("column %s dropped", col)
+		affected = 1
+		return
+	}
+	if p.peek().is("MODIFY") || p.peek().is("CHANGE") {
+		isChange := p.peek().is("CHANGE")
+		p.next()
+		p.matchKeyword("COLUMN")
+		firstCol, e := p.parseIdent()
+		if e != nil {
+			err = e
+			return
+		}
+		target := firstCol
+		if isChange {
+			// CHANGE [COLUMN] old new TYPE
+			newCol, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			target = newCol
+			if newCol != firstCol {
+				if e := db.AlterTableRenameColumn(name, firstCol, newCol); e != nil {
+					err = e
+					return
+				}
+			}
+		}
+		typeTok := p.next()
+		ftype, e := parseFieldType(typeTok.val)
+		if e != nil {
+			err = e
+			return
+		}
+		flen := 0
+		if ftype == TypeVarchar {
+			flen = 255
+		}
+		if q := p.next(); q.kind == kindSym && q.val == "(" {
+			num := p.next()
+			if num.kind != kindNum {
+				err = fmt.Errorf("expected length")
+				return
+			}
+			flen, _ = strconv.Atoi(num.val)
+			if q := p.next(); q.kind != kindSym || q.val != ")" {
+				err = fmt.Errorf("expected )")
+				return
+			}
+		} else {
+			p.i--
+		}
+		// 跳过列属性（NOT NULL / DEFAULT ... 等）
+		for {
+			t := p.peek()
+			if t.kind == kindEof {
+				break
+			}
+			if t.kind == kindSym && (t.val == "," || t.val == ")") {
+				break
+			}
+			p.next()
+		}
+		if e := p.expectEnd(); e != nil {
+			err = e
+			return
+		}
+		if e := db.AlterTableModifyColumn(name, target, ftype, flen); e != nil {
+			err = e
+			return
+		}
+		rawMsg = fmt.Sprintf("column %s modified", target)
+		affected = 1
+		return
+	}
 	if p.matchKeyword("ADD") {
+		// ADD [UNIQUE] [INDEX|KEY] [name] (col)
+		if p.peek().is("UNIQUE") || p.peek().is("INDEX") || p.peek().is("KEY") || p.peek().is("FULLTEXT") || p.peek().is("SPATIAL") {
+			for p.peek().is("UNIQUE") || p.peek().is("FULLTEXT") || p.peek().is("SPATIAL") {
+				p.next()
+			}
+			p.matchKeyword("INDEX")
+			p.matchKeyword("KEY")
+			idxName := ""
+			if n := p.peek(); n.kind == kindIdent || n.kind == kindKw {
+				idxName = n.val
+				p.next()
+			}
+			if !p.matchSym("(") {
+				err = fmt.Errorf("expected ( after index name")
+				return
+			}
+			col, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			for p.matchSym(",") {
+				if _, e := p.parseIdent(); e != nil {
+					err = e
+					return
+				}
+			}
+			if !p.matchSym(")") {
+				err = fmt.Errorf("expected )")
+				return
+			}
+			if idxName == "" {
+				idxName = col
+			}
+			if e := p.expectEnd(); e != nil {
+				err = e
+				return
+			}
+			if e := db.AlterTableAddIndex(name, idxName, col); e != nil {
+				err = e
+				return
+			}
+			rawMsg = fmt.Sprintf("index %s added", idxName)
+			affected = 1
+			return
+		}
 		if !p.matchKeyword("COLUMN") {
 			err = fmt.Errorf("expected COLUMN")
 			return
@@ -2442,6 +3295,34 @@ func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interfac
 		return
 	}
 	if p.matchKeyword("RENAME") {
+		// RENAME COLUMN old TO new
+		if p.matchKeyword("COLUMN") {
+			oldCol, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			if !p.matchKeyword("TO") {
+				err = fmt.Errorf("expected TO")
+				return
+			}
+			newCol, e := p.parseIdent()
+			if e != nil {
+				err = e
+				return
+			}
+			if e := p.expectEnd(); e != nil {
+				err = e
+				return
+			}
+			if e := db.AlterTableRenameColumn(name, oldCol, newCol); e != nil {
+				err = e
+				return
+			}
+			rawMsg = fmt.Sprintf("column %s renamed to %s", oldCol, newCol)
+			affected = 1
+			return
+		}
 		if !p.matchKeyword("TO") {
 			err = fmt.Errorf("expected TO")
 			return

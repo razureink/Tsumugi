@@ -29,50 +29,55 @@ var bytesBufPool = sync.Pool{
 // ==================== 命令常量 ====================
 
 const (
-	CmdAuth           = 10
-	CmdPing           = 11
+	CmdAuth          = 10
+	CmdPing          = 11
 	CmdCreateTable   = 20
 	CmdDropTable     = 21
-	CmdDescribe       = 22
+	CmdDescribe      = 22
 	CmdAlterTable    = 23
-	CmdInsert         = 30
-	CmdSelect         = 31
-	CmdUpdate         = 32
-	CmdDelete         = 33
+	CmdInsert        = 30
+	CmdSelect        = 31
+	CmdUpdate        = 32
+	CmdDelete        = 33
 	CmdQuerySQL      = 35
-	CmdBegin          = 40
-	CmdCommit         = 41
-	CmdRollback       = 42
+	CmdBegin         = 40
+	CmdCommit        = 41
+	CmdRollback      = 42
 	CmdCreateIndex   = 50
-	CmdBatch          = 55
-	CmdBackup         = 56
-	CmdStatus         = 57
-	CmdCompact        = 58
+	CmdBatch         = 55
+	CmdBackup        = 56
+	CmdStatus        = 57
+	CmdCompact       = 58
 	CmdSetDurability = 59
 	CmdCreateProc    = 60
 	CmdCallProc      = 61
 	CmdCreateView    = 70
 	CmdCreateTrigger = 80
-	CmdGrant          = 90
-	CmdRevoke         = 91
+	CmdGrant         = 90
+	CmdRevoke        = 91
 )
 
 const (
-	RespOK        = 1
-	RespErr       = 2
-	RespValue     = 3
+	RespOK       = 1
+	RespErr      = 2
+	RespValue    = 3
 	RespNotFound = 4
-	RespRows      = 5
+	RespRows     = 5
 	RespTxnID    = 6
 )
 
 // ==================== Server ====================
 
 type Server struct {
-	ln     net.Listener
-	db     *DB
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	ln       net.Listener
+	db       *DB
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	// 连接表：用于并发上限与优雅关闭（Stop 时主动断开，避免等 idle_timeout）
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
+	maxConns int
 }
 
 // serviceClosers 服务监听器注册表（name -> io.Closer）。
@@ -96,7 +101,13 @@ func NewServer(addr string, db *DB) (*Server, error) {
 		return nil, err
 	}
 	registerServiceCloser("binary", ln)
-	return &Server{ln: ln, db: db, stopCh: make(chan struct{})}, nil
+	return &Server{
+		ln:       ln,
+		db:       db,
+		stopCh:   make(chan struct{}),
+		conns:    make(map[net.Conn]struct{}),
+		maxConns: db.configSnapshot().MaxConns,
+	}, nil
 }
 
 func (s *Server) Start() {
@@ -108,31 +119,75 @@ func (s *Server) Start() {
 			case <-s.stopCh:
 				return
 			default:
+			}
+			// 监听器被关闭/永久错误时不要忙等烧 CPU
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		if !s.track(conn) {
+			// 超过并发上限：直接回错误帧并断开，避免 fd 耗尽
+			var buf bytes.Buffer
+			buf.WriteByte(RespErr)
+			wU32(&buf, uint32(len(errTooManyConns)))
+			buf.WriteString(errTooManyConns)
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			conn.Write(buf.Bytes())
+			conn.Close()
+			continue
 		}
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
 }
 
+const errTooManyConns = "too many connections"
+
+func (s *Server) track(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxConns > 0 && len(s.conns) >= s.maxConns {
+		return false
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *Server) untrack(c net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+}
+
+// Stop 幂等：关闭监听器 + 主动断开所有活动连接，再等待处理协程退出。
+// 不主动断开时，连接会一直阻塞在 Read 上直到 idle_timeout（默认 60s），
+// 容器滚动重启会一直卡在 terminating。
 func (s *Server) Stop() {
-	close(s.stopCh)
-	s.ln.Close()
-	s.wg.Wait()
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		s.ln.Close()
+		s.mu.Lock()
+		for c := range s.conns {
+			c.Close()
+		}
+		s.mu.Unlock()
+		s.wg.Wait()
+	})
 }
 
 // ==================== Session ====================
 
 type Session struct {
-	conn       net.Conn
-	br         *bufio.Reader
-	bw         *bufio.Writer
-	user       string
-	auth       bool
-	inTxn      bool
-	txnID      uint64
-	db         *DB
+	conn  net.Conn
+	br    *bufio.Reader
+	bw    *bufio.Writer
+	user  string
+	auth  bool
+	inTxn bool
+	txnID uint64
+	db    *DB
 }
 
 // read 从会话缓冲读取指定字节数（优先用 bufio，减少 syscall）。
@@ -228,6 +283,7 @@ func wLenBytes(w io.Writer, data []byte) error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
+	defer s.untrack(conn)
 	defer conn.Close()
 	// 修复: 添加 panic recover，防止单个连接 panic 影响整体
 	defer func() {
@@ -238,9 +294,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 	}()
 	session := &Session{
-		conn:       conn,
-		br:         bufio.NewReaderSize(conn, 32*1024),
-		bw:         bufio.NewWriterSize(conn, 32*1024),
+		conn: conn,
+		br:   bufio.NewReaderSize(conn, 32*1024),
+		bw:   bufio.NewWriterSize(conn, 32*1024),
 		db:   s.db,
 		auth: false,
 	}
@@ -253,21 +309,24 @@ func (s *Server) handleConn(conn net.Conn) {
 	}()
 
 	// 空闲超时按需刷新：每条命令一次 SetReadDeadline 是多余的系统调用，
-	// 只在超时窗口消耗过半时续期（认证状态变化时立即生效）。
-	deadline := s.db.config.IdleTimeout
-	if !session.auth && deadline > 30*time.Second {
-		deadline = 30 * time.Second
+	// 只在超时窗口消耗过半时续期。
+	// 未认证连接最多等 30s（防慢速占坑），但基准值不能被就地改写——
+	// 否则认证后永远停在 30s，配置的 idle_timeout_s 对已登录会话失效。
+	idleBase := s.db.configSnapshot().IdleTimeout
+	idleWindow := func() time.Duration {
+		if session.auth || idleBase <= 30*time.Second {
+			return idleBase
+		}
+		return 30 * time.Second
 	}
+	deadline := idleWindow()
 	deadlineAt := time.Now().Add(deadline)
 	conn.SetReadDeadline(deadlineAt)
 
 	for {
 		if now := time.Now(); now.After(deadlineAt.Add(-deadline / 2)) {
-			d := deadline
-			if !session.auth && d > 30*time.Second {
-				d = 30 * time.Second
-			}
-			deadlineAt = now.Add(d)
+			deadline = idleWindow()
+			deadlineAt = now.Add(deadline)
 			conn.SetReadDeadline(deadlineAt)
 		}
 
@@ -381,16 +440,32 @@ func (s *Server) handleAuth(session *Session) {
 	}
 	uname := string(user)
 	passwd := string(pass)
+	// 口令爆破防护：与 Web / MySQL 入口共用失败计数与退避
+	ip := remoteIP(session.conn)
+	key := loginKey(ip, uname)
+	if blocked, left := loginLimit.Blocked(key); blocked {
+		logf(LOG_WARN, "auth blocked: ip=%s user=%q retry_after=%s", ip, uname, left)
+		s.writeError(session, "too many failed attempts")
+		session.bw.Flush()
+		session.conn.Close()
+		return
+	}
 	// 验证用户凭据
 	u := globalUsers.Get(uname)
 	matched := u != nil && verifyPasswd(u, passwd)
 	if matched {
+		loginLimit.Reset(key)
 		session.auth = true
 		session.user = uname
 		s.writeOK(session)
 		logf(LOG_VERB, "auth success: %s", session.user)
 	} else {
+		loginLimit.Fail(key)
+		logf(LOG_WARN, "auth FAILED: ip=%s user=%q", ip, uname)
 		s.writeError(session, "auth failed")
+		// 失败即断开：不允许在同一连接上连续尝试
+		session.bw.Flush()
+		session.conn.Close()
 	}
 }
 
@@ -486,7 +561,7 @@ func (s *Server) handleCreateTable(session *Session) {
 		indexes[string(idxName)] = string(idxField)
 	}
 
-	if !session.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != session.db.config.User {
+	if !session.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != session.db.rootUser() {
 		s.writeError(session, "permission denied")
 		return
 	}
@@ -514,7 +589,7 @@ func (s *Server) handleCreateTable(session *Session) {
 		return
 	}
 	s.writeOK(session)
-	logf(LOG_VERB, "table %s created", tableName)
+	logf(LOG_VERB, "audit: user=%s action=create_table table=%s fields=%d", session.user, tableName, len(fields))
 }
 
 // readTableName 从连接读取 u16 长度前缀的表名字符串。
@@ -542,7 +617,7 @@ func (s *Server) handleDropTable(session *Session) {
 		s.writeError(session, err.Error())
 		return
 	}
-	if !s.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != s.db.config.User {
+	if !s.db.CheckPrivilege(session.user, tableName, PermDDL) {
 		s.writeError(session, "permission denied")
 		return
 	}
@@ -559,6 +634,11 @@ func (s *Server) handleDropTable(session *Session) {
 			s.writeError(session, err.Error())
 			return
 		}
+		// 授权记录以表名为键：不清理会让同名重建表自动继承旧授权
+		if err := db.privileges.DropTable(tableName); err != nil {
+			logf(LOG_WARN, "drop privileges for %s: %v", tableName, err)
+		}
+		logf(LOG_VERB, "audit: user=%s action=drop_table table=%s", session.user, tableName)
 		s.writeOK(session)
 	} else {
 		s.writeError(session, "table not found")
@@ -578,6 +658,11 @@ func (s *Server) handleDescribe(session *Session) {
 		return
 	}
 	db := session.db
+	// 表结构同属敏感信息（字段/索引名），无表权限的账号不应能枚举
+	if !db.CheckPrivilege(session.user, tableName, PermSelect) {
+		s.writeError(session, "permission denied")
+		return
+	}
 	db.mu.RLock()
 	meta, ok := db.catalog[tableName]
 	db.mu.RUnlock()
@@ -637,7 +722,7 @@ func (s *Server) handleAlterTable(session *Session) {
 		s.writeError(session, "read field length failed")
 		return
 	}
-	if !session.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != session.db.config.User {
+	if !session.db.CheckPrivilege(session.user, tableName, PermDDL) && session.user != session.db.rootUser() {
 		s.writeError(session, "permission denied")
 		return
 	}
@@ -751,21 +836,11 @@ func (s *Server) handleInsert(session *Session) {
 	var txnID uint64
 	if session.inTxn {
 		txnID = session.txnID
-		if oldData, ok := table.pkTree.Get(pk); ok {
-			version := decodeVersion(oldData)
-			db.recordReadVersion(txnID, string(tableName), pk, version)
-		}
-		db.txnMu.Lock()
-		if txn, ok := db.txns[txnID]; ok {
-			if txn.Changes[string(tableName)] == nil {
-				txn.Changes[string(tableName)] = make(map[int64][]byte)
-			}
-			txn.Changes[string(tableName)][pk] = nil
-			txn.Tables[string(tableName)] = true
-		}
-		db.txnMu.Unlock()
 	}
-	if err := table.Insert(pk, values, expireAt, txnID, false); err != nil {
+	// 事务写：写入与 old/new 版本记录在同一临界区完成（提交时的冲突检测依赖它）
+	if err := db.txnApply(txnID, table, pk, func() error {
+		return table.Insert(pk, values, expireAt, txnID, false)
+	}); err != nil {
 		s.writeError(session, err.Error())
 		return
 	}
@@ -787,8 +862,12 @@ func (s *Server) handleSelect(session *Session) {
 	}
 	name := string(tableName)
 
-	// 系统表
+	// 系统表（只对管理员开放：它列出全实例的表/索引/统计，绕过表级授权）
 	if len(name) >= 2 && name[0] == '_' && name[1] == '_' {
+		if session.user != session.db.rootUser() {
+			s.writeError(session, "permission denied")
+			return
+		}
 		rows, err := session.db.getSystemTable(name)
 		if err != nil {
 			s.writeError(session, err.Error())
@@ -910,7 +989,9 @@ func (s *Server) handleQuerySQL(session *Session) {
 		s.writeError(session, "read sql failed")
 		return
 	}
-	columns, rows, affected, rawMsg, err := s.db.runSQL(string(sqlBytes))
+	// 以会话账号执行：内部统一做表级授权（此前完全不做权限校验）
+	var out sqlOut
+	columns, rows, affected, rawMsg, err := s.db.runSQLAsOut(session.user, string(sqlBytes), &out)
 	if err != nil {
 		s.writeError(session, err.Error())
 		return
@@ -1055,23 +1136,10 @@ func (s *Server) handleUpdate(session *Session) {
 	var txnID uint64
 	if session.inTxn {
 		txnID = session.txnID
-		oldData, _ := table.pkTree.Get(pk)
-		if oldData != nil {
-			version := decodeVersion(oldData)
-			db.recordReadVersion(txnID, string(tableName), pk, version)
-		}
-		db.txnMu.Lock()
-		txn, _ := db.txns[txnID]
-		if txn != nil {
-			if txn.Changes[string(tableName)] == nil {
-				txn.Changes[string(tableName)] = make(map[int64][]byte)
-			}
-			txn.Changes[string(tableName)][pk] = oldData
-			txn.Tables[string(tableName)] = true
-		}
-		db.txnMu.Unlock()
 	}
-	if err := table.Update(pk, values, expireAt, txnID, false); err != nil {
+	if err := db.txnApply(txnID, table, pk, func() error {
+		return table.Update(pk, values, expireAt, txnID, false)
+	}); err != nil {
 		s.writeError(session, err.Error())
 		return
 	}
@@ -1109,23 +1177,10 @@ func (s *Server) handleDelete(session *Session) {
 	var txnID uint64
 	if session.inTxn {
 		txnID = session.txnID
-		oldData, _ := table.pkTree.Get(pk)
-		if oldData != nil {
-			version := decodeVersion(oldData)
-			db.recordReadVersion(txnID, string(tableName), pk, version)
-		}
-		db.txnMu.Lock()
-		txn, _ := db.txns[txnID]
-		if txn != nil {
-			if txn.Changes[string(tableName)] == nil {
-				txn.Changes[string(tableName)] = make(map[int64][]byte)
-			}
-			txn.Changes[string(tableName)][pk] = oldData
-			txn.Tables[string(tableName)] = true
-		}
-		db.txnMu.Unlock()
 	}
-	if err := table.Delete(pk, txnID, false); err != nil {
+	if err := db.txnApply(txnID, table, pk, func() error {
+		return table.Delete(pk, txnID, false)
+	}); err != nil {
 		s.writeError(session, err.Error())
 		return
 	}
@@ -1221,7 +1276,7 @@ func (s *Server) handleCreateIndex(session *Session) {
 		return
 	}
 	table := v.(*Table)
-	if !db.CheckPrivilege(session.user, string(tableName), PermDDL) && session.user != db.config.User {
+	if !db.CheckPrivilege(session.user, string(tableName), PermDDL) && session.user != db.rootUser() {
 		s.writeError(session, "permission denied")
 		return
 	}
@@ -1283,7 +1338,7 @@ func (s *Server) handleBatch(session *Session) {
 // ---- BACKUP ----
 func (s *Server) handleBackup(session *Session) {
 	s.db.stats.IncCmd("BACKUP")
-	if session.user != session.db.config.User {
+	if session.user != session.db.rootUser() {
 		s.writeError(session, "only root can backup")
 		return
 	}
@@ -1300,7 +1355,7 @@ func (s *Server) handleBackup(session *Session) {
 func (s *Server) handleStatus(session *Session) {
 	s.db.stats.IncCmd("STATUS")
 	snap := s.db.stats.Snapshot()
-	snap["durability"] = s.db.config.Durability
+	snap["durability"] = string(s.db.configSnapshot().Durability)
 	data, err := json.Marshal(snap)
 	if err != nil {
 		s.writeError(session, err.Error())
@@ -1314,7 +1369,7 @@ func (s *Server) handleStatus(session *Session) {
 // handleCompact 触发 WAL 整理：将 WAL 重写为仅含当前状态的精简 v2 快照。
 func (s *Server) handleCompact(session *Session) {
 	s.db.stats.IncCmd("COMPACT")
-	if session.user != session.db.config.User {
+	if session.user != session.db.rootUser() {
 		s.writeError(session, "only root can compact")
 		return
 	}
@@ -1328,7 +1383,7 @@ func (s *Server) handleCompact(session *Session) {
 // handleSetDurability 动态切换持久化模式（batch/fsync）。
 func (s *Server) handleSetDurability(session *Session) {
 	s.db.stats.IncCmd("SET_DURABILITY")
-	if session.user != session.db.config.User {
+	if session.user != session.db.rootUser() {
 		s.writeError(session, "only root can change durability")
 		return
 	}
@@ -1399,7 +1454,7 @@ func (s *Server) handleGrant(session *Session) {
 		s.writeError(session, "read perm failed")
 		return
 	}
-	if session.user != session.db.config.User {
+	if session.user != session.db.rootUser() {
 		s.writeError(session, "only root can grant")
 		return
 	}
@@ -1407,6 +1462,7 @@ func (s *Server) handleGrant(session *Session) {
 		s.writeError(session, err.Error())
 		return
 	}
+	logf(LOG_VERB, "audit: user=%s action=grant target=%s table=%s perm=%d", session.user, user, tableName, perm)
 	s.writeOK(session)
 }
 
@@ -1438,7 +1494,7 @@ func (s *Server) handleRevoke(session *Session) {
 		s.writeError(session, "read perm failed")
 		return
 	}
-	if session.user != session.db.config.User {
+	if session.user != session.db.rootUser() {
 		s.writeError(session, "only root can revoke")
 		return
 	}
@@ -1446,6 +1502,7 @@ func (s *Server) handleRevoke(session *Session) {
 		s.writeError(session, err.Error())
 		return
 	}
+	logf(LOG_VERB, "audit: user=%s action=revoke target=%s table=%s perm=%d", session.user, user, tableName, perm)
 	s.writeOK(session)
 }
 
@@ -1466,4 +1523,3 @@ func validateTableName(name []byte) error {
 	}
 	return nil
 }
-

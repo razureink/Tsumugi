@@ -28,7 +28,7 @@ type rbNode[K any, V any] struct {
 }
 
 // cloneNode 浅拷贝节点（写时复制路径）。COW 语义下已发布节点不可回收复用
-//（读者可能仍持有旧快照），因此不做池化——此前的"节点池"只有 Get 没有 Put，
+// （读者可能仍持有旧快照），因此不做池化——此前的"节点池"只有 Get 没有 Put，
 // 实际从不复用，纯属开销。
 func (t *RBTree[K, V]) cloneNode(n *rbNode[K, V]) *rbNode[K, V] {
 	if n == nil {

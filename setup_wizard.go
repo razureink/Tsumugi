@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 const setupWizardHTML = `<!DOCTYPE html>
 <html lang="zh">
@@ -26,6 +26,9 @@ const setupWizardHTML = `<!DOCTYPE html>
   --ease-emph:cubic-bezier(0.2,0,0,1);
   --ease-emph-dec:cubic-bezier(0.05,0.7,0.1,1);
   --r-md:12px;--r-lg:16px;--r-xl:28px;--r-full:9999px;
+  /* 高对比强调色（与控制台一致） */
+  --c-red:#DC2626;--c-amber:#B45309;--c-green:#15803D;--c-cyan:#0E7490;--c-blue:#1D4ED8;--c-violet:#6D28D9;
+  --c-hc:#121014;--c-on-hc:#FFFFFF;
 }
 @media(prefers-color-scheme:dark){:root{
   --pri:#F8A4B8;--on-pri:#5C1228;--pri-ctn:#B33060;--on-pri-ctn:#FFE4EB;
@@ -40,6 +43,7 @@ const setupWizardHTML = `<!DOCTYPE html>
   --inv-sf:#F0E0E6;--on-inv-sf:#3D2832;--inv-pri:#E8607C;
   --pri-20:#7B1A38;--pri-40:#E8607C;--ter-40:#D84A6A;
   --pri-90:#FCCDD6;--pri-99:#FFFAF9;
+  --c-red:#FCA5A5;--c-amber:#FCD34D;--c-green:#86EFAC;--c-cyan:#5EEAD4;--c-blue:#93C5FD;--c-violet:#C4B5FD;
 }}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;background:var(--sf);color:var(--on-sf);min-height:100vh;display:flex;align-items:center;justify-content:center;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
@@ -87,6 +91,9 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
 .feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0}
 .feature{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:var(--r-md);background:var(--sc1);font-size:13px;font-weight:500;color:var(--on-sf-var)}
 .feature .mat{font-size:20px;color:var(--pri)}
+/* 高对比强调色（与控制台同一套 token） */
+.ic-red{color:var(--c-red)}.ic-amber{color:var(--c-amber)}.ic-green{color:var(--c-green)}.ic-cyan{color:var(--c-cyan)}.ic-blue{color:var(--c-blue)}.ic-violet{color:var(--c-violet)}
+.feature .mat.ic-red{color:var(--c-red)}.feature .mat.ic-amber{color:var(--c-amber)}.feature .mat.ic-green{color:var(--c-green)}.feature .mat.ic-cyan{color:var(--c-cyan)}.feature .mat.ic-blue{color:var(--c-blue)}.feature .mat.ic-violet{color:var(--c-violet)}
 /* 语言选择：苹果风格大球+小球环形 */
 .apple-ring{position:relative;height:236px;margin:24px 0 8px;user-select:none;-webkit-user-select:none;touch-action:pan-y}
 .apple-ring::before{content:'';position:absolute;left:50%;top:54%;width:176px;height:176px;transform:translate(-50%,-50%);border-radius:50%;background:radial-gradient(circle at 50% 34%, rgba(232,96,124,.14), rgba(232,96,124,0) 72%);pointer-events:none}
@@ -128,10 +135,10 @@ h1{font-size:28px;font-weight:800;text-align:center;margin-bottom:8px;letter-spa
     <h1 data-i18n="wizWelcome">欢迎使用 Tsumugi</h1>
     <p class="sub" data-i18n="wizWelcomeSub">轻量级高性能内存数据库<br>支持原生二进制协议与 MySQL 兼容协议</p>
     <div class="feature-grid">
-      <div class="feature"><span class="mat material-symbols-outlined">bolt</span><span data-i18n="fBolt">亚毫秒级延迟</span></div>
-      <div class="feature"><span class="mat material-symbols-outlined">save</span><span data-i18n="fSave">WAL 持久化</span></div>
-      <div class="feature"><span class="mat material-symbols-outlined">dns</span><span data-i18n="fDns">MySQL 兼容</span></div>
-      <div class="feature"><span class="mat material-symbols-outlined">security</span><span data-i18n="fSec">多用户权限</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined ic-amber">bolt</span><span data-i18n="fBolt">亚毫秒级延迟</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined ic-green">save</span><span data-i18n="fSave">WAL 持久化</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined ic-blue">dns</span><span data-i18n="fDns">MySQL 兼容</span></div>
+      <div class="feature"><span class="mat material-symbols-outlined ic-violet">security</span><span data-i18n="fSec">多用户权限</span></div>
     </div>
     <button class="btn btn-fill" onclick="goStep(3)"><span data-i18n="btnStart">开始设置</span> <span class="material-symbols-outlined" style="font-size:18px">arrow_forward</span></button>
   </div>
@@ -276,6 +283,7 @@ window.addEventListener('keydown',function(e){if(e.key==='Enter'&&document.getEl
 renderLangRing();
 applyTexts();
 </script>
+<!--__PANEL_ASSETS__-->
 </body>
 </html>`
 
@@ -303,6 +311,9 @@ const loginPageHTML = `<!DOCTYPE html>
   --ease-emph:cubic-bezier(0.2,0,0,1);
   --ease-emph-dec:cubic-bezier(0.05,0.7,0.1,1);
   --r-md:12px;--r-lg:16px;--r-xl:28px;--r-full:9999px;
+  /* 高对比强调色（与控制台一致） */
+  --c-red:#DC2626;--c-amber:#B45309;--c-green:#15803D;--c-cyan:#0E7490;--c-blue:#1D4ED8;--c-violet:#6D28D9;
+  --c-hc:#121014;--c-on-hc:#FFFFFF;
 }
 @media(prefers-color-scheme:dark){:root{
   --pri:#F8A4B8;--on-pri:#5C1228;--pri-ctn:#B33060;--on-pri-ctn:#FFE4EB;
@@ -315,6 +326,7 @@ const loginPageHTML = `<!DOCTYPE html>
   --sc0:#120D10;--sc1:#1E1619;
   --inv-sf:#F0E0E6;--on-inv-sf:#3D2832;--inv-pri:#E8607C;
   --pri-20:#7B1A38;--pri-40:#E8607C;--ter-40:#D84A6A;--pri-90:#FCCDD6;
+  --c-red:#FCA5A5;--c-amber:#FCD34D;--c-green:#86EFAC;--c-cyan:#5EEAD4;--c-blue:#93C5FD;--c-violet:#C4B5FD;
 }}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;background:var(--sf);color:var(--on-sf);min-height:100vh;display:flex;align-items:center;justify-content:center;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
@@ -380,5 +392,6 @@ async function doLogin(){
 }
 document.getElementById('pass').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
 </script>
+<!--__PANEL_ASSETS__-->
 </body>
 </html>`

@@ -74,7 +74,8 @@ func walRowCount(t *testing.T, db *DB, name string) int64 {
 	return tbl.pkTree.Size()
 }
 
-// 写路径（INSERT/UPDATE/DELETE）均落 v1 紧凑编码（varint + 表 ID），版本号固定为 1。
+// 新建 WAL 文件写 v3 分帧头；记录体仍是 v1 紧凑编码（varint + 表 ID）。
+// 旧 v1/v2 文件只读兼容（见 TestWALV1Compat），下次 Compact 升级为 v3。
 func TestWALV1Header(t *testing.T) {
 	dir := t.TempDir()
 	db, err := NewDB(walTestConfig(dir))
@@ -88,8 +89,8 @@ func TestWALV1Header(t *testing.T) {
 	}
 	db.flushWAL()
 	db.Close()
-	if v := walFileVersion(t, dir); v != WALVersion {
-		t.Fatalf("WAL version = %d, want %d", v, WALVersion)
+	if v := walFileVersion(t, dir); v != WALVersion3 {
+		t.Fatalf("WAL version = %d, want %d", v, WALVersion3)
 	}
 }
 
@@ -159,10 +160,12 @@ func TestWALV1Txn(t *testing.T) {
 	db.txnMu.Lock()
 	tx := db.txns[tx1]
 	tx.Tables["t"] = true
-	tx.Changes["t"] = make(map[int64][]byte)
+	tx.Changes["t"] = make(map[int64]txnChange)
 	tx.ReadVersions["t"] = make(map[int64]int64)
 	db.txnMu.Unlock()
-	if err := tbl.Insert(1, map[string]interface{}{"id": int64(1), "name": "a"}, 0, tx1, false); err != nil {
+	if err := db.txnApply(tx1, tbl, 1, func() error {
+		return tbl.Insert(1, map[string]interface{}{"id": int64(1), "name": "a"}, 0, tx1, false)
+	}); err != nil {
 		t.Fatalf("tx insert: %v", err)
 	}
 	if err := db.CommitTxn(tx1); err != nil {
@@ -172,10 +175,12 @@ func TestWALV1Txn(t *testing.T) {
 	db.txnMu.Lock()
 	tx2r := db.txns[tx2]
 	tx2r.Tables["t"] = true
-	tx2r.Changes["t"] = make(map[int64][]byte)
+	tx2r.Changes["t"] = make(map[int64]txnChange)
 	tx2r.ReadVersions["t"] = make(map[int64]int64)
 	db.txnMu.Unlock()
-	if err := tbl.Insert(2, map[string]interface{}{"id": int64(2), "name": "b"}, 0, tx2, false); err != nil {
+	if err := db.txnApply(tx2, tbl, 2, func() error {
+		return tbl.Insert(2, map[string]interface{}{"id": int64(2), "name": "b"}, 0, tx2, false)
+	}); err != nil {
 		t.Fatalf("tx2 insert: %v", err)
 	}
 	if err := db.RollbackTxn(tx2); err != nil {

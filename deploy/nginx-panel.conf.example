@@ -1,0 +1,52 @@
+# 面板反向代理示例：TLS 终止在 Nginx，Tsumugi 只监听 127.0.0.1。
+#
+# config/tsumugi.json:
+#   "bind_host": "127.0.0.1",
+#   "trusted_proxies": ["127.0.0.1/32"]      # 命中才采信 X-Forwarded-For（登录限速按真实 IP）
+#
+# 注意：二进制协议（9999）与 MySQL 协议（3309）是裸 TCP，不能用 HTTP 反代；
+#       生产请只在内网开放，或用四层代理 + 网络 ACL 限制来源。
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name db.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/db.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/db.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+
+    # 面板请求体上限与程序内部一致（1MB），留一点余量
+    client_max_body_size 2m;
+
+    location / {
+        proxy_pass http://127.0.0.1:10232;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    60s;
+        proxy_send_timeout    60s;
+    }
+
+    # 监控端点建议只对内网/监控系统开放
+    location /metrics {
+        allow 10.0.0.0/8;
+        allow 127.0.0.1;
+        deny  all;
+        proxy_pass http://127.0.0.1:10232;
+    }
+}
+
+server {
+    listen 80;
+    server_name db.example.com;
+    return 301 https://$host$request_uri;
+}

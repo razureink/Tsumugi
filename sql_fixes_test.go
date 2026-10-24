@@ -252,15 +252,49 @@ func TestTrailingTokensRejected(t *testing.T) {
 	}
 }
 
-// GROUP BY / HAVING 显式报错（此前静默丢弃返回未分组结果）。
-func TestGroupByRejected(t *testing.T) {
+// GROUP BY / HAVING：显式报错已改为真正实现（聚合 + 分组过滤）。
+func TestGroupByAndHaving(t *testing.T) {
 	db := newParserTestDB(t)
 	seedSQLDB(t, db)
-	if _, _, _, _, err := db.runSQL("SELECT grp FROM users GROUP BY grp"); err == nil {
-		t.Fatal("GROUP BY should error")
+	// 分组计数：users 有 grp=10 ×2、grp=20 ×1
+	cols, rows, _, _, err := db.runSQL("SELECT grp, COUNT(*) AS n FROM users GROUP BY grp ORDER BY grp")
+	if err != nil {
+		t.Fatalf("group by: %v", err)
 	}
-	if _, _, _, _, err := db.runSQL("SELECT id FROM users HAVING id > 1"); err == nil {
-		t.Fatal("HAVING should error")
+	if len(cols) != 2 || cols[1] != "n" {
+		t.Fatalf("columns = %v", cols)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("groups = %v, want 2", rows)
+	}
+	if rows[0][0] != int64(10) || rows[0][1] != int64(2) {
+		t.Fatalf("group 10 = %v", rows[0])
+	}
+	if rows[1][0] != int64(20) || rows[1][1] != int64(1) {
+		t.Fatalf("group 20 = %v", rows[1])
+	}
+	// HAVING 过滤分组
+	_, rows, _, _, err = db.runSQL("SELECT grp, COUNT(*) AS n FROM users GROUP BY grp HAVING COUNT(*) > 1")
+	if err != nil {
+		t.Fatalf("having: %v", err)
+	}
+	if len(rows) != 1 || rows[0][0] != int64(10) {
+		t.Fatalf("having groups = %v, want [10]", rows)
+	}
+	// 无 GROUP BY 的隐式聚合
+	_, rows, _, _, err = db.runSQL("SELECT COUNT(*), MIN(id), MAX(id), AVG(id) FROM users")
+	if err != nil {
+		t.Fatalf("implicit agg: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("implicit agg rows = %v", rows)
+	}
+	if rows[0][0] != int64(3) || rows[0][1] != int64(1) || rows[0][2] != int64(3) {
+		t.Fatalf("agg values = %v", rows[0])
+	}
+	// 未知列仍然报错（不静默按 NULL 处理）
+	if _, _, _, _, err := db.runSQL("SELECT grp FROM users GROUP BY nope"); err == nil {
+		t.Fatal("GROUP BY unknown column should error")
 	}
 }
 

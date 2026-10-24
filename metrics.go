@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"runtime/metrics"
 	"strconv"
@@ -55,7 +56,7 @@ type Stats struct {
 	cpuLastTotal float64
 
 	// 持久化模式：batch（定时批量 fsync）或 fsync（每条写立即落盘）
-	durability Durability
+	durability atomic.Value // string：设置页可热切换，Snapshot 并发读
 }
 
 func NewStats() *Stats {
@@ -214,6 +215,9 @@ func (s *Stats) IncErr() {
 
 func (s *Stats) Snapshot() map[string]interface{} {
 	opsCopy := make(map[string]uint64)
+	// 槽位名在注册时写入（slotFor 持 opsMu）：快照读也必须持锁，
+	// 否则与并发注册构成 string header 撕裂的数据竞争。
+	s.opsMu.Lock()
 	n := atomic.LoadUint32(&s.opsNext)
 	if n > opsOverflowSlot {
 		n = opsOverflowSlot
@@ -223,6 +227,7 @@ func (s *Stats) Snapshot() map[string]interface{} {
 			opsCopy[name] = s.opsCounts[i].Load()
 		}
 	}
+	s.opsMu.Unlock()
 	// 溢出槽中的名字（极少发生）：单独列出避免丢计数
 	s.opsSlots.Range(func(k, v interface{}) bool {
 		if v.(uint32) == opsOverflowSlot {
@@ -255,7 +260,7 @@ func (s *Stats) Snapshot() map[string]interface{} {
 		"goroutines":     runtime.NumGoroutine(),
 		"num_cpu":        runtime.NumCPU(),
 		"uptime":         int64(time.Since(s.startTime).Seconds()),
-		"durability":     s.durability,
+		"durability":     s.durability.Load(),
 		"wal_write_mb_s": walMBs,
 		"wal_total_mb":   totalWalMB,
 		"fsync_per_s":    fsyncPerS,
@@ -275,8 +280,13 @@ func (s *Stats) SnapshotQPS() int64 { return calcRate(&s.rateTicks, &s.rateCount
 
 func (db *DB) startMetricsServer() {
 	mux := http.NewServeMux()
-	// Prometheus
+	// Prometheus（需要监控令牌：其内容是实例级计数，且默认全网卡监听）
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if !db.metricsAuthorized(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="tsumugi-metrics"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		snapshot := db.stats.Snapshot()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		fmt.Fprintf(w, "# HELP tsumugi_total_commands Total commands\n")
@@ -327,14 +337,15 @@ func (db *DB) startMetricsServer() {
 		snap["total_rows"] = rowTotal
 		snap["wal_file_mb"] = walFileSizeMB(db)
 		snap["server_version"] = "Tsumugi-0.1"
-		snap["binary_port"] = db.config.Port
-		snap["mysql_enabled"] = db.config.MySQLEnabled
-		snap["mysql_port"] = db.config.MySQLPort
+		cfg := db.configSnapshot()
+		snap["binary_port"] = cfg.Port
+		snap["mysql_enabled"] = cfg.MySQLEnabled
+		snap["mysql_port"] = cfg.MySQLPort
 		snap["config"] = map[string]interface{}{
-			"flush_interval_ms": int(db.config.FlushInterval / time.Millisecond),
-			"group_commit_ms":   int(db.config.GroupCommitInterval / time.Millisecond),
-			"ttl_clean_ms":      int(db.config.TTLCleanInterval / time.Millisecond),
-			"checksum":          db.config.EnableChecksum,
+			"flush_interval_ms": int(cfg.FlushInterval / time.Millisecond),
+			"group_commit_ms":   int(cfg.GroupCommitInterval / time.Millisecond),
+			"ttl_clean_ms":      int(cfg.TTLCleanInterval / time.Millisecond),
+			"checksum":          cfg.EnableChecksum,
 		}
 		json.NewEncoder(w).Encode(snap)
 	}))
@@ -388,6 +399,16 @@ func (db *DB) startMetricsServer() {
 		})
 	}))
 
+	// 健康检查：无鉴权、无外部依赖，供容器/k8s 探针使用
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write([]byte(`{"ok":true}`))
+	})
+
+	// 面板图标字体（可选自托管：assets/material-symbols-outlined.woff2）
+	mux.HandleFunc("/assets/material-symbols-outlined.woff2", handlePanelIconFont)
+
 	// 统一应用（侧边栏布局，按路由渲染 监控 / 数据管理）
 	mux.HandleFunc("/", db.handleRootPage)
 	mux.HandleFunc("/dashboard", db.handleAppPage)
@@ -400,7 +421,8 @@ func (db *DB) startMetricsServer() {
 	// 首次设置向导（root-password 端点已删除：前端从不调用，且安装前无鉴权地
 	// 返回生成密码只增加攻击面；安装统一走 /api/setup/complete）
 	mux.HandleFunc("/api/setup/status", db.handleSetupStatus)
-	mux.HandleFunc("/api/setup/complete", db.handleSetupComplete)
+	// 首次安装只允许来自本机/内网：否则公网上"先到的人"可以直接把自己注册成管理员
+	mux.HandleFunc("/api/setup/complete", setupLocalOnly(db.handleSetupComplete))
 	// 用户管理
 	mux.HandleFunc("/api/admin/users", adminAuthRequired(db.handleUserList))
 	mux.HandleFunc("/api/admin/users/create", adminAuthRequired(db.handleUserCreate))
@@ -432,6 +454,42 @@ func (db *DB) startMetricsServer() {
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": trMsg(reqLang(r), "compact_done")})
 	}))
+	// 备份：POST 立即生成一份 WAL + 权限快照；GET 列出已有备份
+	mux.HandleFunc("/api/admin/backup", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, "backup is admin-only") {
+			return
+		}
+		if r.Method == http.MethodPost {
+			if err := db.Backup(); err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, map[string]interface{}{"ok": true, "dir": db.backupDir})
+			return
+		}
+		entries, err := os.ReadDir(db.backupDir)
+		if err != nil && !os.IsNotExist(err) {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		files := make([]map[string]interface{}, 0, len(entries))
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			info, ierr := e.Info()
+			if ierr != nil {
+				continue
+			}
+			files = append(files, map[string]interface{}{
+				"name":     e.Name(),
+				"size":     info.Size(),
+				"modified": info.ModTime().Unix(),
+			})
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "dir": db.backupDir, "files": files})
+	}))
+
 	mux.HandleFunc("/api/admin/restart", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
 		if !requireAdmin(w, r, "restart is admin-only") {
 			return
@@ -440,12 +498,41 @@ func (db *DB) startMetricsServer() {
 		db.handleRestart()
 	}))
 
-	addr := fmt.Sprintf(":%d", db.config.MetricsPort)
-	srv := &http.Server{Addr: addr, Handler: mux}
+	cfg := db.configSnapshot()
+	addr := cfg.listenAddr(cfg.MetricsPort)
+	// 统一请求体上限（所有 handler 都是裸 json.NewDecoder，未认证即可发超大包）
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		// 基础安全响应头：面板是同源应用，禁止被嵌入/嗅探
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		mux.ServeHTTP(w, r)
+	})
+	// 显式超时：无超时的 http.Server 可被 Slowloris 占满连接
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	db.metricsServer.Store(srv)
-	logf(LOG_VERB, "metrics server listening on %s", addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logf(LOG_ERR, "metrics server error: %v", err)
+	var serveErr error
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		logf(LOG_OK, "panel listening on https://%s (tls)", addr)
+		serveErr = srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+	} else {
+		logf(LOG_OK, "panel listening on http://%s", addr)
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		logf(LOG_ERR, "metrics server error: %v", serveErr)
 	}
 }
 
@@ -475,4 +562,3 @@ func stressModeValid(m string) bool {
 	}
 	return false
 }
-

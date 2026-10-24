@@ -1,13 +1,17 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -160,22 +164,64 @@ func (s *UserStore) Update(u *User) {
 	s.save()
 }
 
+// mustRandom 取密码学随机字节。crypto/rand 失败意味着系统熵源不可用，
+// 此时绝不能用退化值（可预测的盐/令牌）继续，直接 panic 由上层 recover。
+func mustRandom(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
+	return b
+}
+
 func generatePassword() string {
 	const chars = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
-	b := make([]byte, 12)
-	rand.Read(b)
+	b := mustRandom(12)
 	for i := range b {
 		b[i] = chars[int(b[i])%len(chars)]
 	}
 	return string(b)
 }
 
+// pwdIterations PBKDF2 迭代次数：单次校验约 30~60ms，GPU 爆破成本提高数个量级。
+const pwdIterations = 120000
+
+// pbkdf2SHA256 是 RFC 8018 PBKDF2-HMAC-SHA256 的最小实现。
+// 项目坚持零第三方依赖，因此不用 golang.org/x/crypto。
+func pbkdf2SHA256(password, salt []byte, iter, keyLen int) []byte {
+	prf := hmac.New(sha256.New, password)
+	hashLen := prf.Size()
+	blocks := (keyLen + hashLen - 1) / hashLen
+	out := make([]byte, 0, blocks*hashLen)
+	u := make([]byte, hashLen)
+	t := make([]byte, hashLen)
+	var idx [4]byte
+	for block := 1; block <= blocks; block++ {
+		prf.Reset()
+		prf.Write(salt)
+		idx[0], idx[1], idx[2], idx[3] = byte(block>>24), byte(block>>16), byte(block>>8), byte(block)
+		prf.Write(idx[:])
+		u = prf.Sum(u[:0])
+		copy(t, u)
+		for i := 1; i < iter; i++ {
+			prf.Reset()
+			prf.Write(u)
+			u = prf.Sum(u[:0])
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		out = append(out, t...)
+	}
+	return out[:keyLen]
+}
+
+// hashPasswd 生成 `pbkdf2$<iter>$<salt-hex>$<hash-hex>` 格式的口令摘要。
+// 旧版本是单轮 sha256(salt+pwd)，校验时仍兼容并在成功登录后自动升级。
 func hashPasswd(password string) string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	salt := hex.EncodeToString(b)
-	h := sha256.Sum256([]byte(salt + password))
-	return salt + hex.EncodeToString(h[:])
+	salt := mustRandom(16)
+	dk := pbkdf2SHA256([]byte(password), salt, pwdIterations, 32)
+	return fmt.Sprintf("pbkdf2$%d$%s$%s", pwdIterations, hex.EncodeToString(salt), hex.EncodeToString(dk))
 }
 
 // hashEq 常量时间比较十六进制摘要，避免时序侧信道。
@@ -183,32 +229,50 @@ func hashEq(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+// verifyPasswd 校验口令，兼容四种历史格式：
+// pbkdf2$..., salt+sha256, 96 字符 salt+hash 连写, 无盐 sha256（最老格式）。
+// 校验通过且格式较旧时原地升级为 PBKDF2。
 func verifyPasswd(user *User, password string) bool {
+	if strings.HasPrefix(user.Password, "pbkdf2$") {
+		parts := strings.Split(user.Password, "$")
+		if len(parts) != 4 {
+			return false
+		}
+		iter, err := strconv.Atoi(parts[1])
+		if err != nil || iter <= 0 || iter > 10_000_000 {
+			return false
+		}
+		salt, err := hex.DecodeString(parts[2])
+		if err != nil {
+			return false
+		}
+		want := parts[3]
+		got := hex.EncodeToString(pbkdf2SHA256([]byte(password), salt, iter, 32))
+		return hashEq(want, got)
+	}
+	ok := false
 	if user.Salt != "" {
 		h := sha256.Sum256([]byte(user.Salt + password))
-		return hashEq(user.Password, hex.EncodeToString(h[:]))
-	}
-	if len(user.Password) == 96 {
+		ok = hashEq(user.Password, hex.EncodeToString(h[:]))
+	} else if len(user.Password) == 96 {
 		salt := user.Password[:32]
 		h := sha256.Sum256([]byte(salt + password))
 		if hashEq(user.Password[32:], hex.EncodeToString(h[:])) {
-			user.Salt = salt
-			user.Password = user.Password[32:]
-			globalUsers.save()
-			return true
+			ok = true
 		}
+	} else {
+		h := sha256.Sum256([]byte(password))
+		ok = hashEq(user.Password, hex.EncodeToString(h[:]))
 	}
-	h := sha256.Sum256([]byte(password))
-	if hashEq(user.Password, hex.EncodeToString(h[:])) {
-		salt := make([]byte, 16)
-		rand.Read(salt)
-		user.Salt = hex.EncodeToString(salt)
-		h2 := sha256.Sum256([]byte(user.Salt + password))
-		user.Password = hex.EncodeToString(h2[:])
-		globalUsers.save()
-		return true
+	if !ok {
+		return false
 	}
-	return false
+	// 成功登录即升级到 PBKDF2（不需要用户改密）。Get 返回副本，
+	// 必须 Update 回存储，否则升级只发生在局部变量上。
+	user.Salt = ""
+	user.Password = hashPasswd(password)
+	globalUsers.Update(user)
+	return true
 }
 
 // tokenEntry 带过期时间的会话令牌。

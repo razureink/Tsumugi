@@ -31,9 +31,17 @@ func TestScanCondsMatchesMapSemantics(t *testing.T) {
 		d, _, _ := decodeRow(meta, encoded[i])
 		decoded[i] = d
 	}
+	// 旧 schema 短行（ALTER ADD COLUMN 前写入）：只有 id/name 两个编码字段。
+	// decodeRow 对缺失尾部字段零值填充（ok=false），matchRow 必须同样按零值
+	// 求值——此前截断直接判 false，旧行会被条件查询静默排除。
+	shortMeta := &TableMeta{Name: "t", PK: "id", Fields: meta.Fields[:2]}
+	shortEncoded := encodeRow(shortMeta, rows[0], 0, 0)
+	shortDecoded, _, _ := decodeRow(meta, shortEncoded)
+	encoded = append(encoded, shortEncoded)
+	decoded = append(decoded, shortDecoded)
 
 	vals := []interface{}{
-		nil, int64(1), int64(-5), int64(1 << 40), 1.0, 2.5, "", "alpha", "zzz", true, false, []byte("x"),
+		nil, int64(1), int64(-5), int64(1 << 40), int(1), int(300), 1.0, 2.5, "", "alpha", "zzz", true, false, []byte("x"),
 	}
 	ops := []string{"gt", "ge", "lt", "le", "ne", "between"}
 
@@ -103,5 +111,79 @@ func TestSelectCaseInsensitiveWhere(t *testing.T) {
 		if len(rows) != c.wantRows {
 			t.Errorf("%s: got %d rows, want %d", c.sql, len(rows), c.wantRows)
 		}
+	}
+}
+
+// TestSelectStarRowWidth 行宽回归：所有扫描路径（主键点查/条件/OR/无条件）
+// 返回的每行值个数必须与列头一致且值正确。rowArena stride 曾误用 len(colIdx)，
+// SELECT * 时为 0 被钳成 1 列，条件/OR 路径的命中行被截断成只剩首列
+// （行数仍正确，只数行数的测试发现不了）。
+func TestSelectStarRowWidth(t *testing.T) {
+	SetLogMute(true)
+	db, err := NewDB(walTestConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	stmts := []string{
+		"CREATE TABLE rw (id INT, name STRING, ok BOOL, PRIMARY KEY (id))",
+		"INSERT INTO rw VALUES (1, 'one', true)",
+		"INSERT INTO rw VALUES (2, 'two', false)",
+	}
+	for _, s := range stmts {
+		if _, _, _, _, err := db.runSQL(s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+	cases := []struct {
+		sql  string
+		want [][]interface{}
+	}{
+		// 条件路径（非主键等值）
+		{"SELECT * FROM rw WHERE name = 'two'", [][]interface{}{{int64(2), "two", false}}},
+		{"SELECT * FROM rw WHERE ok = false", [][]interface{}{{int64(2), "two", false}}},
+		// 条件路径（非主键范围 → filters）
+		{"SELECT * FROM rw WHERE name >= 'a'", [][]interface{}{{int64(1), "one", true}, {int64(2), "two", false}}},
+		// OR 路径
+		{"SELECT * FROM rw WHERE id=1 OR id=2", [][]interface{}{{int64(1), "one", true}, {int64(2), "two", false}}},
+		// 主键点查路径
+		{"SELECT * FROM rw WHERE id = 1", [][]interface{}{{int64(1), "one", true}}},
+		// 命名列（含乱序投影）
+		{"SELECT name, id FROM rw WHERE id = 2", [][]interface{}{{"two", int64(2)}}},
+		{"SELECT name FROM rw WHERE ok = false", [][]interface{}{{"two"}}},
+	}
+	for _, c := range cases {
+		columns, rows, _, _, err := db.runSQL(c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		if len(rows) != len(c.want) {
+			t.Errorf("%s: got %d rows, want %d", c.sql, len(rows), len(c.want))
+			continue
+		}
+		for i, row := range rows {
+			if len(row) != len(columns) {
+				t.Errorf("%s: row %d has %d values, header has %d cols: %v", c.sql, i, len(row), len(columns), row)
+				continue
+			}
+			for j := range row {
+				if row[j] != c.want[i][j] {
+					t.Errorf("%s: row %d col %s = %#v, want %#v", c.sql, i, columns[j], row[j], c.want[i][j])
+				}
+			}
+		}
+	}
+}
+
+// TestAsciiEqNoPunctuationFold 标点不得折叠进字母：'{' 折叠后等于 '['、
+// '|' 等于 '\\'、'~' 等于 '^' 曾因折叠范围无上界而返回真。
+func TestAsciiEqNoPunctuationFold(t *testing.T) {
+	for _, pair := range [][2]string{{"{", "["}, {"|", "\\"}, {"~", "^"}, {"a{c", "a[c"}} {
+		if asciiEq(pair[0], pair[1]) {
+			t.Errorf("asciiEq(%q, %q) = true, punctuation must not fold", pair[0], pair[1])
+		}
+	}
+	if !asciiEq("select", "SELECT") || !asciiEq("SeLeCt", "select") || asciiEq("selectx", "select") {
+		t.Error("asciiEq letter folding broken")
 	}
 }

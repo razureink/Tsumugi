@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"fmt"
@@ -9,15 +9,19 @@ import (
 // renderApp 渲染统一应用页面（侧边栏布局，监控 + 数据管理两个视图）。
 func renderApp(w http.ResponseWriter, db *DB, page string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 面板样式内嵌在 HTML 里：升级后必须回源，否则浏览器会拿缓存里的旧配色
+	w.Header().Set("Cache-Control", "no-store")
 	html := strings.Replace(appHTML, "__APP_PAGE__", page, 1)
 	html = strings.Replace(html, "/*__I18N__*/", cachedDashDictJS(), 1)
 	html = strings.Replace(html, "/*__PORTS__*/", buildPortsJS(db), 1)
-	fmt.Fprint(w, html)
+	// 图标字体：本地优先 + 缺字体时降级（见 panel_icons.go）
+	fmt.Fprint(w, injectPanelAssets(html))
 }
 
 // buildPortsJS 生成前端端口默认值 JS，避免与 Go 侧默认端口重复维护。
 func buildPortsJS(db *DB) string {
-	return fmt.Sprintf("var PORTS={binary:%d,metrics:%d,mysql:%d};", db.config.Port, db.config.MetricsPort, db.config.MySQLPort)
+	cfg := db.configSnapshot()
+	return fmt.Sprintf("var PORTS={binary:%d,metrics:%d,mysql:%d};", cfg.Port, cfg.MetricsPort, cfg.MySQLPort)
 }
 
 // appHTML is the complete single-page application: sidebar navigation, real-time monitoring,
@@ -29,6 +33,7 @@ const appHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Tsumugi · 控制台</title>
+<script>try{if(localStorage.getItem('tsumugi_tone')==='hc')document.documentElement.classList.add('hc');}catch(e){}</script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto+Flex:opsz,wght,wdth@8..144,300..800,75..125&display=swap">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@48,400,0,0">
@@ -65,6 +70,11 @@ const appHTML = `<!DOCTYPE html>
     --r-none:0px;--r-xs:4px;--r-sm:8px;--r-md:12px;
     --r-lg:16px;--r-xl:28px;--r-full:9999px;
     --acc:#FF6B9D;--acc-soft:rgba(255,107,157,.14);
+    /* 高对比强调色：图表/指标/状态用，避免整页只有粉色系 */
+    --c-red:#DC2626;--c-amber:#B45309;--c-green:#15803D;--c-cyan:#0E7490;--c-blue:#1D4ED8;--c-violet:#6D28D9;
+    --c-red-line:#E5484D;--c-amber-line:#F59E0B;--c-green-line:#16A34A;--c-cyan-line:#0E9384;--c-blue-line:#2563EB;--c-violet-line:#7C3AED;
+    /* 高对比色：近黑 ↔ 纯白（对 --sf 对比度 ≈ 18:1，AAA） */
+    --c-hc:#121014;--c-on-hc:#FFFFFF;
     --glow:0 10px 34px rgba(232,96,124,.14);
   }
   @media(prefers-color-scheme:dark){:root{
@@ -78,10 +88,12 @@ const appHTML = `<!DOCTYPE html>
     --sc0:#120D10;--sc1:#1E1619;--sc2:#231A1E;
     --sc3:#2D2025;--sc4:#382D32;
     --inv-sf:#F0E0E6;--on-inv-sf:#3D2832;--inv-pri:#E8607C;
+    --c-red:#FCA5A5;--c-amber:#FCD34D;--c-green:#86EFAC;--c-cyan:#5EEAD4;--c-blue:#93C5FD;--c-violet:#C4B5FD;
+    --c-hc:#FFFFFF;--c-on-hc:#121014;
   --pri-20:#5C1228;--pri-90:#FFE4EB;
   }}
   *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;color:var(--on-sf);min-height:100vh;background:radial-gradient(1200px 620px at 78% -8%,rgba(232,96,124,.12),transparent 62%),radial-gradient(900px 560px at 8% 108%,var(--acc-soft),transparent 58%),var(--sf);font-size:14px;line-height:1.5;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
+  body{font-family:'Roboto Flex','Roboto',system-ui,sans-serif;color:var(--on-sf);min-height:100vh;background:radial-gradient(1200px 620px at 78% -8%,rgba(232,96,124,.12),transparent 62%),radial-gradient(900px 560px at 8% 108%,var(--acc-soft),transparent 58%),radial-gradient(760px 460px at 96% 88%,rgba(37,99,235,.10),transparent 62%),radial-gradient(680px 420px at 46% 112%,rgba(124,58,237,.09),transparent 60%),var(--sf);font-size:14px;line-height:1.5;font-optical-sizing:auto;-webkit-font-smoothing:antialiased}
   .mono{font-family:'Fira Code','Roboto Flex',monospace;font-variant-numeric:tabular-nums}
   .layout{display:flex;min-height:100vh;gap:16px;padding:18px}
   .side{width:272px;flex-shrink:0;border-radius:var(--r-xl);padding:18px 10px;position:sticky;top:18px;height:calc(100vh - 36px);display:flex;flex-direction:column;gap:2px;background:linear-gradient(180deg,var(--sc3),var(--sc2));border:none;box-shadow:0 1px 2px rgba(0,0,0,.03),0 8px 32px rgba(0,0,0,.06);overflow:hidden}
@@ -160,6 +172,19 @@ const appHTML = `<!DOCTYPE html>
   .chip::after{content:'';position:absolute;inset:0;border-radius:inherit;box-shadow:inset 0 0 0 1px var(--ol-var);pointer-events:none}
   .chip:hover{transform:translateY(-3px);box-shadow:0 8px 22px rgba(0,0,0,.08)}
   .chip .mat{font-size:24px;color:var(--pri)}
+ /* 高对比强调色：图标/指示点（.chip .mat 权重更高，需单独覆盖） */
+ .ic-red{color:var(--c-red)}.ic-amber{color:var(--c-amber)}.ic-green{color:var(--c-green)}.ic-cyan{color:var(--c-cyan)}.ic-blue{color:var(--c-blue)}.ic-violet{color:var(--c-violet)}
+ .chip .mat.ic-red{color:var(--c-red)}.chip .mat.ic-amber{color:var(--c-amber)}.chip .mat.ic-green{color:var(--c-green)}.chip .mat.ic-cyan{color:var(--c-cyan)}.chip .mat.ic-blue{color:var(--c-blue)}.chip .mat.ic-violet{color:var(--c-violet)}
+ .dot-red{background:var(--c-red-line)}.dot-amber{background:var(--c-amber-line)}.dot-green{background:var(--c-green-line)}.dot-cyan{background:var(--c-cyan-line)}.dot-blue{background:var(--c-blue-line)}.dot-violet{background:var(--c-violet-line)}
+ /* 高对比色 --c-hc：近黑/纯白对（浅底 18:1，深底 18:1），用于强调数字与状态 */
+ .chip .c-value{color:var(--c-hc)}
+ .chip:has(.ic-blue){box-shadow:inset 4px 0 0 var(--c-blue)}
+ .chip:has(.ic-red){box-shadow:inset 4px 0 0 var(--c-hc)}
+ .chip:has(.ic-amber){box-shadow:inset 4px 0 0 var(--c-amber)}
+ .chip:has(.ic-cyan){box-shadow:inset 4px 0 0 var(--c-cyan)}
+ .chip:has(.ic-violet){box-shadow:inset 4px 0 0 var(--c-violet)}
+ .chip:has(.ic-green){box-shadow:inset 4px 0 0 var(--c-green)}
+ .nav.active{box-shadow:inset 4px 0 0 var(--c-hc),0 1px 2px rgba(0,0,0,.1)}
   .chip .c-label{font-size:11px;color:var(--ol);font-weight:600;letter-spacing:.6px;text-transform:uppercase}
   .chip .c-value{font-size:18px;font-weight:800;color:var(--on-sf);font-variation-settings:'wght' 800;font-family:'Fira Code',monospace}
   .chip .c-mini{font-size:11px;color:var(--ol);font-weight:500}
@@ -239,6 +264,24 @@ const appHTML = `<!DOCTYPE html>
 .tone-opt:hover{transform:scale(1.12);box-shadow:0 4px 14px rgba(0,0,0,.18)}
 .tone-opt.active{border-color:var(--on-sf);box-shadow:0 0 0 3px var(--sf),0 0 0 5px var(--on-sf)}
 .tone-label{font-size:11px;text-align:center;margin-top:6px;color:var(--on-sf-var);font-weight:500}
+/* 高对比模式（设置 → 色调 → 高对比）：纯黑白、2px 实边、去渐变去柔影 */
+html.hc{--sf:#FFFFFF;--on-sf:#000000;--sf-dim:#F2F2F2;--sf-bri:#FFFFFF;--sf-var:#1F1F1F;--on-sf-var:#1F1F1F;--ol:#000000;--ol-var:#000000;--sc0:#FFFFFF;--sc1:#F2F2F2;--sc2:#E6E6E6;--sc3:#D9D9D9;--sc4:#BFBFBF;--pri:#000000;--on-pri:#FFFFFF;--pri-ctn:#FFFFFF;--on-pri-ctn:#000000;--sec:#000000;--on-sec:#FFFFFF;--sec-ctn:#FFFFFF;--on-sec-ctn:#000000;--ter:#000000;--on-ter:#FFFFFF;--ter-ctn:#FFFFFF;--on-ter-ctn:#000000;--err:#B00020;--on-err:#FFFFFF;--err-ctn:#FFFFFF;--on-err-ctn:#B00020;--acc:#000000;--acc-soft:rgba(0,0,0,.10);--glow:none;--c-hc:#000000;--c-on-hc:#FFFFFF}
+html.hc body{background:#FFFFFF}
+html.hc .side,html.hc .card,html.hc .chip,html.hc .trend-card,html.hc .ring-card,html.hc .modal,html.hc .txt,html.hc select.txt{background:#FFFFFF!important;border:2px solid #000000!important;box-shadow:none!important}
+html.hc .side::after{box-shadow:none!important}
+html.hc .hero,html.hc .logo{background:#000000!important;color:#FFFFFF!important;box-shadow:none!important}
+html.hc .btn-fill{background:#000000!important;color:#FFFFFF!important;box-shadow:none!important}
+html.hc .btn-tonal{background:#FFFFFF!important;color:#000000!important;border:2px solid #000000;box-shadow:none!important}
+html.hc .btn-text{color:#000000!important}
+html.hc .field-label,html.hc .c-label,html.hc .side-foot,html.hc .c-mini,html.hc .sub{color:#1F1F1F!important}
+html.hc .txt:focus{outline:3px solid #000000;outline-offset:1px;box-shadow:none!important}
+html.hc .divider{background:#000000!important;height:2px}
+html.hc .ring-track{stroke:#000000!important;opacity:.2}
+html.hc .nav.active{background:#000000!important;color:#FFFFFF!important;box-shadow:none!important}
+html.hc .nav.active .mat{color:#FFFFFF!important}
+html.hc .chip .c-value{color:#000000}
+html.hc .tone-opt.active{border-color:#000000;box-shadow:0 0 0 3px #FFF,0 0 0 5px #000}
+html.hc .t-name .dot{box-shadow:none!important}
 @media(max-width:820px){.layout{flex-direction:column;gap:0;padding:0}.side{width:100%;height:auto;position:static;padding:14px;border-radius:0;box-shadow:none}.main{padding:18px}}
 </style>
 </head>
@@ -278,13 +321,13 @@ const appHTML = `<!DOCTYPE html>
       </div>
 
       <div class="rings">
-        <div class="ring-card" onclick="showCurve('cpu',t('ringCPU'),'#B3261E')">
+        <div class="ring-card" onclick="showCurve('cpu',t('ringCPU'),'#E5484D')">
           <div class="ring-wrap"><svg viewBox="0 0 120 120"><circle class="ring-track" cx="60" cy="60" r="52"/><circle class="ring-fill" id="ringCpu" cx="60" cy="60" r="52"/></svg>
             <div class="ring-center"><div class="ring-value" id="cpuVal">--</div><div class="ring-unit">%</div></div></div>
           <div class="ring-label"><span class="mat material-symbols-outlined" style="font-size:18px">memory</span><span data-t="ringCPU">CPU 使用率</span></div>
           <div class="ring-sub" id="cpuSub">--</div>
         </div>
-        <div class="ring-card" onclick="showCurve('mem',t('ringMem'),'#018786')">
+        <div class="ring-card" onclick="showCurve('mem',t('ringMem'),'#0E9384')">
           <div class="ring-wrap"><svg viewBox="0 0 120 120"><circle class="ring-track" cx="60" cy="60" r="52"/><circle class="ring-fill" id="ringMem" cx="60" cy="60" r="52"/></svg>
             <div class="ring-center"><div class="ring-value" id="memVal">--</div><div class="ring-unit">%</div></div></div>
           <div class="ring-label"><span class="mat material-symbols-outlined" style="font-size:18px">memory_alt</span><span data-t="ringMem">内存占用</span></div>
@@ -311,21 +354,21 @@ const appHTML = `<!DOCTYPE html>
       </div>
 
       <div class="chips">
-        <div class="chip"><span class="mat material-symbols-outlined">database</span><div><div class="c-label" data-t="chTotal">总命令</div><div class="c-value" id="totalCmds">-</div></div><div class="c-mini" id="totalCmdsRate"></div></div>
-        <div class="chip"><span class="mat material-symbols-outlined">warning</span><div><div class="c-label" data-t="chErr">错误</div><div class="c-value" id="totalErrs">-</div></div><div class="c-mini" id="totalErrsRate"></div></div>
-        <div class="chip"><span class="mat material-symbols-outlined">local_fire_department</span><div><div class="c-label" data-t="chTopCmd">最热命令</div><div class="c-value" id="topCmd">-</div></div><div class="c-mini" id="topCmdCount"></div></div>
-        <div class="chip"><span class="mat material-symbols-outlined">schedule</span><div><div class="c-label" data-t="chUptime">运行时长</div><div class="c-value" id="uptime">-</div></div><div class="c-mini" data-t="uptime">已运行</div></div>
-        <div class="chip"><span class="mat material-symbols-outlined">dns</span><div><div class="c-label" data-t="chThreads">协程 / 核</div><div class="c-value" id="goroutines">-</div></div><div class="c-mini" id="numCpu"></div></div>
-        <div class="chip"><span class="mat material-symbols-outlined">save</span><div><div class="c-label" data-t="chDura">持久化</div><div class="c-value" id="durability">-</div></div><div class="c-mini" id="flushInfo"></div></div>
+        <div class="chip"><span class="mat material-symbols-outlined ic-blue">database</span><div><div class="c-label" data-t="chTotal">总命令</div><div class="c-value" id="totalCmds">-</div></div><div class="c-mini" id="totalCmdsRate"></div></div>
+        <div class="chip"><span class="mat material-symbols-outlined ic-red">warning</span><div><div class="c-label" data-t="chErr">错误</div><div class="c-value" id="totalErrs">-</div></div><div class="c-mini" id="totalErrsRate"></div></div>
+        <div class="chip"><span class="mat material-symbols-outlined ic-amber">local_fire_department</span><div><div class="c-label" data-t="chTopCmd">最热命令</div><div class="c-value" id="topCmd">-</div></div><div class="c-mini" id="topCmdCount"></div></div>
+        <div class="chip"><span class="mat material-symbols-outlined ic-cyan">schedule</span><div><div class="c-label" data-t="chUptime">运行时长</div><div class="c-value" id="uptime">-</div></div><div class="c-mini" data-t="uptime">已运行</div></div>
+        <div class="chip"><span class="mat material-symbols-outlined ic-violet">dns</span><div><div class="c-label" data-t="chThreads">协程 / 核</div><div class="c-value" id="goroutines">-</div></div><div class="c-mini" id="numCpu"></div></div>
+        <div class="chip"><span class="mat material-symbols-outlined ic-green">save</span><div><div class="c-label" data-t="chDura">持久化</div><div class="c-value" id="durability">-</div></div><div class="c-mini" id="flushInfo"></div></div>
       </div>
 
       <div class="card">
         <h3 data-t="trendTitle"><span class="mat material-symbols-outlined">show_chart</span>实时趋势（最近 60s）</h3>
         <div class="trend-grid">
-          <div class="trend-card"><div class="t-name"><span class="dot" style="background:#E8607C"></span>QPS<div class="t-val" id="trQps">--</div></div><svg id="svgQps"></svg></div>
-          <div class="trend-card"><div class="t-name"><span class="dot" style="background:#2F6DF6"></span>TPS<div class="t-val" id="trTps">--</div></div><svg id="svgTps"></svg></div>
-          <div class="trend-card"><div class="t-name"><span class="dot" style="background:#B3261E"></span>CPU %<div class="t-val" id="trCpu">--</div></div><svg id="svgCpu"></svg></div>
-          <div class="trend-card"><div class="t-name" data-t="trendDisk"><span class="dot" style="background:#00696D"></span>磁盘 MB/s<div class="t-val" id="trDisk">--</div></div><svg id="svgDisk"></svg></div>
+          <div class="trend-card"><div class="t-name"><span class="dot dot-violet"></span>QPS<div class="t-val" id="trQps">--</div></div><svg id="svgQps"></svg></div>
+          <div class="trend-card"><div class="t-name"><span class="dot dot-blue"></span>TPS<div class="t-val" id="trTps">--</div></div><svg id="svgTps"></svg></div>
+          <div class="trend-card"><div class="t-name"><span class="dot dot-red"></span>CPU %<div class="t-val" id="trCpu">--</div></div><svg id="svgCpu"></svg></div>
+          <div class="trend-card"><div class="t-name" data-t="trendDisk"><span class="dot dot-amber"></span>磁盘 MB/s<div class="t-val" id="trDisk">--</div></div><svg id="svgDisk"></svg></div>
         </div>
       </div>
 
@@ -603,7 +646,7 @@ var curTable=null, afterPK=-1, _nextPk=-1, rowCount=0;
 var hist = {cpu:[], mem:[], qps:[], tps:[], disk:[]};
 var maxQps=10, maxTps=10, maxDisk=1;
 var prevStats=null, prevTime=Date.now();
-var RING_COLOR={cpu:'#B3261E',mem:'#018786',qps:'#E8607C',tps:'#2F6DF6',disk:'#00696D'};
+var RING_COLOR={cpu:'#E5484D',mem:'#0E9384',qps:'#7C3AED',tps:'#2563EB',disk:'#F59E0B'};
 var RING_UNIT={cpu:'%',mem:'%',qps:' /s',tps:' /s',disk:' MB/s'};
 
 function $(id){return document.getElementById(id);}
@@ -615,7 +658,7 @@ function jsEsc(s){return String(s==null?'':s).replace(/\\/g,'\\\\').replace(/'/g
 function toast(m,isErr){var t=$('toast');t.textContent=m;t.className='toast'+(isErr?' err':'')+' show';setTimeout(function(){t.classList.remove('show');},2400);}
 function fmt(n,d){return (n===null||n===undefined)?'--':Number(n).toFixed(d);}
 function fmtUptime(sec){sec=sec||0;var h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=sec%60;var p=[];if(h>0)p.push(h+'h');if(m>0)p.push(m+'m');p.push(s+'s');return p.join(' ');}
-function pctColor(p){if(p>=90)return '#b3261e';if(p>=70)return '#f4a300';return '#1e7b4c';}
+function pctColor(p){if(p>=90)return '#E5484D';if(p>=70)return '#F59E0B';return '#16A34A';}
 function setRing(id,pct,color){var r=$('ring'+id.charAt(0).toUpperCase()+id.slice(1));if(!r)return;var o=327-327*Math.max(0,Math.min(100,pct))/100;r.style.stroke=color;r.style.strokeDashoffset=o;}
 
 /* ---- i18n ---- */
@@ -678,7 +721,8 @@ var TONE_PRESETS={
   teal:{name:'青色',pri:'#26A69A',priCtn:'#E0F2F1',onPriCtn:'#00695C',ter:'#80CBC4',acc:'#26C6DA',glow:'rgba(38,166,154,.14)'},
   orange:{name:'橙色',pri:'#FF7043',priCtn:'#FBE9E7',onPriCtn:'#BF360C',ter:'#FFAB91',acc:'#FF8A65',glow:'rgba(255,112,67,.14)'},
   green:{name:'绿色',pri:'#66BB6A',priCtn:'#E8F5E9',onPriCtn:'#1B5E20',ter:'#A5D6A7',acc:'#4CAF50',glow:'rgba(102,187,106,.14)'},
-  red:{name:'红色',pri:'#EF5350',priCtn:'#FFEBEE',onPriCtn:'#B71C1C',ter:'#EF9A9A',acc:'#F44336',glow:'rgba(239,83,80,.14)'}
+  red:{name:'红色',pri:'#EF5350',priCtn:'#FFEBEE',onPriCtn:'#B71C1C',ter:'#EF9A9A',acc:'#F44336',glow:'rgba(239,83,80,.14)'},
+  hc:{name:'高对比',pri:'#000000',priCtn:'#FFFFFF',onPriCtn:'#000000',ter:'#000000',acc:'#000000',glow:'rgba(0,0,0,.18)'}
 };
 function hexToRgb(h){var r=parseInt(h.slice(1,3),16),g=parseInt(h.slice(3,5),16),b=parseInt(h.slice(5,7),16);return[r,g,b];}
 function rgbToHex(r,g,b){return '#'+[r,g,b].map(function(x){var s=Math.max(0,Math.min(255,Math.round(x))).toString(16);return s.length<2?'0'+s:s;}).join('');}
@@ -689,6 +733,8 @@ var curTone=localStorage.getItem('tsumugi_tone')||'pink';
 function applyTone(name){
   var p=TONE_PRESETS[name];if(!p)return;
   var r=document.documentElement.style;
+  /* 高对比是"模式"而不是单纯换主色：整页切到纯黑白 + 实边风格 */
+  document.documentElement.classList.toggle('hc',name==='hc');
   r.setProperty('--pri',p.pri);r.setProperty('--pri-ctn',p.priCtn);r.setProperty('--on-pri-ctn',p.onPriCtn);
   r.setProperty('--ter',p.ter);r.setProperty('--acc',p.acc);
   r.setProperty('--glow','0 10px 34px '+p.glow);
@@ -750,11 +796,11 @@ async function fetchStats(force){
     var qps=d.qps||0, tps=d.tps||0;
     if(qps>maxQps)maxQps=qps; if(tps>maxTps)maxTps=tps;
     if(maxQps<10)maxQps=10; if(maxTps<10)maxTps=10;
-    setRingEl('qps',qps/maxQps*100,'#E8607C'); $('qpsVal').textContent=fmt(qps,1); $('qpsSub').textContent=t('peak')+' '+fmt(maxQps,1)+'/s';
-    setRingEl('tps',tps/maxTps*100,'#2f6df6'); $('tpsVal').textContent=fmt(tps,1); $('tpsSub').textContent=t('peak')+' '+fmt(maxTps,1)+'/s';
+    setRingEl('qps',qps/maxQps*100,'#7C3AED'); $('qpsVal').textContent=fmt(qps,1); $('qpsSub').textContent=t('peak')+' '+fmt(maxQps,1)+'/s';
+    setRingEl('tps',tps/maxTps*100,'#2563EB'); $('tpsVal').textContent=fmt(tps,1); $('tpsSub').textContent=t('peak')+' '+fmt(maxTps,1)+'/s';
     var disk=d.wal_write_mb_s||0;
     if(disk>maxDisk)maxDisk=disk; if(maxDisk<0.5)maxDisk=0.5;
-    setRingEl('disk',disk/maxDisk*100,'#00696d'); $('diskVal').textContent=fmt(disk,2);
+    setRingEl('disk',disk/maxDisk*100,'#F59E0B'); $('diskVal').textContent=fmt(disk,2);
     $('diskSub').textContent=t('peak')+' '+fmt(maxDisk,2)+' · fsync '+fmt(d.fsync_per_s||0,0)+'/s';
     $('totalCmds').textContent=d.total_commands||0;
     $('totalErrs').textContent=d.total_errors||0;
@@ -1033,7 +1079,8 @@ async function loadRows(){
   (d.rows||[]).forEach(function(rw,idx){
     b+='<tr><td style="color:var(--ol)">'+(afterPK<0?idx+1:'')+'</td>';
     rw.forEach(function(v){var s=(v===null||v===undefined)?'<span style="color:var(--ol)">NULL</span>':esc(v);b+='<td>'+s+'</td>';});
-    b+='<td><button class="btn btn-text" style="padding:4px 8px;color:var(--err)" onclick="delRow('+esc(JSON.stringify(rw[0]))+')"><span class="material-symbols-outlined" style="font-size:18px">delete</span></button></td></tr>';
+    var rpk=(d.pks&&d.pks[idx]!==undefined)?d.pks[idx]:rw[0];
+    b+='<td><button class="btn btn-text" style="padding:4px 8px;color:var(--err)" onclick="delRow('+esc(JSON.stringify(rpk))+')"><span class="material-symbols-outlined" style="font-size:18px">delete</span></button></td></tr>';
   });
   $('dataGrid').innerHTML='<thead>'+head+'</thead><tbody>'+b+'</tbody>';
   $('pageInfo').textContent=t('rowsTotal',rowCount)+(afterPK<0?t('pageText','1'):t('paging'));
@@ -1310,5 +1357,6 @@ async function deleteUser(name){
   if(v==='users' && token){ loadUsers(); refreshUserDbs(); }
 })();
 </script>
+<!--__PANEL_ASSETS__-->
 </body>
 </html>`

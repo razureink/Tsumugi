@@ -3,23 +3,36 @@ services:
     build: .
     container_name: tsumugi
     restart: unless-stopped
+    # 容器内必须监听所有网卡（bind_host 留空）；对外暴露范围用下面的 ports 控制
     ports:
-      - "9999:9999"      # 二进制协议
-      - "10232:10232"    # 监控 / 管理面板
-      - "3309:3309"      # MySQL 兼容协议
+      - "9999:9999"      # 二进制协议（建议只在内网开放）
+      - "10232:10232"    # 监控 / 管理面板（生产建议改成 "127.0.0.1:10232:10232" 并由反代终止 TLS）
+      - "3309:3309"      # MySQL 兼容协议（按需开放）
     environment:
-      TSUMUGI_DURABILITY: "batch"
+      TSUMUGI_PORT: "9999"
       TSUMUGI_MYSQL: "true"
       TSUMUGI_MYSQL_PORT: "3309"
-      TSUMUGI_PORT: "9999"
+      # fsync：每条提交立即落盘（数据安全优先）；batch：定时批刷，最多丢一个 flush_interval
+      TSUMUGI_DURABILITY: "fsync"
+      # 反代来源：仅当来源命中该网段时才采信 X-Forwarded-For
+      # TSUMUGI_TRUSTED_PROXIES: "172.16.0.0/12"
     volumes:
       - ./data:/app/data
       - ./config:/app/config
       - ./backup:/app/backup
+    # 连接数上限（二进制与 MySQL 共用）
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
-      # 面板端口是 10232（曾误写 8080 导致容器永久 unhealthy）
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:10232/api/setup/status"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:10232/healthz"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

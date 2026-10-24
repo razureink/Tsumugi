@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -38,12 +39,18 @@ func (d Durability) Fsync() bool { return d == DuraFsync }
 
 type Config struct {
 	Port                int
+	BindHost            string // 监听地址：空=全部网卡；生产建议 127.0.0.1 + 反向代理
+	TLSCert             string // 面板 HTTPS 证书路径（与 TLSKey 同时配置才生效）
+	TLSKey              string
+	MaxConns            int      // 二进制协议并发连接上限
+	TrustedProxies      []string // 可信反代 CIDR：命中时才采信 X-Forwarded-For
 	WALDir              string
 	WALFile             string
 	PrivilegeFile       string
 	User                string
 	Password            string // 仅驻内存的兼容字段，不再持久化；认证一律走 PasswordSHA1
 	PasswordSHA1        string // SHA1(password) hex，mysql_native_password 校验用
+	MetricsToken        string // /metrics 抓取令牌（Prometheus 用；与登录会话令牌分离）
 	FlushInterval       time.Duration
 	GroupCommitInterval time.Duration
 	TTLCleanInterval    time.Duration
@@ -58,6 +65,12 @@ type Config struct {
 	CompactIdleSeconds  int
 	CompactMinWALMB     int
 	CompactPeakRate     int
+	// TxnConflict：事务写冲突策略。
+	//   error            —— 默认：提交时校验行版本，冲突则回滚并报错（乐观并发）
+	//   last_write_wins  —— 不做冲突校验，后写者直接覆盖（与 MySQL autocommit 一致，
+	//                       适合 ORM 默认给每条语句套隐式事务的场景：冲突在 COMMIT 才报，
+	//                       驱动层的"语句级重试"根本不会触发）
+	TxnConflict string
 }
 
 // loadDotEnvKV 读取 .env 文件（若存在），返回 KEY=VALUE 映射与是否成功。
@@ -92,27 +105,34 @@ func loadDotEnvKV() (map[string]string, bool) {
 // 指针字段表示"文件中未提供时不覆盖"，便于增量合并。
 // 注意：不再写出明文 password；兼容读取旧文件的 password 字段并迁移为 SHA1。
 type configFile struct {
-	Port               *int    `json:"port"`
-	WALDir             *string `json:"wal_dir"`
-	WALFile            *string `json:"wal_file"`
-	PrivilegeFile      *string `json:"privilege_file"`
-	User               *string `json:"user"`
-	PasswordSHA1       *string `json:"password_sha1,omitempty"`
-	Password           *string `json:"password,omitempty"` // 旧格式兼容读取，保存时不再写出
-	FlushIntervalMS    *int    `json:"flush_interval_ms"`
-	GroupCommitMS      *int    `json:"group_commit_ms"`
-	TTLCleanMS         *int    `json:"ttl_clean_ms"`
-	IdleTimeoutS       *int    `json:"idle_timeout_s"`
-	BackupDir          *string `json:"backup_dir"`
-	MetricsPort        *int    `json:"metrics_port"`
-	EnableChecksum     *bool   `json:"enable_checksum"`
-	Durability         *string `json:"durability"`
-	MySQLEnabled       *bool   `json:"mysql_enabled"`
-	MySQLPort          *int    `json:"mysql_port"`
-	AutoCompact        *bool   `json:"auto_compact"`
-	CompactIdleSeconds *int    `json:"compact_idle_seconds"`
-	CompactMinWALMB    *int    `json:"compact_min_wal_mb"`
-	CompactPeakRate    *int    `json:"compact_peak_rate"`
+	Port               *int     `json:"port"`
+	BindHost           *string  `json:"bind_host,omitempty"`
+	TLSCert            *string  `json:"tls_cert,omitempty"`
+	TLSKey             *string  `json:"tls_key,omitempty"`
+	MaxConns           *int     `json:"max_conns,omitempty"`
+	TrustedProxies     []string `json:"trusted_proxies,omitempty"`
+	WALDir             *string  `json:"wal_dir"`
+	WALFile            *string  `json:"wal_file"`
+	PrivilegeFile      *string  `json:"privilege_file"`
+	User               *string  `json:"user"`
+	PasswordSHA1       *string  `json:"password_sha1,omitempty"`
+	Password           *string  `json:"password,omitempty"` // 旧格式兼容读取，保存时不再写出
+	MetricsToken       *string  `json:"metrics_token,omitempty"`
+	FlushIntervalMS    *int     `json:"flush_interval_ms"`
+	GroupCommitMS      *int     `json:"group_commit_ms"`
+	TTLCleanMS         *int     `json:"ttl_clean_ms"`
+	IdleTimeoutS       *int     `json:"idle_timeout_s"`
+	BackupDir          *string  `json:"backup_dir"`
+	MetricsPort        *int     `json:"metrics_port"`
+	EnableChecksum     *bool    `json:"enable_checksum"`
+	Durability         *string  `json:"durability"`
+	MySQLEnabled       *bool    `json:"mysql_enabled"`
+	MySQLPort          *int     `json:"mysql_port"`
+	AutoCompact        *bool    `json:"auto_compact"`
+	CompactIdleSeconds *int     `json:"compact_idle_seconds"`
+	CompactMinWALMB    *int     `json:"compact_min_wal_mb"`
+	CompactPeakRate    *int     `json:"compact_peak_rate"`
+	TxnConflict        *string  `json:"txn_conflict,omitempty"`
 }
 
 // loadConfigFile 从 /config/tsumugi.json 读取 Tsumugi 自身配置（若存在）。
@@ -130,6 +150,21 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	if raw.Port != nil {
 		cfg.Port = *raw.Port
 	}
+	if raw.BindHost != nil {
+		cfg.BindHost = *raw.BindHost
+	}
+	if raw.TLSCert != nil {
+		cfg.TLSCert = *raw.TLSCert
+	}
+	if raw.TLSKey != nil {
+		cfg.TLSKey = *raw.TLSKey
+	}
+	if raw.MaxConns != nil && *raw.MaxConns > 0 {
+		cfg.MaxConns = *raw.MaxConns
+	}
+	if raw.TrustedProxies != nil {
+		cfg.TrustedProxies = raw.TrustedProxies
+	}
 	if raw.WALDir != nil {
 		cfg.WALDir = *raw.WALDir
 	}
@@ -141,6 +176,9 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	}
 	if raw.User != nil {
 		cfg.User = *raw.User
+	}
+	if raw.MetricsToken != nil {
+		cfg.MetricsToken = *raw.MetricsToken
 	}
 	if raw.PasswordSHA1 != nil {
 		cfg.PasswordSHA1 = *raw.PasswordSHA1
@@ -192,6 +230,9 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	if raw.CompactPeakRate != nil {
 		cfg.CompactPeakRate = *raw.CompactPeakRate
 	}
+	if raw.TxnConflict != nil {
+		cfg.TxnConflict = *raw.TxnConflict
+	}
 	return existed, true
 }
 
@@ -203,11 +244,17 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 	boolp := func(b bool) *bool { return &b }
 	*f = configFile{
 		Port:               intp(cfg.Port),
+		BindHost:           str(cfg.BindHost),
+		TLSCert:            str(cfg.TLSCert),
+		TLSKey:             str(cfg.TLSKey),
+		MaxConns:           intp(cfg.MaxConns),
+		TrustedProxies:     cfg.TrustedProxies,
 		WALDir:             str(cfg.WALDir),
 		WALFile:            str(cfg.WALFile),
 		PrivilegeFile:      str(cfg.PrivilegeFile),
 		User:               str(cfg.User),
 		PasswordSHA1:       str(cfg.PasswordSHA1),
+		MetricsToken:       str(cfg.MetricsToken),
 		FlushIntervalMS:    intp(int(cfg.FlushInterval / time.Millisecond)),
 		GroupCommitMS:      intp(int(cfg.GroupCommitInterval / time.Millisecond)),
 		TTLCleanMS:         intp(int(cfg.TTLCleanInterval / time.Millisecond)),
@@ -222,6 +269,7 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 		CompactIdleSeconds: intp(cfg.CompactIdleSeconds),
 		CompactMinWALMB:    intp(cfg.CompactMinWALMB),
 		CompactPeakRate:    intp(cfg.CompactPeakRate),
+		TxnConflict:        str(cfg.TxnConflict),
 	}
 }
 
@@ -255,6 +303,9 @@ func applyEnvToConfig(cfg *Config) {
 	if v := os.Getenv("TSUMUGI_MYSQL"); v != "" {
 		cfg.MySQLEnabled = getenvBool("TSUMUGI_MYSQL", cfg.MySQLEnabled)
 	}
+	if v := os.Getenv("TSUMUGI_TXN_CONFLICT"); v == "error" || v == "last_write_wins" {
+		cfg.TxnConflict = v
+	}
 	if p := os.Getenv("TSUMUGI_MYSQL_PORT"); p != "" {
 		if n, ok := parsePort(p); ok {
 			cfg.MySQLPort = n
@@ -273,6 +324,28 @@ func applyEnvToConfig(cfg *Config) {
 			cfg.Port = n
 		}
 	}
+	if v := os.Getenv("TSUMUGI_BIND_HOST"); v != "" {
+		cfg.BindHost = v
+	}
+	if v := os.Getenv("TSUMUGI_TLS_CERT"); v != "" {
+		cfg.TLSCert = v
+	}
+	if v := os.Getenv("TSUMUGI_TLS_KEY"); v != "" {
+		cfg.TLSKey = v
+	}
+	if v := os.Getenv("TSUMUGI_MAX_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxConns = n
+		}
+	}
+	if v := os.Getenv("TSUMUGI_TRUSTED_PROXIES"); v != "" {
+		cfg.TrustedProxies = strings.Split(v, ",")
+	}
+}
+
+// listenAddr 拼接监听地址：BindHost 为空表示监听所有网卡（JoinHostPort 会生成 ":port"）。
+func (c *Config) listenAddr(port int) string {
+	return net.JoinHostPort(c.BindHost, strconv.Itoa(port))
 }
 
 // applyDotEnvToConfig 把 .env 解析出的 TSUMUGI_* 值写入 cfg（用于迁移）。
@@ -313,7 +386,7 @@ func ensureConfigFile(cfg *Config) {
 	if _, err := os.Stat(tsumugiConfigPath); err == nil {
 		return
 	}
-	if err := os.MkdirAll("config", 0755); err != nil {
+	if err := os.MkdirAll("config", 0700); err != nil {
 		logf(LOG_ERR, "create config dir: %v", err)
 		return
 	}
@@ -364,19 +437,39 @@ func normalizeConfig(cfg *Config) {
 	if cfg.CompactPeakRate <= 0 {
 		cfg.CompactPeakRate = 50
 	}
+	// 事务冲突策略：只认 error / last_write_wins，其它值回落到默认
+	switch cfg.TxnConflict {
+	case "error", "last_write_wins":
+	default:
+		cfg.TxnConflict = "error"
+	}
 	if !cfg.Durability.Valid() {
 		cfg.Durability = DuraBatch
+	}
+	if cfg.MaxConns < 16 {
+		cfg.MaxConns = 512
+	}
+	if cfg.MaxConns > 65536 {
+		cfg.MaxConns = 65536
+	}
+	// 证书只配了一半时明确告警：否则会静默降级成明文 HTTP
+	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {
+		logf(LOG_WARN, "tls_cert/tls_key must be configured together; HTTPS disabled")
+		cfg.TLSCert, cfg.TLSKey = "", ""
 	}
 }
 
 func loadConfig() *Config {
 	cfg := &Config{
-		Port:                9999,
-		WALDir:              "./data",
-		WALFile:             "tsumugi.wal",
-		PrivilegeFile:       "privileges.json",
-		User:                "root",
-		Password:            "password",
+		Port:          9999,
+		MaxConns:      512,
+		WALDir:        "./data",
+		WALFile:       "tsumugi.wal",
+		PrivilegeFile: "privileges.json",
+		User:          "root",
+		// 不再内置默认口令：未完成安装向导时 MySQL 端口没有可用的
+		// password_sha1，verifyNativePassword 会直接拒绝（消除 root/password）。
+		Password:            "",
 		FlushInterval:       100 * time.Millisecond,
 		GroupCommitInterval: 2 * time.Millisecond,
 		TTLCleanInterval:    30 * time.Second,
@@ -391,6 +484,7 @@ func loadConfig() *Config {
 		CompactIdleSeconds:  60,
 		CompactMinWALMB:     64,
 		CompactPeakRate:     50,
+		TxnConflict:         "error",
 	}
 	// 顺序很重要：先读已有配置文件（单一事实源），再把 .env 叠加其上。
 	// 旧实现先应用 .env 再读文件，升级用户带残留 .env 时自定义配置会被默认值覆盖。
@@ -416,6 +510,11 @@ func loadConfig() *Config {
 	normalizeConfig(cfg)
 	// 旧文件兼容迁移：明文 password 已换算为 SHA1，立即以新格式回写。
 	if existed && ok && cfg.Password != "" {
+		persistConfig(cfg)
+	}
+	// /metrics 抓取令牌：首次启动自动生成并落盘，避免监控端点裸奔。
+	if cfg.MetricsToken == "" {
+		cfg.MetricsToken = hex.EncodeToString(mustRandom(16))
 		persistConfig(cfg)
 	}
 	return cfg

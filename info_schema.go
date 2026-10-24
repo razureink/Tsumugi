@@ -543,6 +543,79 @@ func (db *DB) createTableStmt(tblName string) string {
 	return sb.String()
 }
 
+// systemTableSelect 把 __tables / __indexes / __stats 的行集映射成结果集，
+// 供 SQL SELECT 路径使用（列顺序固定，行按首列排序保证输出稳定）。
+func (db *DB) systemTableSelect(name string, selectCols []string, colSrc map[string]string) ([]string, [][]interface{}, error) {
+	recs, err := db.getSystemTable(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	var cols []string
+	switch name {
+	case "__tables":
+		cols = []string{"table_name", "pk", "field_count", "index_count"}
+	case "__indexes":
+		cols = []string{"table_name", "index_name", "field"}
+	default:
+		if len(recs) > 0 {
+			for k := range recs[0] {
+				cols = append(cols, k)
+			}
+			sort.Strings(cols)
+		}
+	}
+	if len(cols) == 0 {
+		return nil, nil, fmt.Errorf("system table %s has no rows", name)
+	}
+	sort.Slice(recs, func(i, j int) bool {
+		a, _ := recs[i][cols[0]].(string)
+		b, _ := recs[j][cols[0]].(string)
+		return a < b
+	})
+	outCols := cols
+	var pick []int
+	if selectCols != nil {
+		outCols = nil
+		for _, sc := range selectCols {
+			src := sc
+			if colSrc != nil {
+				if s, ok := colSrc[strings.ToLower(sc)]; ok {
+					src = s
+				}
+			}
+			// 支持 table.col 形式
+			if i := strings.LastIndexByte(src, '.'); i >= 0 {
+				src = src[i+1:]
+			}
+			for i, c := range cols {
+				if strings.EqualFold(src, c) {
+					outCols = append(outCols, sc)
+					pick = append(pick, i)
+					break
+				}
+			}
+		}
+		if len(outCols) == 0 {
+			return nil, nil, fmt.Errorf("no matching columns in %s", name)
+		}
+	}
+	rows := make([][]interface{}, 0, len(recs))
+	for _, r := range recs {
+		row := make([]interface{}, 0, len(outCols))
+		if pick == nil {
+			for _, c := range cols {
+				row = append(row, r[c])
+			}
+		} else {
+			for _, i := range pick {
+				row = append(row, r[cols[i]])
+			}
+		}
+		rows = append(rows, row)
+	}
+	return outCols, rows, nil
+}
+
 // countSelect 处理 SELECT COUNT(*) FROM tbl [WHERE ..]。
 // 目前仅支持纯等值 WHERE（phpMyAdmin 惯例即如此）。
 func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
@@ -557,6 +630,10 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			err = ce
 			return
 		}
+		if e := p.expectEnd(); e != nil {
+			err = e
+			return
+		}
 		it := strings.ToLower(strings.TrimPrefix(tableName, "information_schema."))
 		_, recs, e := db.queryInfoSchema(it, conds, nil, nil)
 		if e != nil {
@@ -565,6 +642,17 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		}
 		columns = []string{"COUNT(*)"}
 		rows = [][]interface{}{{int64(len(recs))}}
+		return
+	}
+	// 系统表：直接按行数返回
+	if base := tableName[strings.LastIndexByte(tableName, '.')+1:]; strings.HasPrefix(base, "__") {
+		_, srows, se := db.systemTableSelect(base, nil, nil)
+		if se != nil {
+			err = se
+			return
+		}
+		columns = []string{"COUNT(*)"}
+		rows = [][]interface{}{{int64(len(srows))}}
 		return
 	}
 	// 物理表
@@ -581,6 +669,26 @@ func (db *DB) countSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	if ce != nil {
 		err = ce
 		return
+	}
+	// 语句必须在此结束：否则 `WHERE a=1 OR b=2` 这类未支持条件会被静默丢弃，
+	// 计数结果与 SQL 语义不符。
+	if e := p.expectEnd(); e != nil {
+		err = e
+		return
+	}
+	// 条件列名按表元数据归一化：matchConditions 用精确 map 键比较，
+	// 若沿用 SQL 原文的大小写（WHERE ID=1 / 字段 id）会静默数出 0 行。
+	if len(conds) > 0 {
+		norm := make(map[string]interface{}, len(conds))
+		for k, v := range conds {
+			idx := t.Meta().fieldIndexOf(k)
+			if idx < 0 {
+				err = fmt.Errorf("unknown column %q in table %s", k, tableName)
+				return
+			}
+			norm[t.Meta().Fields[idx].Name] = v
+		}
+		conds = norm
 	}
 	// 物理表计数：遍历计数而非大 limit 预分配（避免 OOM）
 	// 树为写时复制结构，读者加载根指针后无锁遍历，无需加锁
@@ -730,7 +838,10 @@ func (db *DB) parseScalarExpr(p *sqlParser) (name string, val interface{}, ok bo
 		case "UUID":
 			val = newUUID()
 		default:
-			val = ""
+			// 未知函数：交给通用 SELECT 路径（那里有完整的标量函数求值），
+			// 旧实现直接返回空串，YEAR()/DATE_FORMAT() 等会静默变成 ""。
+			p.i = save
+			return "", nil, false
 		}
 		return strings.ToLower(fn), val, true
 	}

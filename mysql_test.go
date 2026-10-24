@@ -388,7 +388,7 @@ func TestSQLFeatures(t *testing.T) {
 	_ = os.RemoveAll(d)
 	db, err := NewDB(&Config{
 		WALDir: d, WALFile: "wal", PrivilegeFile: "priv.json",
-		User: "root", Password: "password",
+		User: "root", Password: "password", PasswordSHA1: passwordSHA1Hex("password"),
 		FlushInterval: 50 * time.Millisecond, GroupCommitInterval: 2 * time.Millisecond,
 		TTLCleanInterval: 30 * time.Second, IdleTimeout: 5 * time.Minute,
 		BackupDir: filepath.Join(d, "backup"),
@@ -419,7 +419,7 @@ func TestSQLFeatures(t *testing.T) {
 	db.Close()
 	db2, err := NewDB(&Config{
 		WALDir: d, WALFile: "wal", PrivilegeFile: "priv.json",
-		User: "root", Password: "password",
+		User: "root", Password: "password", PasswordSHA1: passwordSHA1Hex("password"),
 		FlushInterval: 50 * time.Millisecond, GroupCommitInterval: 2 * time.Millisecond,
 		TTLCleanInterval: 30 * time.Second, IdleTimeout: 5 * time.Minute,
 		BackupDir: filepath.Join(d, "backup"),
@@ -675,6 +675,7 @@ func newTestDB(t *testing.T) *DB {
 		PrivilegeFile:       "priv.json",
 		User:                "root",
 		Password:            "password",
+		PasswordSHA1:        passwordSHA1Hex("password"),
 		FlushInterval:       100 * time.Millisecond,
 		GroupCommitInterval: 2 * time.Millisecond,
 		TTLCleanInterval:    30 * time.Second,
@@ -752,6 +753,7 @@ func BenchmarkMySQLQuery(b *testing.B) {
 		PrivilegeFile:       "priv.json",
 		User:                "root",
 		Password:            "password",
+		PasswordSHA1:        passwordSHA1Hex("password"),
 		FlushInterval:       100 * time.Millisecond,
 		GroupCommitInterval: 2 * time.Millisecond,
 		TTLCleanInterval:    30 * time.Second,

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -153,12 +154,15 @@ func (db *DB) adminRows(tableName string, afterPK int64, limit int) (map[string]
 	for _, f := range t.Meta().Fields {
 		cols = append(cols, f.Name)
 	}
+	// keyset 分页：afterPK 是上一页最后一行的主键，必须从 afterPK+1 开始，
+	// 否则每页首行与上一页末行重复（scanRangeLimit 的下界是闭区间）。
 	var min *int64
-	if afterPK >= 0 {
-		v := afterPK
+	if afterPK >= 0 && afterPK < math.MaxInt64 {
+		v := afterPK + 1
 		min = &v
 	}
 	rows := make([][]interface{}, 0, limit)
+	pks := make([]int64, 0, limit)
 	nextPK := int64(-1)
 	t.pkTree.scanRangeLimit(min, limit, func(key int64, value []byte) bool {
 		row, _, _ := decodeRow(t.Meta(), value)
@@ -167,12 +171,14 @@ func (db *DB) adminRows(tableName string, afterPK int64, limit int) (map[string]
 			vals = append(vals, row[f.Name])
 		}
 		rows = append(rows, vals)
+		pks = append(pks, key)
 		nextPK = key
 		return false
 	})
 	return map[string]interface{}{
 		"columns":   cols,
 		"rows":      rows,
+		"pks":       pks, // 与 rows 同序：前端删除必须用真实主键，而不是首列
 		"next_pk":   nextPK,
 		"row_count": t.pkTree.Size(),
 	}, nil
@@ -341,6 +347,14 @@ type queryRequest struct {
 	SQL string `json:"sql"`
 }
 
+// truncateForLog 截断过长输入，避免审计日志被单条 SQL 撑爆。
+func truncateForLog(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
 // webSchemaFor 取某令牌的 SQL 控制台会话库（USE 的作用域）。
 // 会话库按 token 隔离，不再写入全局 curDB——否则一个受限用户 USE 后，
 // 其他用户（含管理员）的未限定表名解析都会被带偏，且 canExecTableSQL
@@ -383,8 +397,14 @@ func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	tok := bearerToken(r)
 	schema := db.webSchemaFor(tok)
+	// 一次分词得到语句类型 + 被引用的表：判定不再依赖首词猜测
+	access, aerr := analyzeSQL(req.SQL)
+	if aerr != nil {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": aerr.Error()})
+		return
+	}
 	// USE 在会话层处理：校验后仅对本 token 生效
-	if firstWordUpper(strings.ToUpper(strings.TrimSpace(req.SQL))) == "USE" {
+	if access.Kind == sqlUse {
 		ok, msg := db.handleWebUse(u, tok, req.SQL)
 		if !ok {
 			writeJSON(w, map[string]interface{}{"ok": false, "error": msg})
@@ -393,14 +413,17 @@ func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]interface{}{"ok": true, "message": "Database changed"})
 		return
 	}
-	if ok, reason := u.canExecSQL(strings.ToUpper(req.SQL)); !ok {
-		writeJSON(w, map[string]interface{}{"ok": false, "error": reason})
+	user := ""
+	if u != nil {
+		user = u.Username
+	}
+	if err := db.authorizeSQLIn(user, access, schema); err != nil {
+		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
 	}
-	// 表级 ACL 按当前会话库限定：未限定名在 USE mydb 后指向 mydb.<name>
-	if !u.canExecTableSQLIn(req.SQL, schema) {
-		denyJSON(w, "statement references tables")
-		return
+	// 审计：写/DDL 语句留痕（读查询量大，不记）
+	if access.Kind != sqlRead && access.Kind != sqlUse && u != nil {
+		logf(LOG_VERB, "audit: user=%s action=sql kind=%d sql=%q", u.Username, access.Kind, truncateForLog(req.SQL, 200))
 	}
 	columns, rows, affected, rawMsg, err := db.runSQLSchema(req.SQL, nil, 0, schema)
 	if err != nil {
@@ -493,11 +516,13 @@ func (db *DB) handleRootPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 同上：登录/向导页的样式也是内嵌的，禁止缓存避免升级后仍是旧外观
+	w.Header().Set("Cache-Control", "no-store")
 	// 首次安装：显示向导；已安装：显示登录页
 	if globalUsers.Count() == 0 {
-		fmt.Fprint(w, strings.Replace(setupWizardHTML, "/*__I18N__*/", cachedWizDictJS(), 1))
+		fmt.Fprint(w, injectPanelAssets(strings.Replace(setupWizardHTML, "/*__I18N__*/", cachedWizDictJS(), 1)))
 	} else {
-		fmt.Fprint(w, strings.Replace(loginPageHTML, "/*__I18N__*/", cachedDashDictJS(), 1))
+		fmt.Fprint(w, injectPanelAssets(strings.Replace(loginPageHTML, "/*__I18N__*/", cachedDashDictJS(), 1)))
 	}
 }
 
@@ -558,28 +583,18 @@ func (db *DB) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().Unix(),
 	}
 	globalUsers.Add(admin)
-	// 同时保留 root 账号
-	rootPwd := generatePassword()
-	root := &User{
-		Username:  "root",
-		Password:  hashPasswd(rootPwd),
-		IsAdmin:   true,
-		CanStress: true,
-		CanManage: true,
-		CreatedAt: time.Now().Unix(),
-	}
-	globalUsers.Add(root)
 	// 同步管理员凭据到配置（供 MySQL 协议认证使用）：仅持久化 SHA1 摘要，不落明文
 	// cfgMu 与设置页的并发写入互斥（回归 M2）
 	db.cfgMu.Lock()
 	db.config.User = req.Username
 	db.config.PasswordSHA1 = passwordSHA1Hex(req.Password)
-	db.config.Password = req.Password // 仅驻内存，persistConfig 不写出该字段
+	db.config.Password = "" // 明文只在本函数栈上存在，不驻留、不落盘
 	persistConfig(db.config)
 	db.cfgMu.Unlock()
-	logf(LOG_OK, "setup complete: admin=%s, root password regenerated", req.Username)
+	logf(LOG_OK, "setup complete: admin=%s (MySQL root 账号使用同一口令)", req.Username)
 	tok := adminTokens.issue(req.Username)
-	writeJSON(w, map[string]interface{}{"ok": true, "token": tok, "user": req.Username, "root_password": rootPwd})
+	// 不再把口令回传给浏览器：响应体里的凭据会被代理日志/浏览器历史留存
+	writeJSON(w, map[string]interface{}{"ok": true, "token": tok, "user": req.Username})
 }
 
 // handleUserList 管理员获取用户列表。
