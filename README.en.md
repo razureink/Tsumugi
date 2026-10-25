@@ -1,345 +1,375 @@
 # Tsumugi
 
-Tsumugi (つむぎ, Japanese for "spinning thread") is an embedded relational database implemented from scratch using **only the Go standard library** — zero third-party dependencies. It features a home-grown red-black tree index, WAL crash recovery, transactions, TTL, permissions, and backups, plus a Material Design 3 Expressive real-time monitoring dashboard with a built-in stress tester.
+A single-node, in-memory relational database written with the Go standard library only: data lives in RAM, durability comes from a WAL, and it ships with a monitoring/admin panel plus MySQL wire-protocol compatibility. No third-party dependencies — `go build` is all you need.
 
-> An educational / learning-oriented project: compact code, no external dependencies, and a complete walkthrough of a storage engine, WAL, transactions, and monitoring.
+Built for **small-to-medium, single-node deployments** that want simple SQL, table-level ACLs and a built-in ops panel (cache/session/config/metrics-style data), and as a readable storage-engine reference.
 
----
-
-## ✨ Features
-
-- **Pure standard library**: build and run with a single `go build`.
-- **Core storage engine**: custom Left-leaning Red-Black Tree (LLRB), primary-key index + generic secondary indexes.
-- **Performance**: PK point-lookups skip full scans (O(log n)); buffered WAL writes with periodic fsync; hand-rolled byte encoding replaces reflection; WAL (version 1) uses varint + table-ID compression, `COMPACT` rewrites the WAL to reclaim disk space, and concurrent writes funnel through a single-writer FIFO queue (group commit in fsync mode) to eliminate lock contention.
-- **Fast startup**: WAL recovery reads the file into memory in one pass (no per-field syscalls), replays records in parallel per table, and stores already-encoded rows directly. Measured: 1.24M rows / 81MB WAL restored in ~3s.
-- **WAL crash recovery**: append-only Write-Ahead Log with CRC32 checksums, replayed on restart; truncated trailing records are discarded instead of blocking startup.
-- **Transactions**: BEGIN / COMMIT / ROLLBACK with MVCC-style version-based conflict detection.
-- **Group commit**: batches transaction fsyncs to improve write throughput.
-- **TTL**: per-row expiration with a background cleanup loop.
-- **Permissions**: GRANT / REVOKE table-level privileges (SELECT / INSERT / UPDATE / DELETE / DDL).
-- **Backup**: one-shot snapshot of the WAL and privilege file into a backup directory.
-- **Real-time monitoring**: HTTP `/metrics` (Prometheus format), `/api/stats` (JSON), and `/dashboard` (MD3 Expressive console). Five clickable rings (CPU / memory / QPS / TPS / disk-write-rate) expand into live curves; trend charts, system info, command table and stress tool included.
-- **Data manager**: `/admin` (MD3 Expressive, phpMyAdmin-style) — table list, paginated row browser, SQL console, visual table creation; **login required** (token auth).
-- **Unified console**: `/dashboard` and `/admin` share one sidebar layout and design language.
-- **MySQL protocol**: optional (enable in the Settings page or via `mysql_enabled` in `config/tsumugi.json`), supports handshake + `mysql_native_password` auth + `COM_QUERY`; any MySQL client can connect and run SQL.
-- **First-run wizard**: on first visit, a setup wizard walks you through creating the admin account; there is no default password.
-- **Built-in stress test**: `/stress?duration=10&workers=4` to hammer the engine and watch QPS / TPS live.
-- **System tables**: `__tables`, `__indexes`, `__stats` queryable via SELECT.
+[中文文档](README.md)
 
 ---
 
-## 📦 Project Layout
+## Scope
 
-```
-tsumugi/
-├── main.go          # Entry point
-├── config.go        # Configuration loading
-├── logger.go        # Logging utilities
-├── db.go            # Storage engine: red-black trees, tables, WAL, txn, indexes, TTL, privileges, backup
-├── server.go        # TCP server and binary command protocol handling
-├── metrics.go       # Stats, Prometheus / JSON APIs, dashboard, stress test
-├── go.mod           # Go module
-└── examples/
-    └── client.go    # Example client demonstrating the full protocol
-```
+**Good fit**
+
+- Single node, working set fits in RAM (keep it under ~50% of available memory)
+- Read-heavy workloads, or write throughput that one disk can sustain
+- Internal systems that need table-level permissions, audit logs, a monitoring panel and a load generator
+- Deployments that should be one binary + one data directory
+
+**Not a fit**
+
+- Datasets far larger than RAM (there is no disk tier; the WAL is recovery-only)
+- Multi-replica / sharding / HA (single process, single-writer WAL)
+- Analytical SQL: no `JOIN`, `GROUP BY`, `HAVING`, subqueries, window functions, foreign keys
+- Serializable isolation: optimistic concurrency, same-row concurrent writes are **last-writer-wins**
+- Row locks, `SELECT ... FOR UPDATE`, cursors
 
 ---
 
-## 🚀 Quick Start
+## Features
 
-```bash
-# Start the server
-go run .
+- **Zero dependencies**: pure standard library, `CGO_ENABLED=0` static builds
+- **Custom LLRB indexes**: O(log n) primary-key lookups, copy-on-write secondary indexes with lock-free readers
+- **WAL durability**: append-only + CRC32 + varint records, v3 batch framing (length + whole-batch checksum) for streaming replay, torn-tail truncation on startup, single-writer queue with group commit
+- **Transactions**: `BEGIN / COMMIT / ROLLBACK` with per-row version conflict detection
+- **Row TTL** with a background reaper
+- **Table-level GRANT/REVOKE** (SELECT / INSERT / UPDATE / DELETE / DDL), enforced in the engine, shared by all entry points
+- **MySQL protocol**: handshake, `mysql_native_password`, text protocol, prepared statements (binary rows), `COM_FIELD_LIST`, `COM_SET_OPTION`
+- **Admin panel**: live metrics, row browser, SQL console, visual table builder, user management, backup and WAL compaction
+- **Panel themes**: 7 tones plus a "high contrast" mode (pure black/white, 2px solid borders, no gradients or soft shadows); pick it under Settings → Tone, applies instantly and is remembered in the browser
+- **Observability**: `/metrics` (Prometheus), `/api/stats` (JSON), `/healthz`, audit logs
+- **Built-in load test**: `/stress` drives the real client protocols (native or MySQL)
 
-# In another terminal, run the example client
-go run ./examples
-```
+---
 
-On first visit to <http://localhost:10232/> you'll be guided through a setup wizard to create the admin account, then sign in.
+## Quick start
 
-## Deployment
-
-### Option 1: Docker Compose (recommended)
-
-A Dockerfile and docker-compose.yml are included:
+### Docker Compose
 
 ```bash
 docker compose up -d --build
 ```
 
+Open <http://localhost:10232/> and complete the setup wizard (the setup endpoint only accepts local/private source addresses).
+
 | Port | Purpose |
-| ---- | ---- |
-| 9999 | Binary protocol |
-| 10232 | Dashboard / admin panel |
+| ---- | ------- |
+| 9999 | binary protocol |
+| 10232 | panel / metrics |
 | 3309 | MySQL protocol |
 
-Data is stored in `./data` (mounted as a volume, survives container removal). Useful commands:
+Data, config and backups live in `./data`, `./config`, `./backup`.
 
 ```bash
-docker compose logs -f          # follow logs
-docker compose restart           # restart
-docker compose down              # stop (data stays in ./data)
-docker compose down -v           # stop and wipe data
+docker compose logs -f
+docker compose restart     # SIGTERM, flushes the WAL
+docker compose down
 ```
 
-MySQL protocol is enabled by default in `docker-compose.yml` (`TSUMUGI_MYSQL=true`), with a health check configured.
-
-**Install `tsumugi` / `tsumugi-cli` as host-wide commands**
-
-Both binaries ship inside the image (at `/usr/local/bin`). To call them from any directory on the host, run the bundled script:
+Install the binaries on the host:
 
 ```bash
 sudo ./build.sh
 ```
 
-It extracts the binaries via the multi-stage `binaries` export stage and installs them to `/usr/local/bin`. After that they are available globally:
+### Build from source
 
 ```bash
-tsumugi --help        # server
-tsumugi-cli --help    # command-line client
-```
-
-Manual equivalent (when not using the script):
-
-```bash
-docker compose build
-id=$(docker create tsumugi-tsumugi:latest)
-docker cp "$id:/usr/local/bin/tsumugi" /usr/local/bin/tsumugi
-docker cp "$id:/usr/local/bin/tsumugi-cli" /usr/local/bin/tsumugi-cli
-docker rm "$id"
-```
-
-### Option 2: Build and run directly
-
-Requires Go 1.21+:
-
-```bash
-# build (Linux)
+# Go 1.21+ required (verified on go1.27)
 go build -o tsumugi .
-
-# run
 ./tsumugi
 ```
 
-On Windows you get `tsumugi.exe` — run it from a terminal or double-click. `data/` and `config/` are auto-created next to the binary.
+On first start `config/tsumugi.json`, `data/` and `backup/` are created in the working directory.
 
-Or just:
-
-```bash
-go run .
-```
-
-### Option 3: Custom builds
+### Client examples
 
 ```bash
-# static build, portable to any machine
-CGO_ENABLED=0 go build -o tsumugi .
-
-# cross-compile (e.g. build a Linux binary on Windows)
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o tsumugi .
+go run ./examples                     # binary protocol client
+mysql -h 127.0.0.1 -P 3309 -u root -p # MySQL protocol (enable it first)
 ```
-
-### Production notes
-
-- **Ports**: expose 9999 and 10232 only to your intranet or behind a reverse proxy (Nginx/Caddy); open 3309 only if you need remote MySQL access.
-- **Persistence**: `data/` holds the WAL plus user/privilege files — back it up. With Docker, make sure the `./data` volume is mounted.
-- **Durability**: use `batch` for max throughput (may lose up to one flush interval, default 100ms, on crash); use `fsync` if you cannot afford to lose writes. Changes apply hot, no restart needed.
-- **WAL compaction**: auto `COMPACT` is on by default (idle periods, WAL over 64MB); you can also trigger it manually in the Settings page.
-- **Reverse proxy**: for HTTPS, forward `/`, `/dashboard`, `/admin` and `/api/*` to port 10232 — nothing extra to configure.
-- **First-run flow**: start → visit 10232 → create the admin via the wizard → sign in. - `data/users.json`: panel accounts (salted SHA-256 hashes, mode 0600); `config/tsumugi.json` keeps only a SHA1 digest (`password_sha1`) for MySQL auth - plaintext passwords are never written to disk
-
-Expected output:
-
-```
-[ok] AUTH
-[ok] CREATE TABLE users
-[ok] INSERT id=1 name=Alice age=30
-[ok] INSERT id=2 name=Bob age=25
-[ok] INSERT id=3 name=Carol age=28
-[rows] total=3
-  - id=1 name=Alice age=30 (version=0)
-  - id=2 name=Bob age=25 (version=0)
-  - id=3 name=Carol age=28 (version=0)
-[done]
-```
-
-### Monitoring Dashboard
-
-After startup, visit:
-
-- **Dashboard**: <http://localhost:10232/dashboard>
-- **JSON API**: <http://localhost:10232/api/stats>
-- **Prometheus metrics**: <http://localhost:10232/metrics>
-
-The dashboard's header renders **four MD3 Expressive circular progress gauges** with live metrics:
-
-| Gauge | Source |
-| ---- | ---- |
-| CPU usage | `runtime/metrics` (cumulative process CPU-time delta; cross-platform, stdlib only) |
-| Memory usage | `runtime.ReadMemStats` (HeapAlloc / Sys) |
-| QPS | all commands within the last 1-second sliding window |
-| TPS | write commands within the last 1-second window (INSERT/UPDATE/DELETE/BATCH) |
-
-Info chips below show total commands, errors, hottest command, uptime, and goroutines / cores, followed by a per-command table.
-
-Click **Start Stress Test** on the dashboard, or trigger it directly:
-
-```
-curl "http://localhost:10232/stress?duration=10&workers=4"
-```
-
-The dashboard refreshes QPS / TPS and per-command stats every 2 seconds; watch the gauges and throughput change live while the stress test runs.
 
 ---
 
-## ⚙️ Configuration
+## Production deployment
 
-All settings live in `loadConfig()` inside `config.go`:
+### Sizing
 
-| Field | Default | Description |
-| --- | --- | --- |
-| `Port` | `9999` | TCP server port |
-| `WALDir` | `./data` | Data directory |
-| `WALFile` | `tsumugi.wal` | WAL file name |
-| `PrivilegeFile` | `privileges.json` | Privilege store file |
-| `User` / `Password` | created by setup wizard | Admin account (no default; set during first-run wizard) |
-| `FlushInterval` | `100ms` | Periodic WAL fsync interval (fsync runs outside the write lock, so it never stalls writers) |
-| `GroupCommitInterval` | `2ms` | Group-commit batching window |
-| `TTLCleanInterval` | `30s` | TTL cleanup period |
-| `IdleTimeout` | `60s` | Connection idle timeout |
-| `BackupDir` | `./backup` | Backup directory |
-| `MetricsPort` | `10232` | Monitoring HTTP port |
-| `EnableChecksum` | `true` | CRC32 checksums in WAL |
-| `Durability` | `batch` | Persistence mode: `batch` (periodic batched fsync, max throughput, may lose up to one flush-interval of writes on crash); `fsync` (fsync every write, real-time durability, throughput capped by disk fsync speed) |
-
-> `Durability` can also be set via the `TSUMUGI_DURABILITY` environment variable (`batch` / `fsync`) without recompiling.
-
----
-
-## 📡 Binary Protocol
-
-Clients communicate over TCP using a big-endian binary protocol. Every request starts with a **1-byte command code**.
-
-### Command Codes
-
-| Command | Code | Command | Code |
-| --- | --- | --- | --- |
-| AUTH | 10 | BEGIN | 40 |
-| PING | 11 | COMMIT | 41 |
-| CREATE TABLE | 20 | ROLLBACK | 42 |
-| DROP TABLE | 21 | CREATE INDEX | 50 |
-| DESCRIBE | 22 | BATCH | 55 |
-| ALTER TABLE | 23 | BACKUP | 56 |
-| INSERT | 30 | CREATE PROC / CALL | 60 / 61 |
-| SELECT | 31 | CREATE VIEW | 70 |
-| UPDATE | 32 | CREATE TRIGGER | 80 |
-| DELETE | 33 | GRANT | 90 |
-| | | REVOKE | 91 |
-
-### Response Codes
-
-| Response | Code | Description |
-| --- | --- | --- |
-| OK | 1 | Success |
-| ERROR | 2 | Failure (`uint32` length + UTF-8 message) |
-| VALUE | 3 | Single value |
-| NOT_FOUND | 4 | Not found |
-| ROWS | 5 | Row set (`uint32` count; each row = `uint32` length + encoded data) |
-| TXN_ID | 6 | Transaction ID (`uint64`) |
-
-### Field Types (wire encoding)
-
-| Type | Byte value |
+| Item | Guidance |
 | --- | --- |
-| TypeInt (int64) | `0` |
-| TypeVarchar | `1` |
-| TypeBool | `2` |
+| Memory | Data size × 1.5–2 (row bytes + indexes + replay overhead) |
+| Disk | WAL ≈ data size × 2–3 before compaction; dedicated SSD recommended |
+| CPU | Reads scale with cores; writes are bounded by the single WAL writer and fsync speed |
+| File descriptors | ≥ `max_conns` × 2 + headroom |
+| RPO | `durability=fsync` for zero loss, `batch` tolerates losing the last flush interval (100 ms default) |
 
-> See `examples/client.go` for a complete reference implementation of AUTH / CREATE TABLE / INSERT / SELECT encoding and decoding.
-
----
-
-## 🏗️ Architecture
+### Topology
 
 ```
-┌──────────────────────────────────────────────┐
-│                 TCP Client                    │
-└──────────────────┬───────────────────────────┘
-                   │ binary protocol (big-endian)
-┌──────────────────▼───────────────────────────┐
-│              server.go (Server)               │
-│  Session · Auth · command dispatch · encode   │
-└──────────────────┬───────────────────────────┘
-                   │
-┌──────────────────▼───────────────────────────┐
-│                db.go (DB engine)              │
-│  ┌────────┐  ┌────────┐  ┌──────────────┐    │
-│  │Catalog │  │ Tables │  │  Transaction │    │
-│  │  meta  │  │  set   │  │  management  │    │
-│  └────────┘  └───┬────┘  └──────────────┘    │
-│                  │                            │
-│   ┌──────────────▼──────────────┐             │
-│   │          Table              │             │
-│   │  pkTree: IntRBTree (PK)     │             │
-│   │  idxTrees: RBTree (2nd idx) │             │
-│   │  writeLog → WAL (CRC32)     │             │
-│   └─────────────────────────────┘             │
-│    WAL replay · TTL cleanup · group commit    │
-│    · backup                                   │
-└──────────────────┬───────────────────────────┘
-                   │
-┌──────────────────▼───────────────────────────┐
-│            metrics.go (monitoring)            │
-│  Stats · /metrics · /api/stats · /dashboard  │
-│  /stress concurrency test (read/write mix)   │
-└──────────────────────────────────────────────┘
+        HTTPS (443)
+   ┌────────▼─────────┐
+   │ Nginx / Caddy    │  TLS termination, rate limit, IP allowlist
+   └────────┬─────────┘
+            │ http://127.0.0.1:10232
+   ┌────────▼─────────┐
+   │     Tsumugi      │  bind_host=127.0.0.1
+   │  10232 panel     │
+   │  9999  binary    │◄── private network only
+   │  3309  mysql     │◄── private network only
+   └────────┬─────────┘
+            │
+   /var/lib/tsumugi/{data,config,backup}
 ```
 
-### Data Files
+- Never expose the panel directly: set `bind_host: "127.0.0.1"` and terminate TLS in a proxy (`deploy/nginx-panel.conf.example`)
+- Behind a proxy, set `trusted_proxies` so login rate limiting sees real client IPs
+- The binary and MySQL listeners are raw TCP — HTTP reverse proxies cannot front them
+- A hardened systemd unit is provided in `deploy/tsumugi.service`
 
-- `data/tsumugi.wal`: WAL file with header (magic `TSUMUGI` + version + reserved). Compact format (version 1): varint encoding + table IDs (via a table registry, replacing repeated table-name strings); data records are `[cmd][tableID][txnID][pk][len][data][CRC32]`, catalog records use `cmd=100`; fixed per-row overhead drops from ~38B to ~10B. Reads and writes use this single compact format; reads also accept files written during the v2-labeled window (same format).
-- `data/privileges.json`: privilege data.
-- `backup/tsumugi_<timestamp>.wal` and `backup/privileges_<timestamp>.json`: backup snapshots.
+**First-time setup**: open the panel, run the wizard. It only accepts local/private addresses, stores a PBKDF2 hash for the console and a SHA1 digest (`password_sha1`) for MySQL, and generates `metrics_token`.
 
----
+### Configuration reference
 
-## 🔌 Command Overview
+`config/tsumugi.json` is the single source of truth (created on first start, editable from the settings page, hot-applied and persisted).
 
-| Command | Description |
+| Key | Default | Description |
+| --- | --- | --- |
+| `port` | `9999` | binary protocol port |
+| `bind_host` | `""` | listen address; empty = all interfaces |
+| `tls_cert` / `tls_key` | empty | panel HTTPS cert/key (both required) |
+| `max_conns` | `512` | concurrent connection limit (binary + MySQL) |
+| `wal_dir` | `./data` | data directory |
+| `wal_file` | `tsumugi.wal` | WAL file name |
+| `privilege_file` | `privileges.json` | table ACL file |
+| `flush_interval_ms` | `100` | batch-mode fsync interval |
+| `group_commit_ms` | `2` | group commit window |
+| `ttl_clean_ms` | `30000` | TTL sweep interval |
+| `idle_timeout_s` | `60` | idle connection timeout (unauthenticated: 30s) |
+| `backup_dir` | `./backup` | backup directory |
+| `metrics_port` | `10232` | panel port |
+| `enable_checksum` | `true` | WAL CRC32 |
+| `durability` | `batch` | `batch` (periodic fsync) or `fsync` (every commit) |
+| `mysql_enabled` | `false` | enable MySQL protocol |
+| `mysql_port` | `3309` | MySQL protocol port |
+| `password_sha1` | empty | MySQL auth digest; empty rejects MySQL logins |
+| `metrics_token` | generated | `/metrics` scrape token |
+| `trusted_proxies` | `[]` | CIDRs allowed to supply `X-Forwarded-For` |
+| `auto_compact` | `true` | compact the WAL during idle periods |
+| `compact_idle_seconds` | `60` | compaction check interval |
+| `compact_min_wal_mb` | `64` | minimum WAL size before auto compaction |
+| `compact_peak_rate` | `50` | commands/s under which the instance counts as idle |
+| `txn_conflict` | `error` | write-conflict policy: `error`=abort+rollback (optimistic concurrency); `last_write_wins`=overwrite (MySQL autocommit semantics, for ORMs that wrap every statement in an implicit transaction) |
+
+Environment overrides: `TSUMUGI_PORT`, `TSUMUGI_BIND_HOST`, `TSUMUGI_METRICS_PORT`, `TSUMUGI_MYSQL`, `TSUMUGI_MYSQL_PORT`, `TSUMUGI_DURABILITY`, `TSUMUGI_MAX_CONNS`, `TSUMUGI_TLS_CERT`, `TSUMUGI_TLS_KEY`, `TSUMUGI_TRUSTED_PROXIES`, `TSUMUGI_AUTO_COMPACT`.
+
+Startup validates the config: port conflicts abort, while plain HTTP / non-fsync / all-interface listeners emit warnings.
+
+### Security checklist
+
+- [ ] Strong admin password; unused wizard-created accounts removed
+- [ ] `bind_host=127.0.0.1` + TLS reverse proxy (or `tls_cert`/`tls_key`)
+- [ ] `trusted_proxies` configured when behind a proxy
+- [ ] Ports 9999/3309 reachable only from trusted networks
+- [ ] `/metrics` scraped with `metrics_token` stored in the monitoring system
+- [ ] `data/`, `config/`, `backup/` are `0700` and owned by the service account
+- [ ] Audit lines (`audit:`) shipped to your log platform
+- [ ] Scheduled backups **with restore drills**
+- [ ] `durability=fsync` if acknowledged writes must never be lost
+- [ ] `enable_checksum` left enabled
+- [ ] Panel icon font self-hosted (next section): offline installs without it fall back to Unicode glyphs
+
+### Panel icon font (web first, graded fallback)
+
+Panel icons use Material Symbols Outlined (the M3E icon set) and are still fetched from Google Fonts by default. When that fails:
+
+1. **Google Fonts** — the original `<link>` stays untouched
+2. **Mirror CDN** — `fonts.googleapis.cn`, then `fonts.loli.net`
+3. **Self-hosted** — drop `material-symbols-outlined.woff2` into `assets/` and it is served from `/assets/material-symbols-outlined.woff2` (no restart needed)
+4. **Monochrome glyphs** — only when everything above is unreachable; icon names become **text glyphs** (`add → ＋`, `chevron_left → ‹`), never emoji
+
+Set `TSUMUGI_ICON_FALLBACK=off` to disable step 4 and keep the plain CDN behaviour. See `assets/README.md` for font sources; Docker images ship only the binary, so steps 1–2 still apply.
+
+### Backup and restore
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:10232/api/admin/backup
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:10232/api/admin/backup   # list
+```
+
+Produces `backup/tsumugi_<ts>.wal` (full data snapshot) and `backup/privileges_<ts>.json` with mode `0600`.
+
+```bash
+systemctl stop tsumugi
+cp backup/tsumugi_20260101_030000.wal /var/lib/tsumugi/data/tsumugi.wal
+cp backup/privileges_20260101_030000.json /var/lib/tsumugi/data/privileges.json   # optional
+systemctl start tsumugi
+```
+
+The snapshot reflects the moment the backup was taken; later writes are not included. The file is a WAL snapshot in the current format: this build reads v1/v2/v3, but **older binaries cannot read v3**, so export the data before downgrading.
+
+### Monitoring
+
+```bash
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:10232/metrics
+```
+
+Metrics: `tsumugi_total_commands`, `tsumugi_total_errors`, `tsumugi_qps`, `tsumugi_tps`, `tsumugi_wal_write_mb_s`, `tsumugi_wal_total_mb`, `tsumugi_fsync_per_s`, `tsumugi_cmd_<name>`. Scrape config: `deploy/prometheus.yml`.
+
+Suggested alerts: `/healthz` failing; non-zero `rate(tsumugi_total_errors[5m])`; `tsumugi_fsync_per_s` dropping to zero while QPS > 0; WAL growth outpacing workload; `total_rows` approaching the sizing limit.
+
+### Logs and audit
+
+Logs go to stdout with timestamps and levels (`[OK] [INFO] [WARN] [ERR]`). Audit entries use the `audit:` prefix:
+
+```
+audit: user=admin action=create_table table=orders fields=5
+audit: user=admin action=grant target=bob table=orders perm=1
+login FAILED from 10.0.0.8 (user="root")
+```
+
+Failed logins are counted per (IP, user) with exponential backoff; failed binary/MySQL authentications close the connection.
+
+### Upgrade and rollback
+
+```bash
+systemctl stop tsumugi
+cp -a /var/lib/tsumugi/data /var/lib/tsumugi/data.bak.$(date +%F)
+install -m 0755 tsumugi-new /usr/local/bin/tsumugi
+systemctl start tsumugi
+curl -fsS http://127.0.0.1:10232/healthz
+```
+
+New config keys always have defaults, and WAL reads are backward compatible (v1/v2/v3). However new files are written as v3, which older binaries reject — export the data before downgrading.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Startup: `port conflicts` | duplicate ports in config | change ports |
+| Startup: `invalid WAL magic` / `unsupported WAL version` | corrupted or newer WAL | restore from backup; never hand-edit the WAL |
+| `tail record truncated` in logs | crash left a partial record | expected; the tail is truncated automatically |
+| Writes fail with `wal: ...` | disk full / permissions / IO error | fix disk or ownership, then restart |
+| `too many connections` | `max_conns` exceeded | raise the limit or hunt connection leaks |
+| Login keeps failing | backoff after repeated failures | wait (max 5 min) or restart |
+| MySQL `Access denied` | empty `password_sha1` / not the configured root user | finish setup in the panel |
+| `/metrics` 401 | missing token | use Bearer or `?token=` |
+| Memory keeps growing | compaction not firing / data growth | check `wal_file_mb`, `total_rows`, compact manually |
+
+### Performance baseline
+
+Measured on a Xeon E5-2687W v2 with `go test -bench` (engine level, batch durability):
+
+| Benchmark | Result |
 | --- | --- |
-| `AUTH(user, pass)` | Authenticate; returns OK or error |
-| `CREATE TABLE(meta)` | Create a table (fields, PK, indexes); persists catalog |
-| `DROP TABLE(name)` | Drop a table |
-| `DESCRIBE(name)` | Return schema and indexes |
-| `ALTER TABLE(name, field, type)` | Add a column |
-| `INSERT(name, pk, ttl, fields...)` | Insert a row, supports TTL |
-| `SELECT(name, conditions, minKey, maxKey)` | Conditional query (secondary index first) |
-| `UPDATE(name, pk, ttl, fields...)` | Update (bumps row version) |
-| `DELETE(name, pk)` | Delete a row |
-| `BEGIN` / `COMMIT` / `ROLLBACK` | Transaction control |
-| `CREATE INDEX(table, idxName, field)` | Create an index and backfill it |
-| `BACKUP` | Snapshot backup |
-| `GRANT` / `REVOKE(user, table, perm)` | Privilege management |
-| SELECT `__tables` / `__indexes` / `__stats` | System-table queries |
+| `BenchmarkPointSelect` | ~478 ns/op |
+| `BenchmarkPointSelectParallel` | ~164 ns/op |
+| `BenchmarkInsert` | ~3.3 µs/op |
+| `BenchmarkUpdate` | ~11 µs/op |
+| `BenchmarkSQLPointSelect` | ~2 µs/op |
+| `BenchmarkMySQLQuery` | ~50 µs/op |
 
-> `BATCH`, stored procedures, views, and triggers are protocol placeholders that currently return `not implemented`.
+Tuning: `durability=fsync` + `group_commit_ms` 2–5 ms for safety; `batch` + larger `flush_interval_ms` for throughput; size `max_conns` with file descriptors and memory (~64 KB buffering per connection); shorten `compact_idle_seconds` / lower `compact_min_wal_mb` if the WAL grows fast.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:10232/stress?duration=10&workers=4&protocol=mysql&mode=rw"
+```
 
 ---
 
-## 🧪 Verification
+## HTTP endpoints
 
-Validated on `go1.26.5` / Windows:
+| Path | Auth | Notes |
+| --- | --- | --- |
+| `/healthz` | none | health probe |
+| `/metrics` | metrics token / session | Prometheus |
+| `/` `/dashboard` `/admin` `/users` | page public, APIs require token | console |
+| `/api/login` `/api/logout` | — | Bearer session token, 24h TTL |
+| `/api/setup/status` `/api/setup/complete` | local/private only | first-run wizard |
+| `/api/stats` | session | monitoring JSON |
+| `/api/admin/*` | session (admin for most) | tables, rows, SQL, settings, backup, compact, restart, users |
+| `/stress` | session + `can_stress` | load generator |
 
-1. `go vet ./...` passes with no warnings.
-2. End-to-end smoke test: AUTH → CREATE TABLE → INSERT ×3 → SELECT, all correct.
-3. WAL recovery: after restart, schema and data are fully restored (a duplicate-PK error on re-insert proves data survived).
-4. Stress test: `/stress?duration=3&workers=4` produced ~26k commands with 0 errors.
-5. `/metrics`, `/api/stats`, and `/dashboard` all respond correctly.
+Request bodies are capped at 1 MB; the HTTP server sets read-header/read/write/idle timeouts and security headers.
 
 ---
 
-## 📝 Notes
+## SQL subset
 
-- This is an educational / learning project. WAL uses a **single-writer queue**: all writes are handed to one writer goroutine over a FIFO channel and serialized there, so the hot path has no global mutex; in `fsync` mode the writer does **group commit** (concurrent writers share one fsync). Measured ~900k QPS in batch mode at 1000 threads, and ~30x higher QPS in fsync mode vs. per-write flush.
-- Stored procedures / views / triggers are protocol placeholders ready to be implemented.
-- To run under Docker / Linux: `docker run --rm -v "$PWD":/app -w /app golang:1.24 go run .`
+Supported:
+
+- **DDL**: `CREATE TABLE` (column attributes, table-level `PRIMARY KEY (...)`, `KEY`/`INDEX`/`UNIQUE`, `ENGINE=`/`CHARSET=` options), `CREATE DATABASE/INDEX`, `ALTER TABLE` (`ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME COLUMN`, `ADD`/`DROP INDEX`, rename table), `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `RENAME TABLE`
+- **DML**: `INSERT` (multi-row is atomic), `INSERT IGNORE`, `REPLACE INTO`, `INSERT ... ON DUPLICATE KEY UPDATE` (incl. `VALUES(col)`), `UPDATE` (any `WHERE`, `SET col = expr`, `LIMIT`), `DELETE` (any `WHERE`, `LIMIT`)
+- **SELECT**: projections/expressions/aliases, `DISTINCT`, `WHERE` (`AND`/`OR`/`NOT`/comparisons/`IN`/`LIKE`/`BETWEEN`/`IS [NOT] NULL`), `JOIN` (`INNER`/`LEFT`/`RIGHT`/`CROSS` with `ON`/`USING`, comma joins), `GROUP BY` + `HAVING`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `COUNT(DISTINCT)`), `ORDER BY` (incl. `ORDER BY 1`), `LIMIT`/`OFFSET`, `UNION` / `UNION ALL`
+- **Functions**: string, numeric, conditional (`IF`/`IFNULL`/`NULLIF`/`COALESCE`/`CASE WHEN`), date (`NOW`/`CURDATE`/`YEAR`/`DATE_FORMAT`/`DATEDIFF`/`DATE_ADD`), info (`DATABASE`/`USER`/`VERSION`)
+- **Statement-level compat**: `BEGIN`/`START TRANSACTION`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`, `SET` (incl. `autocommit`), `USE`, `FLUSH`/`ANALYZE`/`OPTIMIZE`/`CHECK`/`REPAIR`/`LOCK`/`UNLOCK`/`KILL`/`DO`/`RESET`, `SHOW` (tables/columns/databases/index/status/variables/engines/processlist/master status/privileges…), `DESCRIBE`, `GRANT`/`REVOKE`, backtick identifiers, comments, system tables `__tables`/`__indexes`/`__stats` (admin only), read-only `information_schema.*` / `mysql.*` for phpMyAdmin compatibility.
+
+Rejected explicitly (never silently mis-evaluated): subqueries/derived tables, window functions, recursive CTEs, foreign keys, `SELECT ... FOR UPDATE`, and stored procedures/triggers/views (`CALL` returns a clear error).
+
+`JOIN` uses nested loops (no optimizer); `INT` columns have no NULL semantics (NULL stores as 0) — only `VARCHAR` can hold NULL.
+
+---
+
+## Protocol summary
+
+Binary protocol: big-endian, one command byte. Commands: AUTH(10), PING(11), CREATE/DROP/DESCRIBE/ALTER TABLE(20/21/22/23), INSERT/SELECT/UPDATE/DELETE(30/31/32/33), QUERY SQL(35), BEGIN/COMMIT/ROLLBACK(40/41/42), CREATE INDEX(50), BACKUP(56), STATUS(57), COMPACT(58), SET DURABILITY(59), GRANT/REVOKE(90/91). Responses: OK(1), ERROR(2), VALUE(3), NOT_FOUND(4), ROWS(5), TXN_ID(6). Types: INT(0), VARCHAR(1, ≤65534 bytes), BOOL(2). See `docs/native-protocol.md`.
+
+MySQL protocol: `mysql_native_password`, text protocol and prepared statements (binary row encoding), `COM_FIELD_LIST`, `COM_SET_OPTION`, `COM_INIT_DB`, 64 MB packet ceiling (64 KB before authentication). Only the configured root account can connect.
+
+---
+
+## Data files and crash recovery
+
+| File | Contents | Mode |
+| --- | --- | --- |
+| `config/tsumugi.json` | configuration | 0600 |
+| `data/tsumugi.wal` | WAL (magic + version header, batch frames with length + CRC32, varint records) | 0600 |
+| `data/users.json` | console users (PBKDF2 + salt) | 0600 |
+| `data/privileges.json` | table ACLs | 0600 |
+| `backup/*` | snapshots | 0600 |
+
+Recovery validates the header, streams v3 batch frames (verifying one CRC per batch), replays the varint records inside, truncates an incomplete tail batch instead of refusing to start, uses catalog records as replay barriers, and drops writes from transactions that never committed.
+
+---
+
+## Development
+
+```bash
+go build ./...
+go vet ./...
+gofmt -l .                    # CI requires empty output
+go test ./... -count=1
+go test -race ./... -count=1  # needs cgo/gcc
+go test -run '^$' -bench . .
+cd interop && go test ./...    # real MySQL driver interop
+```
+
+CI runs build / vet / gofmt / race tests / MySQL interop on Ubuntu (`.github/workflows/ci.yml`).
+
+Performance regression check: mount a HEAD copy with `git worktree`, run fixed-iteration benchmarks on both trees alternately (`-benchtime 100000x -count=3`, 3–6 rounds, medians) to avoid the noise of time-based runs on Windows. SQL point lookups, range scans, inserts and transaction commits stay within ±3% of HEAD; range scans and transaction commits are ~12% and ~32% faster respectively.
+
+Layout: `main.go` (startup), `db.go` (engine), `wal_v3.go` (batch framing + streaming replay), `wal_alter.go` (atomic whole-table rewrite for ALTER), `rb_tree.go`, `sql_parser.go`/`sql_expr.go`/`sql_exec.go`/`sql_dml.go`/`sql_alter.go`/`sql_stmt.go`, `server.go` (binary protocol), `mysql.go`, `acl.go`/`users.go`, `metrics.go`/`admin.go`/`app_html.go` (panel), `deploy/` (systemd, nginx, prometheus), `interop/` (driver tests), `docs/`.
+
+---
+
+## Known limitations
+
+- Single-node, single-writer WAL; no replication or failover
+- One instance per data directory (an exclusive file lock is taken on `data/` at startup; a second instance refuses to start). Two processes sharing a WAL overwrite each other — silent corruption. Scale out with MySQL/PostgreSQL instead
+- Auto-increment primary keys are assigned by the engine: `INSERT` without a primary-key column (or with 0/NULL) gets a monotonic, never-reused id, returned through the MySQL protocol's last-insert-id so ORMs can read it back. Clients must not seed ids themselves with `MAX(pk)+1` — that collides across concurrent clients
+- Entire dataset must fit in memory; restarts replay the whole WAL (seconds for millions of rows)
+- SQL subset: no subqueries/derived tables, no window functions or recursive CTEs, no foreign keys; `JOIN` is a nested loop without an optimizer; no `SELECT ... FOR UPDATE`
+- `INT` columns have no NULL semantics (NULL becomes 0); only `VARCHAR` holds NULL
+- Optimistic concurrency with last-writer-wins (not snapshot isolation); conflicts are detected at COMMIT (`conflict: row N version changed`), so ORMs that wrap each statement in an implicit transaction never see a statement-level error - use `txn_conflict=last_write_wins` for MySQL-like autocommit semantics
+- `VARCHAR` limited to 65534 bytes
+- Single MySQL account; table grants apply to the native protocol
+- Protocol ports are plain TCP — keep them on trusted networks
+- Panel loads text web fonts (Roboto Flex / Fira Code) from a public CDN; icon font can be self-hosted under `assets/`, otherwise icons fall back to Unicode glyphs
+- Stored procedures, views and triggers are protocol placeholders
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
