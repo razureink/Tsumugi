@@ -151,6 +151,10 @@ type mysqlConn struct {
 	txnID       uint64
 	autocommit  bool // SET autocommit=0 后写语句进入隐式事务
 	implicitTxn uint64
+	// isoLevel 事务隔离级别。引擎当前只提供 READ COMMITTED 语义，
+	// 客户端显式设置其它级别时必须报错，而不是静默按 RC 运行——
+	// 否则应用以为拿到了 REPEATABLE READ 的读快照，实际会出现不可重复读。
+	isoLevel string
 }
 
 // mysqlPreparedStmt 记录一条已解析的 prepared statement。
@@ -822,6 +826,11 @@ func (mc *mysqlConn) handleTxCommand(sql string) {
 // 其余（NAMES / sql_mode / 会话变量）一律返回 OK。
 func (mc *mysqlConn) handleSetVar(sql string) {
 	lower := strings.ToLower(sql)
+	// 事务隔离级别：SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL <level>
+	if strings.Contains(lower, "isolation level") || strings.Contains(lower, "transaction isolation") {
+		mc.handleSetIsolation(lower)
+		return
+	}
 	if strings.Contains(lower, "autocommit") {
 		if strings.Contains(lower, "autocommit=0") || strings.Contains(lower, "autocommit = 0") ||
 			strings.Contains(lower, "autocommit='0'") || strings.Contains(lower, "autocommit = '0'") {
@@ -837,6 +846,25 @@ func (mc *mysqlConn) handleSetVar(sql string) {
 		}
 	}
 	mc.writeOK()
+}
+
+// handleSetIsolation 处理 SET TRANSACTION ISOLATION LEVEL。
+// 引擎只实现 READ COMMITTED（写冲突在提交时按行版本检测）。
+// 其它级别明确报错 1235，避免应用误以为拥有 REPEATABLE READ 的读快照。
+func (mc *mysqlConn) handleSetIsolation(lower string) {
+	switch {
+	case strings.Contains(lower, "read committed"):
+		mc.isoLevel = "READ COMMITTED"
+		mc.writeOK()
+	case strings.Contains(lower, "read uncommitted"):
+		mc.sendError(1235, "isolation level 'READ UNCOMMITTED' is not supported; use READ COMMITTED")
+	case strings.Contains(lower, "repeatable read"):
+		mc.sendError(1235, "isolation level 'REPEATABLE READ' is not supported yet; use READ COMMITTED")
+	case strings.Contains(lower, "serializable"):
+		mc.sendError(1235, "isolation level 'SERIALIZABLE' is not supported; use READ COMMITTED")
+	default:
+		mc.sendError(1235, "unknown isolation level in SET TRANSACTION")
+	}
 }
 
 // isWriteStatement 判断语句是否写库（autocommit=0 时用于开启隐式事务）。
