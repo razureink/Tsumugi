@@ -2887,6 +2887,9 @@ type Transaction struct {
 	Changes map[string]map[int64]txnChange
 	// ReadVersions 保留读取版本记录（历史字段，冲突检测已改用 txnChange.newVersion）。
 	ReadVersions map[string]map[int64]int64
+	// Savepoints 命名保存点栈（A4）。每个点保存"当时的行字节 + 事务记账"快照，
+	// 用于部分回滚（ROLLBACK TO SAVEPOINT）。
+	Savepoints []*txnSavepoint
 }
 
 // txnChange 一条事务内行变更。

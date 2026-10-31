@@ -1008,9 +1008,15 @@ func (db *DB) runSQLSessionAsOut(session *Session, sql string, out *sqlOut) (col
 		}
 		return nil, nil, 0, "Query OK", nil
 	case "ROLLBACK":
-		// ROLLBACK TO [SAVEPOINT] name 不是整事务回滚，交给执行器（保存点路径）
+		// ROLLBACK TO [SAVEPOINT] name 不是整事务回滚，走保存点路径
 		if isRollbackToSavepoint(sql) {
-			return db.runSQLSchemaAsOut(session.user, sql, nil, session.txnID, "", out)
+			if !session.inTxn {
+				return nil, nil, 0, "", fmt.Errorf("savepoint does not exist (no active transaction)")
+			}
+			if e := db.RollbackToSavepoint(session.txnID, savepointName(sql)); e != nil {
+				return nil, nil, 0, "", e
+			}
+			return nil, nil, 0, "Query OK", nil
 		}
 		if !session.inTxn {
 			return nil, nil, 0, "Query OK", nil
@@ -1022,9 +1028,40 @@ func (db *DB) runSQLSessionAsOut(session *Session, sql string, out *sqlOut) (col
 			return nil, nil, 0, "", e
 		}
 		return nil, nil, 0, "Query OK", nil
+	case "SAVEPOINT":
+		if !session.inTxn {
+			return nil, nil, 0, "", fmt.Errorf("savepoint requires an active transaction")
+		}
+		if e := db.Savepoint(session.txnID, savepointName(sql)); e != nil {
+			return nil, nil, 0, "", e
+		}
+		return nil, nil, 0, "Query OK", nil
+	case "RELEASE":
+		if !session.inTxn {
+			return nil, nil, 0, "", fmt.Errorf("savepoint requires an active transaction")
+		}
+		if e := db.ReleaseSavepoint(session.txnID, savepointName(sql)); e != nil {
+			return nil, nil, 0, "", e
+		}
+		return nil, nil, 0, "Query OK", nil
 	}
 	// 普通语句：带上会话事务号，使写操作加入该事务
 	return db.runSQLSchemaAsOut(session.user, sql, nil, session.txnID, "", out)
+}
+
+// savepointName 从 SAVEPOINT / ROLLBACK TO / RELEASE 语句里取出名字（末尾标识符）。
+func savepointName(sql string) string {
+	toks, err := tokenizeSQL(sql)
+	if err != nil {
+		return ""
+	}
+	defer putSQLTokens(toks)
+	for i := len(toks) - 1; i >= 0; i-- {
+		if toks[i].kind == kindIdent || toks[i].kind == kindStr {
+			return toks[i].val
+		}
+	}
+	return ""
 }
 
 // isRollbackToSavepoint 判断是否为 ROLLBACK TO [SAVEPOINT] xxx。

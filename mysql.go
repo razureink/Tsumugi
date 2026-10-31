@@ -651,7 +651,7 @@ func (mc *mysqlConn) handleQuery(sql string) {
 	mc.db.stats.IncCmd(cmd)
 	// 信息函数（DATABASE()/USER() 等）需要连接上下文
 	setSessionContext(mc.schema, mc.user)
-	if matchAnyFold(fw, "BEGIN", "START", "COMMIT", "ROLLBACK", "SET", "SETS") {
+	if matchAnyFold(fw, "BEGIN", "START", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "SET", "SETS") {
 		mc.handleTxCommand(sql)
 		return
 	}
@@ -770,6 +770,19 @@ func (mc *mysqlConn) handleTxCommand(sql string) {
 		mc.implicitTxn = 0
 		mc.writeOK()
 	case hasPrefixFold(sql, "ROLLBACK"):
+		// ROLLBACK TO [SAVEPOINT] name：部分回滚，事务保持活跃
+		if isRollbackToSavepoint(sql) {
+			if !mc.inTxn || mc.txnID == 0 {
+				mc.sendError(1305, "SAVEPOINT does not exist")
+				return
+			}
+			if err := mc.db.RollbackToSavepoint(mc.txnID, savepointName(sql)); err != nil {
+				mc.sendSQLError(err)
+				return
+			}
+			mc.writeOK()
+			return
+		}
 		if txn := mc.txnID; txn != 0 {
 			_ = mc.db.RollbackTxn(txn)
 		}
@@ -779,6 +792,26 @@ func (mc *mysqlConn) handleTxCommand(sql string) {
 		mc.inTxn = false
 		mc.txnID = 0
 		mc.implicitTxn = 0
+		mc.writeOK()
+	case hasPrefixFold(sql, "SAVEPOINT"):
+		if !mc.inTxn || mc.txnID == 0 {
+			mc.sendError(1305, "SAVEPOINT does not exist (no active transaction)")
+			return
+		}
+		if err := mc.db.Savepoint(mc.txnID, savepointName(sql)); err != nil {
+			mc.sendSQLError(err)
+			return
+		}
+		mc.writeOK()
+	case hasPrefixFold(sql, "RELEASE"):
+		if !mc.inTxn || mc.txnID == 0 {
+			mc.sendError(1305, "SAVEPOINT does not exist (no active transaction)")
+			return
+		}
+		if err := mc.db.ReleaseSavepoint(mc.txnID, savepointName(sql)); err != nil {
+			mc.sendSQLError(err)
+			return
+		}
 		mc.writeOK()
 	case hasPrefixFold(sql, "SET"), hasPrefixFold(sql, "SETS"):
 		mc.handleSetVar(sql)
