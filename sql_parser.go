@@ -1595,6 +1595,18 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		outNames = meta.fieldNames() // SELECT *：列头取 meta 惰性缓存
 	}
 	columns = outNames
+	// fieldToOut 把源字段下标映射到输出列下标（-1 跳过）。扫描时只解码
+	// 选中列，避免 SELECT id FROM ... 仍解码整行 varchar 并二次投影。
+	var fieldToOut []int
+	if colIdx != nil {
+		fieldToOut = make([]int, len(meta.Fields))
+		for i := range fieldToOut {
+			fieldToOut[i] = -1
+		}
+		for out, ci := range colIdx {
+			fieldToOut[ci] = out
+		}
+	}
 	// projectRow 将 flat 解码行投影到 arena 行（恒等投影走 copy，零下标循环）。
 	projectRow := func(flat, row []interface{}) {
 		if colIdx == nil {
@@ -1609,6 +1621,13 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	scanLimit := limit
 	if hasOR || len(orderBys) > 0 || offset > 0 {
 		scanLimit = -1
+	}
+	// 内存保护：SQL 路径会把结果集整体物化成 [][]interface{}。没有 LIMIT 时
+	// 给扫描加一个硬上限，超过就报错而不是把进程撑爆（小内存设备上的 OOM 主因）。
+	// 多扫 1 行用于判断"是否超限"。
+	scanCapped := limit < 0 && scanLimit < 0
+	if scanCapped {
+		scanLimit = maxScanRows + 1
 	}
 	// 主键点查：树内直接命中 + TTL 检查 + flat 单行投影，避开通用扫描路径
 	if pkPoint {
@@ -1626,9 +1645,8 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			rows = nil
 			return
 		}
-		flat := decodeRowFlat(meta, rowData, nil)
 		row := make([]interface{}, len(cols))
-		projectRow(flat, row)
+		decodeRowProjected(meta, rowData, row, fieldToOut)
 		rows = [][]interface{}{row}
 		return
 	}
@@ -1670,34 +1688,31 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 			t.pkTree.Delete(k)
 		}
 	} else if len(conds) == 0 && len(filters) == 0 {
-		// 无 WHERE 条件的快速路径：直接解码为 []interface{}，跳过每行 map 分配
-		flat := t.selectRowsFlat(minKey, maxKey, scanLimit)
-		if selectCols == nil {
-			rows = flat
-		} else {
-			// 列投影：flat 行按 meta.Fields 顺序排列，按下标取值
-			arena := newRowArena(len(cols))
-			rows = make([][]interface{}, 0, len(flat))
-			for _, r := range flat {
-				row := arena.row()
-				projectRow(r, row)
-				rows = append(rows, row)
-			}
-		}
+		// 无 WHERE 条件的快速路径：只解码选中列，跳过未选中的 varchar 等字段，
+		// 也不再生成完整 flat 行后二次投影。
+		rows = t.selectRowsProjected(minKey, maxKey, scanLimit, fieldToOut, len(cols))
+	} else if cov, okCov := t.coveringRows(meta, conds, filters, colIdx, len(cols), scanLimit); okCov {
+		// 覆盖索引：投影列全在二级索引条目里（索引列 + 主键），
+		// 直接从索引构造结果，省掉回表（主键树查找 + 行解码）。
+		rows = cov
 	} else {
 		// 等值/范围条件路径：与 SelectR 相同的字节级求值内核
 		//（主键点查/二级索引/全表扫描三级分发），命中行 flat 解码后
 		// 按 colIdx 直接投影，全程不物化行 map。
 		rawRows := t.selectRBytes(conds, filters, minKey, maxKey, scanLimit)
 		arena := newRowArena(len(cols))
-		var flat []interface{}
 		rows = make([][]interface{}, 0, len(rawRows))
 		for _, data := range rawRows {
-			flat = decodeRowFlat(meta, data, flat)
 			row := arena.row()
-			projectRow(flat, row)
+			decodeRowProjected(meta, data, row, fieldToOut)
 			rows = append(rows, row)
 		}
+	}
+	// 超限检查：扫描已在上限处停止，这里给出明确错误（提示加 LIMIT）
+	if scanCapped && len(rows) > maxScanRows {
+		err = fmt.Errorf("%s: result set exceeds %d rows, add LIMIT to the query "+
+			"(raise max_scan_rows if you really need more)", "scan limit", maxScanRows)
+		return
 	}
 	// ORDER BY：按输出列排序（找不到列则显式报错）
 	if len(orderBys) > 0 {
@@ -2253,18 +2268,67 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 	}
 	// 多行 INSERT 整体原子：包一个隐式事务，任一行失败即整体回滚
 	//（MySQL 语句级原子性）；会话已在事务中（p.txnID != 0）时沿用外层事务。
+	// 单行简单 INSERT 走无事务快速路径（batch 模式）：省掉 Begin/Commit、
+	// 事务表/Changes map 与读版本记录；主键唯一性仍由 pkTree.SetNX 保证。
 	autoTxn := p.txnID == 0
-	if autoTxn {
-		p.txnID = db.BeginTxn()
+	txnStarted := false
+	beginAutoTxn := func() {
+		if autoTxn && !txnStarted {
+			p.txnID = db.BeginTxn()
+			txnStarted = true
+		}
 	}
 	rollback := func(e error) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
-		if autoTxn {
+		if txnStarted {
 			db.RollbackTxn(p.txnID)
 			p.txnID = 0
+			txnStarted = false
 		}
 		return nil, nil, 0, "", e
 	}
 	affected = 0
+	// 批量路径的列映射：batchColIdx[i] = 表第 i 个字段在本行 values 里的下标。
+	// 适用条件（其余形态继续走逐行 insertRow，语义完全不变）：
+	//   - 无 IGNORE / REPLACE / ON DUPLICATE；
+	//   - 无显式列清单时列数须与表字段数一致；
+	//   - 有显式列清单时必须是"全字段的一个排列"（避免缺省列填充语义与原路径不一致）。
+	var batchColIdx []int
+	if !ignore && !replaceMode && onDup == nil && len(t.Meta().Fields) > 0 {
+		meta := t.Meta()
+		if !colsExplicit {
+			idx := make([]int, len(meta.Fields))
+			for i := range idx {
+				idx[i] = i
+			}
+			batchColIdx = idx
+		} else if len(fields) == len(meta.Fields) {
+			idx := make([]int, len(meta.Fields))
+			for i := range idx {
+				idx[i] = -1
+			}
+			okAll := true
+			for vi, f := range fields {
+				fi := meta.fieldIndexOf(f)
+				if fi < 0 || idx[fi] != -1 {
+					okAll = false
+					break
+				}
+				idx[fi] = vi
+			}
+			if okAll {
+				batchColIdx = idx
+			}
+		}
+	}
+	pkFieldIdx := 0
+	for i, f := range t.Meta().Fields {
+		if f.Name == t.Meta().PK {
+			pkFieldIdx = i
+			break
+		}
+	}
+	var batchPks []int64
+	var batchRows [][]interface{}
 	for {
 		if q := p.next(); q.kind != kindSym || q.val != "(" {
 			return rollback(fmt.Errorf("expected ("))
@@ -2297,7 +2361,49 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 				return rollback(fmt.Errorf("expected , or )"))
 			}
 		}
+		// 单行简单 INSERT 且语句已到结尾：batch 模式直接写，不建事务。
+		if autoTxn && !txnStarted && !walFsync.Load() && !ignore && !replaceMode && !onDupParsed && p.atSingleRowEnd() {
+			p.txnID = 0
+		} else {
+			beginAutoTxn()
+		}
 		// 提交单行
+		// 简单多行 INSERT（无 IGNORE/REPLACE/ON DUPLICATE、列能完整映射到表字段）
+		// 走批量路径：一次主键树锁 + 一条 WAL 记录 + 索引按桶合并。
+		if batchColIdx != nil && len(values) == len(batchColIdx) {
+			pkPos := batchColIdx[pkFieldIdx]
+			var pk int64
+			if pkPos >= 0 {
+				if v, ok := values[pkPos].(int64); ok && v != 0 {
+					pk = v
+				}
+			}
+			if pk == 0 {
+				pk = t.allocPK()
+				if pkPos >= 0 {
+					values[pkPos] = pk
+				}
+				p.lastInsertID = pk
+			}
+			// 按表字段序重排（带列清单时就是一次置换）
+			ordered := make([]interface{}, len(batchColIdx))
+			for i, vi := range batchColIdx {
+				ordered[i] = values[vi]
+			}
+			batchPks = append(batchPks, pk)
+			batchRows = append(batchRows, ordered)
+			affected++
+			if !colsExplicit {
+				interfaceSlicePool.Put(values[:0])
+			}
+			if !p.matchSym(",") {
+				break
+			}
+			if p.peek().kind == kindSym && p.peek().val == "(" {
+				continue
+			}
+			break
+		}
 		pk, e := db.insertRow(p, t, fields, colsExplicit, values)
 		if e != nil {
 			if !errors.Is(e, errPKExists) {
@@ -2362,15 +2468,23 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 	if onDupParsed {
 		p.i = len(p.toks) - 1 // ON DUPLICATE 子句已消费
 	}
+	// 批量收尾：整批一次写入（先整体校验，冲突则整句回滚）
+	if len(batchPks) > 0 {
+		if e := db.insertBatchOrdered(t, batchPks, batchRows, p.txnID); e != nil {
+			return rollback(e)
+		}
+	}
 	if e := p.expectEnd(); e != nil {
 		return rollback(e)
 	}
-	if autoTxn {
+	if txnStarted {
 		if e := db.CommitTxn(p.txnID); e != nil {
 			p.txnID = 0
+			txnStarted = false
 			return nil, nil, 0, "", e
 		}
 		p.txnID = 0
+		txnStarted = false
 	}
 	rawMsg = fmt.Sprintf("%d row inserted", affected)
 	if affected > 1 {
@@ -2381,6 +2495,16 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 		rawMsg = fmt.Sprintf("%s (id=%d)", rawMsg, p.lastInsertID)
 	}
 	return
+}
+
+// atSingleRowEnd 判断当前游标后是否只剩可选分号与 EOF，供单行 INSERT 快路径使用。
+// 不移动游标；只有能确定语句已完整结束时才允许跳过事务，避免语法错误时已落行。
+func (p *sqlParser) atSingleRowEnd() bool {
+	i := p.i
+	for i < len(p.toks) && p.toks[i].kind == kindSym && p.toks[i].val == ";" {
+		i++
+	}
+	return i < len(p.toks) && p.toks[i].kind == kindEof
 }
 
 // insertRow 提交 INSERT 的单行：优先位置参数快速路径，否则按列名映射。
@@ -2440,49 +2564,35 @@ func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bo
 		default:
 			return 0, fmt.Errorf("primary key must be integer")
 		}
-	} else if colsExplicit {
-		rowMap := make(map[string]interface{}, len(fields))
-		for i, f := range fields {
-			rowMap[f] = values[i]
-		}
-		pkVal, ok := rowMap[t.Meta().PK]
-		if !ok {
-			// 未给出主键列：引擎分配
-			autoAssign = true
-		} else {
-			switch v := pkVal.(type) {
-			case int64:
-				if v == 0 {
-					autoAssign = true
-				} else {
-					pk = v
-				}
-			case nil:
-				autoAssign = true
-			default:
-				return 0, fmt.Errorf("primary key must be integer")
-			}
-		}
 	} else {
-		// 位置参数形式未覆盖主键列：同样由引擎分配
+		// 主键缺省：由引擎分配（MySQL AUTO_INCREMENT 语义）。
 		autoAssign = true
 	}
+	if autoAssign {
+		pk = t.allocPK()
+		p.lastInsertID = pk
+		if orderedPath && pkIdx >= 0 && pkIdx < len(values) {
+			values[pkIdx] = pk
+		}
+	}
+	if orderedPath {
+		// 位置参数快速路径：不构建每行 map，也不按列名回查。
+		if err := db.txnApply(p.txnID, t, pk, func() error {
+			return t.InsertOrdered(pk, values, 0, p.txnID, false)
+		}); err != nil {
+			return pk, err
+		}
+		return pk, nil
+	}
+	// 显式列清单且与表字段序不一致：保留按列名映射路径。
 	rowMap := make(map[string]interface{}, len(fields))
 	for i, f := range fields {
 		rowMap[f] = values[i]
 	}
 	if autoAssign {
-		pk = t.allocPK()
-		if orderedPath && pkIdx >= 0 && pkIdx < len(values) {
-			values[pkIdx] = pk
-		}
 		rowMap[t.Meta().PK] = pk
-		p.lastInsertID = pk
 	}
 	if err := db.txnApply(p.txnID, t, pk, func() error {
-		if orderedPath && pkIdx >= 0 && pkIdx < len(values) {
-			return t.InsertOrdered(pk, values, 0, p.txnID, false)
-		}
 		return t.Insert(pk, rowMap, 0, p.txnID, false)
 	}); err != nil {
 		return pk, err
@@ -3048,7 +3158,7 @@ func (db *DB) dropTableByName(name string) error {
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	if err := appendWAL(buf); err != nil {
+	if err := appendWAL(buf, false); err != nil {
 		db.mu.Unlock()
 		return err
 	}

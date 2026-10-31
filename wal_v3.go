@@ -25,15 +25,25 @@ import (
 )
 
 const (
-	// WALVersion3 分帧格式；v1/v2 仍可读取（升级后第一次 Compact 会写成 v3）
+	// WALVersion3 远端仓库（razureink/Tsumugi）的分帧格式版本。仍可读取。
 	WALVersion3 = 3
-	// 写入侧单批上限：超过就切批，避免一次攒出巨大缓冲
-	walBatchMaxBytes   = 1 << 20 // 1MB
-	walBatchMaxRecords = 64
+	// WALVersion4 本项目格式版本 = 远端版本 + 1。
+	// 相比远端 v3，本版本在 payload 中新增了批量插入记录（WALInsertBatch），
+	// 因此用独立版本号标识，避免与远端写出的 WAL 混淆。
+	// 读取侧同时兼容 v1/v2/v3/v4；写入一律用 v4。
+	WALVersion4 = WALVersion3 + 1
 	// 读取侧预读缓冲（不影响单批内存上限）
 	walReadAheadBytes = 1 << 20
 	// 批次头的固定开销：4 字节 CRC
 	walBatchCRCBytes = 4
+)
+
+// 写入侧单批上限：超过就切批，避免一次攒出巨大缓冲。
+// 默认值面向普通 SSD；启动时的设备探测会按落盘延迟/内存压力调整
+//（慢盘用更大批次减少帧头与系统调用，小内存用更小批次限制峰值占用）。
+var (
+	walBatchMaxBytes   = 1 << 20 // 1MB
+	walBatchMaxRecords = 256
 )
 
 // walFramed 当前 WAL 文件是否是 v3 分帧格式（writer 与 Compact 会切换）。
@@ -84,7 +94,6 @@ func (c *walReplayCtx) loadV3(fileSize int64) error {
 	c.totalRows = fileSize / 45 // 进度条分母：按平均每行 45 字节粗估
 	br := bufio.NewReaderSize(c.file, walReadAheadBytes)
 	offset := int64(c.headerLen)
-	var payload []byte
 	for {
 		batchStart := offset
 		n, nbytes, err := readVarUintFromReader(br)
@@ -96,20 +105,22 @@ func (c *walReplayCtx) loadV3(fileSize int64) error {
 			c.truncateAt(batchStart)
 			break
 		}
-		// 超过文件总长度只可能是损坏头：直接报错（同时避免按声明长度分配巨量内存）。
-		if n > uint64(fileSize) {
-			return fmt.Errorf("invalid WAL batch length %d at offset %d (file size %d)", n, batchStart, fileSize)
-		}
-		// 批次声明长度超出文件剩余字节：必然是崩溃时写了一半的尾批，按批次边界截断。
+		// 崩溃残留优先判定：声明长度超出文件剩余字节，说明这一批没写完就被断电了。
+		// 必须先按"剩余字节"判断（而不是先比文件总长），否则断电产生的半帧会被
+		// 误判成"损坏头"直接报错，导致进程再也起不来——这正是崩溃一致性测试
+		// 抓到的场景。判断发生在分配之前，因此不会因为巨大长度而 OOM。
 		remaining := fileSize - batchStart - int64(nbytes)
 		if remaining < walBatchCRCBytes || n > uint64(remaining-walBatchCRCBytes) {
 			c.truncateAt(batchStart)
 			break
 		}
-		if cap(payload) < int(n) {
-			payload = make([]byte, n)
+		// 绝对上限：到此长度已可安全分配，只剩明显不合理的值才当损坏处理
+		if n > 1<<31 {
+			return fmt.Errorf("invalid WAL batch length %d at offset %d", n, batchStart)
 		}
-		payload = payload[:n]
+		// 每批单独分配 payload：段式并行重放会把本批记录的 data 切片交给
+		// 后台应用 goroutine，复用同一底层数组会让下一批覆盖尚未应用的数据。
+		payload := make([]byte, n)
 		var crcBuf [walBatchCRCBytes]byte
 		if _, err := io.ReadFull(br, crcBuf[:]); err != nil {
 			c.truncateAt(batchStart)

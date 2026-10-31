@@ -9,7 +9,7 @@ import (
 
 // rbInvariants checks LLRB key invariants: black root, no red-with-red-left child,
 // no red right child (left-leaning), and equal black-heights on every path.
-func rbInvariants[K cmp.Ordered, V any](t *RBTree[K, V]) bool {
+func rbInvariants[K cmp.Ordered, V any](t *llrbTree[K, V]) bool {
 	if t.Size() == 0 && t.root.Load() == nil {
 		return true
 	}
@@ -49,6 +49,15 @@ func collectInt(t *RBTree[int64, int64]) map[int64]int64 {
 }
 
 func TestRBTreeDifferentialInt(t *testing.T) {
+	for _, v := range allTreeVariants() {
+		t.Run(v.String(), func(t *testing.T) {
+			useVariant(t, v)
+			differentialInt(t)
+		})
+	}
+}
+
+func differentialInt(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260806))
 	tree := newIntKeyTree[int64]()
 	ref := make(map[int64]int64)
@@ -98,7 +107,7 @@ func TestRBTreeDifferentialInt(t *testing.T) {
 			if int64(tree.Size()) != int64(len(ref)) {
 				t.Fatalf("size mismatch tree=%d ref=%d", tree.Size(), len(ref))
 			}
-			if !rbInvariants(tree) {
+			if !checkTreeInvariants(tree) {
 				t.Fatalf("LLRB invariants violated at iter %d", i)
 			}
 		}
@@ -112,6 +121,15 @@ func collectBytes(t *RBTree[string, int64]) map[string]int64 {
 }
 
 func TestRBTreeDifferentialBytes(t *testing.T) {
+	for _, v := range allTreeVariants() {
+		t.Run(v.String(), func(t *testing.T) {
+			useVariant(t, v)
+			differentialBytes(t)
+		})
+	}
+}
+
+func differentialBytes(t *testing.T) {
 	rng := rand.New(rand.NewSource(970207))
 	idx := newStringKeyTree[int64]()
 	ref := make(map[string]int64)
@@ -142,7 +160,7 @@ func TestRBTreeDifferentialBytes(t *testing.T) {
 					t.Fatalf("content mismatch key=%q tree=%d ref=%d", k, treeM[k], v)
 				}
 			}
-			if !rbInvariants(idx) {
+			if !checkTreeInvariants(idx) {
 				t.Fatalf("LLRB invariants violated (bytes) at iter %d", i)
 			}
 		}
@@ -152,6 +170,15 @@ func TestRBTreeDifferentialBytes(t *testing.T) {
 // TestRBTreeConcurrent 并发读+写校验（配合 -race 检测数据竞争）。写者覆盖/删除/重建，
 // 读者并发点查与全表扫描；最终验证密度（size）与键集合完整，且无越界/撕裂值。
 func TestRBTreeConcurrent(t *testing.T) {
+	for _, v := range allTreeVariants() {
+		t.Run(v.String(), func(t *testing.T) {
+			useVariant(t, v)
+			concurrentTree(t)
+		})
+	}
+}
+
+func concurrentTree(t *testing.T) {
 	const keys = 500
 	tree := newIntKeyTree[int64]()
 	for i := int64(0); i < keys; i++ {

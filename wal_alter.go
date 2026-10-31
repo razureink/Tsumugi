@@ -81,7 +81,7 @@ func (db *DB) writeCatalogAlterAll(meta *TableMeta, rowsBuf []byte, rowCount int
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	if err := appendWAL(buf); err != nil {
+	if err := appendWAL(buf, false); err != nil {
 		return err
 	}
 	return db.flushWAL()

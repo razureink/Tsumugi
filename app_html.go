@@ -562,6 +562,24 @@ html.hc .t-name .dot{box-shadow:none!important}
         </div>
 
         <div class="card">
+          <h3><span class="mat material-symbols-outlined">account_tree</span><span id="settingsCardTree" data-t="settingsCardTree">索引结构</span></h3>
+          <p style="color:var(--on-sf-var);font-size:13px;margin-bottom:14px" data-t="settingsTreeSub">主键与二级索引使用的平衡树实现。切换后需重启：索引在启动时从 WAL 重建，已建好的树无法原地更换结构。</p>
+          <select class="txt" id="sTreeKind">
+            <option value="llrb" data-t="treeLLRB">LLRB 红黑树（默认，成熟稳定）</option>
+            <option value="btree" data-t="treeBTree">COW B 树（写入更快，克隆层数少）</option>
+          </select>
+          <label class="field-label" id="lblTreeMode" data-t="lblTreeMode">并发模式</label>
+          <select class="txt" id="sTreeMode">
+            <option value="cow" data-t="modeCOW">COW 写时复制（默认，读完全无锁）</option>
+            <option value="lock" data-t="modeLock">读写锁 + 原地更新（写入快数倍，读加锁）</option>
+            <option value="auto" data-t="modeAuto">自适应（单线程快写，检测到并发自动切 COW）</option>
+          </select>
+          <div style="color:var(--on-sf-var);font-size:12px;margin-top:10px">
+            <span data-t="treeActiveNow">当前生效</span>：<b id="treeActive">-</b> / <b id="treeModeActive">-</b>
+          </div>
+        </div>
+
+        <div class="card">
           <h3><span class="mat material-symbols-outlined">computer</span><span id="settingsCardSrv" data-t="settingsCardSrv">服务器</span></h3>
           <label class="field-label" id="lblUser" data-t="lblUser">管理员用户名</label><input class="txt" id="sUser">
           <label class="field-label" id="lblPass" data-t="lblPass">管理员密码</label><input class="txt" id="sPassword" type="password">
@@ -1179,6 +1197,11 @@ async function loadSettings(){
     $('sCompactIdle').value=s.compact_idle_seconds||60;
     $('sCompactMin').value=s.compact_min_wal_mb||64;
     $('sCompactPeak').value=s.compact_peak_rate||50;
+    // 索引结构：显示"配置值"与"当前进程实际生效值"（两者可能因未重启而不同）
+    $('sTreeKind').value=s.tree_kind||'llrb';
+    $('sTreeMode').value=s.tree_mode||'cow';
+    if($('treeActive')) $('treeActive').textContent=s.tree_active||'-';
+    if($('treeModeActive')) $('treeModeActive').textContent=s.tree_mode_active||'-';
     $('varRows').innerHTML='';
     var vars=(d.mysql&&d.mysql.variables)||{};
     for(var name in vars){ addVarRow(name, vars[name]); }
@@ -1202,6 +1225,8 @@ async function saveSettings(){
     compact_idle_seconds:parseInt($('sCompactIdle').value)||60,
     compact_min_wal_mb:parseInt($('sCompactMin').value)||64,
     compact_peak_rate:parseInt($('sCompactPeak').value)||50,
+    tree_kind:$('sTreeKind').value,
+    tree_mode:$('sTreeMode').value,
     variables:vars
   };
   try{

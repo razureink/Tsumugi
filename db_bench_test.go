@@ -141,7 +141,7 @@ func BenchmarkTxnCommit(b *testing.B) {
 	}
 }
 
-// BenchmarkTxnCommitParallel 并行事务提交：观察 CommitTxn 全局锁 + 组提交等待的竞争
+// BenchmarkTxnCommitParallel 并行事务提交：观察 batch 异步提交下 CommitTxn 的全局锁竞争
 func BenchmarkTxnCommitParallel(b *testing.B) {
 	db, tbl := benchDB(b)
 	var seq atomic.Int64
@@ -255,6 +255,151 @@ func BenchmarkSQLFilteredScan(b *testing.B) {
 		_, rows, _, _, err := db.runSQL(fmt.Sprintf("SELECT * FROM bench WHERE name = 'name-%d'", i%(n/2)))
 		if err != nil || len(rows) != 1 {
 			b.Fatalf("rows=%d err=%v", len(rows), err)
+		}
+	}
+}
+
+// ==================== WAL 重放（启动加载）基准与正确性 ====================
+
+// replayFixture 生成 n 行 WAL（compact 决定是否转成 v3 分帧格式），
+// 返回配置供反复重开测量。调用方负责在后用完删除目录。
+func replayFixture(b *testing.B, n int64, compact bool) (*Config, int64) {
+	b.Helper()
+	SetLogMute(true)
+	dir := b.TempDir()
+	cfg := walTestConfig(dir)
+	db, err := NewDB(cfg)
+	if err != nil {
+		b.Fatalf("NewDB: %v", err)
+	}
+	walMustCreate(b, db, "bench")
+	tbl := db.getTable("bench")
+	for i := int64(0); i < n; i++ {
+		if err := tbl.Insert(i, benchRow(i), 0, 0, false); err != nil {
+			b.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if compact {
+		if err := db.Compact(); err != nil {
+			b.Fatalf("compact: %v", err)
+		}
+	}
+	db.Close()
+	return cfg, n
+}
+
+// BenchmarkWALReplay 量化启动加载：重开数据库（重放整份 WAL）并校验行数。
+func BenchmarkWALReplay(b *testing.B) {
+	for _, tc := range []struct {
+		name    string
+		compact bool
+	}{{"v2-unframed", false}, {"v3-framed", true}} {
+		b.Run(tc.name, func(b *testing.B) {
+			const n = 50000
+			cfg, want := replayFixture(b, n, tc.compact)
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				db, err := NewDB(cfg)
+				if err != nil {
+					b.Fatalf("reopen: %v", err)
+				}
+				tbl := db.getTable("bench")
+				if tbl == nil {
+					db.Close()
+					b.Fatal("table missing after replay")
+				}
+				if got := tbl.pkTree.Size(); got != want {
+					db.Close()
+					b.Fatalf("rows after replay = %d, want %d", got, want)
+				}
+				db.Close()
+			}
+		})
+	}
+}
+
+// TestWALReplayIntegrity 校验段式并行重放的数据完整性：
+// 混合 insert/update/delete + 事务提交，重开后逐行比对最终值。
+func TestWALReplayIntegrity(t *testing.T) {
+	SetLogMute(true)
+	dir := t.TempDir()
+	cfg := walTestConfig(dir)
+	db, err := NewDB(cfg)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	if _, _, _, _, err := db.runSQL("CREATE TABLE ri (id INT PRIMARY KEY, v INT)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	const n = 4000
+	// 主键从 1 开始：0 在主键插入里等价于"自动分配"，会与后续显式 1 撞键。
+	for i := 1; i <= n; i++ {
+		if _, _, _, _, err := db.runSQL(fmt.Sprintf("INSERT INTO ri (id, v) VALUES (%d, %d)", i, i*2)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	// 覆盖写
+	for i := 1; i <= n; i += 3 {
+		if _, _, _, _, err := db.runSQL(fmt.Sprintf("UPDATE ri SET v = %d WHERE id = %d", i*2+1, i)); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+	}
+	// 删除
+	for i := 1; i <= n; i += 7 {
+		if _, _, _, _, err := db.runSQL(fmt.Sprintf("DELETE FROM ri WHERE id = %d", i)); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	// 事务内写入
+	if _, _, _, _, err := db.runSQL("BEGIN"); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for i := n + 1; i <= n+100; i++ {
+		if _, _, _, _, err := db.runSQL(fmt.Sprintf("INSERT INTO ri (id, v) VALUES (%d, %d)", i, -i)); err != nil {
+			t.Fatalf("txn insert %d: %v", i, err)
+		}
+	}
+	if _, _, _, _, err := db.runSQL("COMMIT"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 期望值
+	want := map[int64]int64{}
+	for i := 1; i <= n; i++ {
+		want[int64(i)] = int64(i * 2)
+	}
+	for i := 1; i <= n; i += 3 {
+		want[int64(i)] = int64(i*2 + 1)
+	}
+	for i := 1; i <= n; i += 7 {
+		delete(want, int64(i))
+	}
+	for i := n + 1; i <= n+100; i++ {
+		want[int64(i)] = int64(-i)
+	}
+	db.Close()
+
+	// 重开并逐行比对
+	db2, err := NewDB(cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	tbl := db2.getTable("ri")
+	if tbl == nil {
+		t.Fatal("table ri missing after replay")
+	}
+	if got, wantN := tbl.pkTree.Size(), int64(len(want)); got != wantN {
+		t.Fatalf("row count after replay = %d, want %d", got, wantN)
+	}
+	for id, v := range want {
+		row, ok := tbl.SelectByPK(id)
+		if !ok {
+			t.Fatalf("row %d missing after replay", id)
+		}
+		if got := row["v"]; got != v {
+			t.Fatalf("row %d v = %v, want %v", id, got, v)
 		}
 	}
 }

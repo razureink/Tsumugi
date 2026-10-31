@@ -376,6 +376,107 @@ curl -fsS http://127.0.0.1:10232/healthz
 - WAL 增长快：缩短 `compact_idle_seconds`、降低 `compact_min_wal_mb`
 - 大表扫描：给过滤列建二级索引（`CREATE INDEX`），避免全表扫描
 
+#### 极端设备自适应
+
+启动时会做一次很轻量的设备探测（临时文件写 64KB + fsync，按进程缓存），
+结合核数自动调整写入与重放参数，并在日志里打印所选画像：
+
+```
+[INFO] device profile: class=ssd fsync≈1.55ms cores=32 | commit window 500µs..20ms,
+       wal buf 256KB, batch 256 rec/1MB, replay 65536 ops/8MB x 16 workers
+```
+
+| 探测到的设备 | 自动调整 |
+| --- | --- |
+| 内存盘 / tmpfs（fsync < 200µs） | 窗口 100µs~5ms、WAL 缓冲 128KB、批次 128 条：落盘便宜，优先降延迟 |
+| NVMe（< 1ms） | 窗口 200µs~10ms、缓冲 256KB |
+| SATA SSD（1~8ms） | 窗口 500µs~20ms、缓冲 256KB |
+| 机械盘 / 网络盘（≥ 8ms） | 窗口 1ms~4×fsync（上限 50ms）、缓冲 1MB、批次 512 条/4MB：一次落盘极贵，要攒大批 |
+| **≤ 1 核** | 关闭重放流水线（改分段同步回填），worker=1，段 16k 条/2MB |
+| **2 核** | worker=核数，段 16k 条/2MB，降低峰值内存 |
+| **≥ 32 核** | 重放 worker 上限 16，避免调度与 cache 争用 |
+| **内存 < 256MB** | 缓冲 32KB / 批次 128KB / 段 1MB，worker=1，关闭流水线 |
+| **内存 < 1GB** | 缓冲 64KB / 批次 256KB / 段 2MB，worker ≤ 2 |
+| **内存 < 4GB** | 缓冲 256KB / 批次 1MB / 段 8MB |
+| **内存 < 16GB** | 设 70% 软内存上限（`debug.SetMemoryLimit`），让 GC 提前加频而不是被 OOM-killer 杀掉；用户设了 `GOMEMLIMIT` 则不覆盖 |
+| **磁盘剩余 < 2GB**（或 ≤4GB 内存机器上剩余 < 内存） | 启动告警，提示缩短压缩间隔 |
+
+启动日志会打印完整画像，便于确认实际生效值：
+
+```
+[INFO] device profile: class=ssd fsync≈1.03ms cores=32 ram=63.9GB disk_free=10.5GB |
+       commit window 500µs..20ms, wal buf 256KB, batch 256 rec/1024KB,
+       replay 65536 ops/8MB x 16 workers (pipeline=true), mem limit unknown
+```
+
+慢盘 + `durability=fsync` 时日志会告警：这种组合每次提交都要付一次完整 fsync，
+吞吐上限就是 `1 / fsync 延迟`，高写入场景应改用 `batch`。
+
+所有参数都可用环境变量覆盖（优先级最高，适合无法探测的容器环境）：
+
+| 变量 | 含义 |
+| --- | --- |
+| `TSUMUGI_WAL_BUF_KB` | WAL 单写者 bufio 缓冲（KB） |
+| `TSUMUGI_WAL_BATCH_RECORDS` | v3 分帧单批记录数上限 |
+| `TSUMUGI_WAL_BATCH_MB` | v3 分帧单批字节上限（MB） |
+| `TSUMUGI_REPLAY_SEGMENT_OPS` | 重放单段记录数 |
+| `TSUMUGI_REPLAY_SEGMENT_MB` | 重放单段字节上限（MB） |
+| `TSUMUGI_REPLAY_WORKERS` | 重放并行 worker 数 |
+
+#### 索引结构（可切换）
+
+主键索引与二级索引都走同一套有序映射接口，底层有两个**正交**的可选项：
+
+**① 平衡结构 `tree_kind`**
+
+| 取值 | 实现 | 特点 |
+| --- | --- | --- |
+| `llrb`（默认） | 左倾红黑树 | 成熟稳定；COW 每次写入克隆 ~19 个小节点 |
+| `btree` | 写时复制 B 树（分支因子 6） | 克隆层数少（~11 层），但单节点更大 |
+
+**② 并发模式 `tree_mode`**
+
+| 取值 | 语义 | 适用 |
+| --- | --- | --- |
+| `cow`（默认） | 写时复制 + 原子换根，**读者完全无锁**、读到一致快照 | 读多写少、长扫描多 |
+| `lock` | 读写锁 + **原地更新**，写入不再克隆 | 写多、可接受"长扫描阻塞写入" |
+| `auto` | 自适应：单线程走原地更新，**检测到并发即单向升级为 COW** | 不确定负载形态，想自动取两者之长 |
+
+`auto` 的工作原理（单向、不可逆，因此永远安全）：
+
+1. 每次操作先用一个原子计数探测"当前是否只有我在操作这棵树"；
+2. 独占时直接原地修改（无写时复制，写入快一个数量级，读也不需要加锁）；
+3. 一旦发现别人也在操作，就把树标记为"升级中"，**等待在途操作全部退出**（此时刻不存在任何原地写者），
+   再把树永久切换为 COW 语义，此后零额外开销。
+
+升级只在 `inflight == 0` 时发生，所以 COW 读者绝不会看到被改了一半的节点。
+
+切换方式：配置文件 `tree_kind` / `tree_mode`、环境变量 `TSUMUGI_TREE` / `TSUMUGI_TREE_MODE`，
+或后台「设置 → 索引结构」。**必须重启生效**（索引在启动时从 WAL 重建，已建好的树无法原地更换结构或并发策略）。
+
+实测（纯树层，20 万键，`go test -bench`）：
+
+| 场景 | llrb + cow（默认） | llrb + lock | btree + lock |
+| --- | --- | --- | --- |
+| 插入 SetNX | 1370 ns / 19 allocs / 1276 B | 388 ns / 1 alloc | **289 ns / 0 alloc** |
+| 主键点查 | 98.6 ns | **60.2 ns** | — |
+
+`auto` 模式（btree 结构）实测：
+
+| 场景 | cow | lock | **auto** |
+| --- | --- | --- | --- |
+| 单线程写入 SetNX | 1946 ns | 290 ns | **263 ns** |
+| 并发读（32 P） | **30.5 ns** | 118 ns | **31.5 ns** |
+
+也就是说 `auto` 同时拿到了 lock 的写入速度与 cow 的并发读速度。
+
+结论：
+
+- **`lock` 模式写入快 3.5~4.7 倍**，单线程读反而更快（不再产生 COW 垃圾节点、缓存局部性更好）；
+  代价是长扫描持读锁期间写入被阻塞，且失去"扫描期间看到一致旧快照"的语义。
+- **B 树在 COW 模式下比红黑树更慢**：写时复制成本 ≈ 层数 × 单节点大小，B 树层数少了但节点变大，
+  总拷贝字节反而上升。默认仍是 `llrb + cow`；`btree + lock` 是写入最快的组合。
+
 压测（走真实协议）：
 
 ```bash

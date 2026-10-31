@@ -21,7 +21,9 @@ func passwordSHA1Hex(password string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// Durability 持久化模式：batch（定时批量刷盘）/ fsync（每条写入立即落盘）。
+// Durability 持久化模式：
+//   - batch：写入/提交入队即返回，后台按 FlushInterval 批量刷盘；崩溃可能丢一个窗口。
+//   - fsync：事务提交等待组提交 fsync 后才返回；多个并发提交共享一次 fsync。
 type Durability string
 
 const (
@@ -71,6 +73,16 @@ type Config struct {
 	//                       适合 ORM 默认给每条语句套隐式事务的场景：冲突在 COMMIT 才报，
 	//                       驱动层的"语句级重试"根本不会触发）
 	TxnConflict string
+	// TreeKind 索引树的平衡结构：llrb（左倾红黑树，默认）| btree（写时复制 B 树）。
+	// 两者语义完全一致，B 树写路径克隆层数更少、写入更快；切换需重启
+	//（树上已有数据，无法原地换结构，会在下次从 WAL 重建索引时生效）。
+	TreeKind string
+	// TreeMode 索引树的并发/写路径策略，与 TreeKind 正交：
+	//   cow  （默认）写时复制：读者完全无锁，每次写入克隆路径
+	//   lock          读写锁 + 原地更新：写入快一个数量级，但读要持锁、
+	//                 长扫描期间写入被阻塞，且不再有快照隔离
+	// 切换需重启（树无法原地更换并发策略）。
+	TreeMode string
 }
 
 // loadDotEnvKV 读取 .env 文件（若存在），返回 KEY=VALUE 映射与是否成功。
@@ -133,6 +145,8 @@ type configFile struct {
 	CompactMinWALMB    *int     `json:"compact_min_wal_mb"`
 	CompactPeakRate    *int     `json:"compact_peak_rate"`
 	TxnConflict        *string  `json:"txn_conflict,omitempty"`
+	TreeKind           *string  `json:"tree_kind,omitempty"`
+	TreeMode           *string  `json:"tree_mode,omitempty"`
 }
 
 // loadConfigFile 从 /config/tsumugi.json 读取 Tsumugi 自身配置（若存在）。
@@ -233,6 +247,12 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	if raw.TxnConflict != nil {
 		cfg.TxnConflict = *raw.TxnConflict
 	}
+	if raw.TreeKind != nil {
+		cfg.TreeKind = *raw.TreeKind
+	}
+	if raw.TreeMode != nil {
+		cfg.TreeMode = *raw.TreeMode
+	}
 	return existed, true
 }
 
@@ -270,6 +290,8 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 		CompactMinWALMB:    intp(cfg.CompactMinWALMB),
 		CompactPeakRate:    intp(cfg.CompactPeakRate),
 		TxnConflict:        str(cfg.TxnConflict),
+		TreeKind:           str(cfg.TreeKind),
+		TreeMode:           str(cfg.TreeMode),
 	}
 }
 
@@ -305,6 +327,24 @@ func applyEnvToConfig(cfg *Config) {
 	}
 	if v := os.Getenv("TSUMUGI_TXN_CONFLICT"); v == "error" || v == "last_write_wins" {
 		cfg.TxnConflict = v
+	}
+	if v := os.Getenv("TSUMUGI_TREE_MODE"); v != "" {
+		switch strings.ToLower(v) {
+		case "lock", "rw", "rwlock", "mutable":
+			cfg.TreeMode = "lock"
+		case "cow":
+			cfg.TreeMode = "cow"
+		case "auto", "adaptive":
+			cfg.TreeMode = "auto"
+		}
+	}
+	if v := os.Getenv("TSUMUGI_TREE"); v != "" {
+		switch strings.ToLower(v) {
+		case "btree", "b-tree":
+			cfg.TreeKind = "btree"
+		case "llrb", "rb", "rbtree":
+			cfg.TreeKind = "llrb"
+		}
 	}
 	if p := os.Getenv("TSUMUGI_MYSQL_PORT"); p != "" {
 		if n, ok := parsePort(p); ok {
@@ -443,6 +483,22 @@ func normalizeConfig(cfg *Config) {
 	default:
 		cfg.TxnConflict = "error"
 	}
+	// 索引树实现：只认 llrb / btree，其它值回落到默认
+	switch strings.ToLower(cfg.TreeKind) {
+	case "btree", "b-tree":
+		cfg.TreeKind = "btree"
+	default:
+		cfg.TreeKind = "llrb"
+	}
+	// 并发/写路径策略：只认 cow / lock
+	switch strings.ToLower(cfg.TreeMode) {
+	case "lock", "rw", "rwlock", "mutable":
+		cfg.TreeMode = "lock"
+	case "auto", "adaptive":
+		cfg.TreeMode = "auto"
+	default:
+		cfg.TreeMode = "cow"
+	}
 	if !cfg.Durability.Valid() {
 		cfg.Durability = DuraBatch
 	}
@@ -485,6 +541,8 @@ func loadConfig() *Config {
 		CompactMinWALMB:     64,
 		CompactPeakRate:     50,
 		TxnConflict:         "error",
+		TreeKind:            "llrb",
+		TreeMode:            "cow",
 	}
 	// 顺序很重要：先读已有配置文件（单一事实源），再把 .env 叠加其上。
 	// 旧实现先应用 .env 再读文件，升级用户带残留 .env 时自定义配置会被默认值覆盖。

@@ -49,6 +49,10 @@ func TestAlterAtomicTornTail(t *testing.T) {
 	}
 	mustRun(t, db, "CREATE TABLE at2(id INT PRIMARY KEY, a VARCHAR, b INT)")
 	mustRun(t, db, "INSERT INTO at2 VALUES (1,'x',10),(2,'y',20)")
+	// batch 模式提交是异步的：先显式落盘，确保 base 偏移覆盖建表+插入。
+	if err := db.flushWAL(); err != nil {
+		t.Fatal(err)
+	}
 	fi, err := os.Stat(filepath.Join(dir, cfg.WALFile))
 	if err != nil {
 		t.Fatal(err)

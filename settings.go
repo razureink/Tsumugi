@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,8 @@ type settingsPayload struct {
 	CompactIdleSeconds *int              `json:"compact_idle_seconds"`
 	CompactMinWALMB    *int              `json:"compact_min_wal_mb"`
 	CompactPeakRate    *int              `json:"compact_peak_rate"`
+	TreeKind           string            `json:"tree_kind"`
+	TreeMode           string            `json:"tree_mode"`
 	Variables          map[string]string `json:"variables"`
 }
 
@@ -58,6 +61,10 @@ func (db *DB) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 			"compact_idle_seconds": db.config.CompactIdleSeconds,
 			"compact_min_wal_mb":   db.config.CompactMinWALMB,
 			"compact_peak_rate":    db.config.CompactPeakRate,
+			"tree_kind":            db.config.TreeKind,
+			"tree_active":          currentTreeKind().String(),
+			"tree_mode":            db.config.TreeMode,
+			"tree_mode_active":     currentTreeMode().String(),
 		},
 		"mysql": map[string]interface{}{
 			"version":   mc.Version,
@@ -133,6 +140,23 @@ func (db *DB) handleSettingsPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.CompactPeakRate != nil && *p.CompactPeakRate > 0 {
 		db.config.CompactPeakRate = *p.CompactPeakRate
+	}
+	// 索引树实现：只记录到配置，重启后从 WAL 重建索引时生效。
+	// 已有树的节点结构是既成事实，无法原地替换（换了会读不出旧数据）。
+	switch strings.ToLower(p.TreeKind) {
+	case "btree", "b-tree":
+		db.config.TreeKind = "btree"
+	case "llrb", "rb", "rbtree":
+		db.config.TreeKind = "llrb"
+	}
+	// 并发模式同理：只记配置，重启生效
+	switch strings.ToLower(p.TreeMode) {
+	case "lock", "rw", "rwlock", "mutable":
+		db.config.TreeMode = "lock"
+	case "cow":
+		db.config.TreeMode = "cow"
+	case "auto", "adaptive":
+		db.config.TreeMode = "auto"
 	}
 
 	// ---- 落盘到 /config/tsumugi.json（原子写；配置含 MySQL 认证摘要，0600）----

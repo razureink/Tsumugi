@@ -46,7 +46,7 @@ func TestCLIBinary(t *testing.T) {
 	host, port := addr[:i], addr[i+1:]
 
 	run := func(args ...string) (string, error) {
-		args = append([]string{"-h", host, "-p", port, "-u", "root", "-P", "password"}, args...)
+		args = append([]string{"-host", host, "-port", port, "-user", "root", "-pass", "password"}, args...)
 		cmd := exec.Command(cliBin, args...)
 		out, err := cmd.CombinedOutput()
 		return string(out), err
@@ -61,7 +61,7 @@ func TestCLIBinary(t *testing.T) {
 	if !strings.Contains(out, "Alice") || !strings.Contains(out, "Bob") {
 		t.Fatalf("missing data rows:\n%s", out)
 	}
-	if !strings.Contains(out, "rows in set") {
+	if !strings.Contains(out, "rows in set") && !strings.Contains(out, "行结果") {
 		t.Fatalf("missing result table:\n%s", out)
 	}
 }

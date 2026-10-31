@@ -65,8 +65,8 @@ func TestWALV3MultiBatchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
-	if v := binary.BigEndian.Uint32(data[len(WALMagic):]); v != WALVersion3 {
-		t.Fatalf("WAL version = %d, want %d", v, WALVersion3)
+	if v := binary.BigEndian.Uint32(data[len(WALMagic):]); v != WALVersion4 {
+		t.Fatalf("WAL version = %d, want %d (upstream+1)", v, WALVersion4)
 	}
 	frames := walV3Frames(t, data)
 	if len(frames) < 2 {
@@ -163,10 +163,17 @@ func TestWALV3AbsurdBatchLength(t *testing.T) {
 	}
 	ctx := &walReplayCtx{file: f, headerLen: len(WALMagic) + 8, enableCRC: true}
 	err = ctx.loadV3(st.Size())
-	if err == nil {
-		t.Fatal("absurd batch length must fail replay")
+	// 语义变更说明：声明长度远超文件剩余字节，与"断电写了半帧"是同一形态，
+	// 因此按崩溃残留处理——截断尾部并正常启动，而不是报错让进程起不来。
+	// 关键是绝不能按声明长度分配内存（下面校验文件已被截断回头部长度）。
+	if err != nil {
+		t.Fatalf("absurd length should be treated as torn tail, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "invalid WAL batch length") {
-		t.Fatalf("error = %v, want invalid batch length", err)
+	st2, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat after replay: %v", err)
+	}
+	if got, want := st2.Size(), int64(len(WALMagic)+8); got != want {
+		t.Fatalf("file size after replay = %d, want %d (should truncate torn tail)", got, want)
 	}
 }

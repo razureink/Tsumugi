@@ -89,8 +89,8 @@ func TestWALV1Header(t *testing.T) {
 	}
 	db.flushWAL()
 	db.Close()
-	if v := walFileVersion(t, dir); v != WALVersion3 {
-		t.Fatalf("WAL version = %d, want %d", v, WALVersion3)
+	if v := walFileVersion(t, dir); v != WALVersion4 {
+		t.Fatalf("WAL version = %d, want %d (upstream+1)", v, WALVersion4)
 	}
 }
 

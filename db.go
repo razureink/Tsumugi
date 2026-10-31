@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"net/http"
 	"os"
-	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,10 @@ const (
 	WALDelete   = 4
 	WALCommit   = 5
 	WALRollback = 6
+	// WALInsertBatch 一次写入多行（多行 INSERT / 批量导入）。
+	// 布局：[cmd][varint tableID][varint txnID][varint count]([varint pk][varint len][data])*count
+	// 相比 count 条 WALInsert，省掉每条的记录头与一次 appendWAL 通道交互。
+	WALInsertBatch = 7
 )
 
 // 单写者 WAL 队列：所有 WAL 记录经此 FIFO 通道交给唯一 writer goroutine 串行落盘，
@@ -632,17 +637,83 @@ func (a *rowArena) row() []interface{} {
 	return a.backing[start : start+a.stride]
 }
 
-// selectRowsFlat 无 WHERE 条件的全表扫描：直接解码为 []interface{} 行，不建 map。
-// 过期行收集后锁外清理（与 SelectR 一致）。limit<0 表示不限制。
-func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{} {
+// skipField 跳过行编码中的一个字段，用于窄投影扫描：不把未选中列解码成
+// interface{}，只推进读取位置。行格式由 encodeRow 写出，字段顺序与 meta 一致。
+func skipField(data []byte, pos *int, typ FieldType) {
+	switch typ {
+	case TypeInt:
+		*pos += 8
+	case TypeVarchar:
+		if *pos+2 > len(data) {
+			*pos = len(data)
+			return
+		}
+		l, _ := readU16(data, pos)
+		if l != varcharNullMarker {
+			*pos += int(l)
+		}
+	case TypeBool:
+		*pos++
+	}
+}
+
+// decodeRowProjected 只解码 fieldToOut 指向的列，输出顺序由 fieldToOut 的
+// 值决定（-1 表示跳过）。fieldToOut 为 nil 时等价于 decodeRowFlat。
+// 这样 SELECT id FROM ... 不再解码整行 varchar，也省掉二次投影和每行
+// 一个完整 flat 行缓冲。
+func decodeRowProjected(meta *TableMeta, data []byte, into []interface{}, fieldToOut []int) []interface{} {
+	if fieldToOut == nil {
+		return decodeRowFlat(meta, data, into)
+	}
+	pos := 16
+	for i, f := range meta.Fields {
+		out := fieldToOut[i]
+		if out < 0 || out >= len(into) {
+			skipField(data, &pos, f.Type)
+			continue
+		}
+		switch f.Type {
+		case TypeInt:
+			v, _ := readI64(data, &pos)
+			into[out] = v
+		case TypeVarchar:
+			l, _ := readU16(data, &pos)
+			if l == varcharNullMarker {
+				into[out] = nil
+			} else if l > 0 && pos+int(l) <= len(data) {
+				into[out] = unsafeString(data[pos : pos+int(l)])
+				pos += int(l)
+			} else {
+				into[out] = ""
+			}
+		case TypeBool:
+			if pos < len(data) {
+				into[out] = data[pos] == 1
+				pos++
+			} else {
+				into[out] = false
+			}
+		}
+	}
+	return into
+}
+
+// selectRowsProjected 无 WHERE 条件的范围/全表扫描：按 output 宽度分片，
+// 只解码投影列，不建 map。过期行收集后锁外清理（与 SelectR 一致）。
+// limit<0 表示不限制；fieldToOut 为 nil 表示 SELECT * 的恒等投影。
+func (t *Table) selectRowsProjected(minKey, maxKey *int64, limit int, fieldToOut []int, outWidth int) [][]interface{} {
 	// 预分配上限钳制：LIMIT 值客户端可控，直接用于 make 预分配会被
 	// LIMIT 999999999 之类一次打爆内存（fatal OOM）；大 limit 交给 append 摊还扩容。
 	capHint := 16
 	if limit > 0 && limit <= 4096 {
 		capHint = limit
 	}
+	if outWidth < 1 {
+		outWidth = 1
+	}
 	rows := make([][]interface{}, 0, capHint)
-	arena := newRowArena(len(t.Meta().Fields))
+	meta := t.Meta()
+	arena := newRowArena(outWidth)
 	var expired []int64
 	now := time.Now().UnixNano()
 	scan := func(key int64, value []byte) bool {
@@ -650,7 +721,7 @@ func (t *Table) selectRowsFlat(minKey, maxKey *int64, limit int) [][]interface{}
 			expired = append(expired, key)
 			return true
 		}
-		rows = append(rows, decodeRowFlat(t.Meta(), value, arena.row()))
+		rows = append(rows, decodeRowProjected(meta, value, arena.row(), fieldToOut))
 		if limit >= 0 && len(rows) >= limit {
 			return false
 		}
@@ -848,6 +919,10 @@ type Table struct {
 	// INSERT 未给出主键（或给出 0/NULL）时由引擎分配，避免多客户端各自
 	// "MAX(pk)+1" 播种导致主键碰撞（实测并发下 37% 插入失败）。
 	autoPK atomic.Int64
+	// ttlRows 记录本表是否出现过带过期时间的行（粘性标记，只置位不清零）。
+	// 覆盖索引要跳过回表，而过期时间编码在行字节里；只要表里可能有过期行，
+	// 就不能省掉这次行读取，否则会把已过期行当有效结果返回。
+	ttlRows atomic.Bool
 }
 
 // allocPK 分配一个自增主键：单调递增、绝不复用。
@@ -995,6 +1070,406 @@ func (t *Table) indexRemovePK(idxName string, idxKey string, pk int64) {
 	tree.Set(idxKey, newList)
 }
 
+// ---- 重放专用：索引原地更新（无并发读者，免去写时复制的列表拷贝）----
+
+// indexAddPKMutable 重放期把 pk 追加到倒排列表。append 可直接复用尾部空闲容量，
+// 且此时没有任何读者持有旧切片，因此无需 COW 复制整条列表。
+func (t *Table) indexAddPKMutable(idxName string, idxKey string, pk int64) {
+	tree, ok := t.indexes()[idxName]
+	if !ok || tree == nil {
+		return
+	}
+	list, _ := tree.Get(idxKey)
+	tree.SetMutable(idxKey, append(list, pk))
+}
+
+// indexRemovePKMutable 重放期从倒排列表移除 pk。
+func (t *Table) indexRemovePKMutable(idxName string, idxKey string, pk int64) {
+	tree, ok := t.indexes()[idxName]
+	if !ok || tree == nil {
+		return
+	}
+	list, ok := tree.Get(idxKey)
+	if !ok {
+		return
+	}
+	if len(list) <= 1 {
+		tree.DeleteMutable(idxKey)
+		return
+	}
+	// 原地压缩：把不等于 pk 的元素前移，避免额外分配
+	n := 0
+	for _, id := range list {
+		if id != pk {
+			list[n] = id
+			n++
+		}
+	}
+	if n == 0 {
+		tree.DeleteMutable(idxKey)
+		return
+	}
+	tree.SetMutable(idxKey, list[:n])
+}
+
+func (t *Table) updateIndexMutable(fieldName, idxName string, oldVal, newVal interface{}, pk int64) {
+	if oldVal == newVal {
+		return
+	}
+	if oldVal != nil {
+		t.indexRemovePKMutable(idxName, t.encodeIndexValue(fieldName, oldVal), pk)
+	}
+	if newVal != nil {
+		t.indexAddPKMutable(idxName, t.encodeIndexValue(fieldName, newVal), pk)
+	}
+}
+
+// ==================== 二级索引查询下推 / 覆盖索引 ====================
+// 索引键编码是保序的（int64 → 大端 8 字节，string → 原串），因此范围条件可以
+// 直接换算成索引树上的键区间，用有序扫描收窄候选，而不是全表逐行求值。
+
+// indexNameForField 返回该字段上的二级索引名。
+func (t *Table) indexNameForField(field string) (string, bool) {
+	meta := t.Meta()
+	for idxName, f := range meta.Indexes {
+		if f == field {
+			return idxName, true
+		}
+	}
+	for idxName, f := range meta.Indexes {
+		if strings.EqualFold(f, field) {
+			return idxName, true
+		}
+	}
+	return "", false
+}
+
+// indexRangeBounds 把范围条件换算成二级索引键区间。
+// 区间允许"偏宽"（例如 lt v 直接用到 v 为止，而不去算 v 的前驱）：命中后
+// 仍由完整谓词精筛，所以宁可多取也不能漏。返回 ok=false 表示该条件无法下推。
+func (t *Table) indexRangeBounds(fieldIdx int, f RangeCond) (lo, hi *string, ok bool) {
+	meta := t.Meta()
+	switch meta.Fields[fieldIdx].Type {
+	case TypeInt:
+		v, okv := toInt64OK(f.Val)
+		if !okv {
+			return nil, nil, false
+		}
+		switch f.Op {
+		case "gt":
+			if v == math.MaxInt64 {
+				return nil, nil, false // 无可行上界，交给全表过滤
+			}
+			s := t.encodeIndexValue(f.Field, v+1)
+			return &s, nil, true
+		case "ge":
+			s := t.encodeIndexValue(f.Field, v)
+			return &s, nil, true
+		case "lt", "le":
+			// 含端点扫描，等值行由精筛剔除（编码保序，无法便捷求前驱）
+			s := t.encodeIndexValue(f.Field, v)
+			return nil, &s, true
+		case "between":
+			v2, ok2 := toInt64OK(f.Val2)
+			if !ok2 {
+				return nil, nil, false
+			}
+			loS := t.encodeIndexValue(f.Field, v)
+			hiS := t.encodeIndexValue(f.Field, v2)
+			return &loS, &hiS, true
+		}
+	case TypeVarchar:
+		s, okS := f.Val.(string)
+		if !okS {
+			return nil, nil, false
+		}
+		switch f.Op {
+		case "gt", "ge":
+			return &s, nil, true
+		case "lt", "le":
+			return nil, &s, true
+		case "between":
+			s2, ok2 := f.Val2.(string)
+			if !ok2 {
+				return nil, nil, false
+			}
+			return &s, &s2, true
+		}
+	}
+	return nil, nil, false
+}
+
+// indexRangeCandidates 用二级索引的有序范围扫描求出候选行。
+// 返回 (行, 是否采用索引)。候选过多时主动放弃并退回主键顺序扫描：
+// 宽范围下"索引全扫 + 随机回表"反而比一次顺序扫描更慢。
+func (t *Table) indexRangeCandidates(meta *TableMeta, scan *scanConds, filters []RangeCond, limit int, now int64) ([][]byte, bool) {
+	const maxCandidates = 4096
+	if len(filters) == 0 {
+		return nil, false
+	}
+	pkIdx := meta.fieldIndexOf(meta.PK)
+	type fieldBounds struct{ lo, hi *string }
+	bounds := make([]*fieldBounds, len(meta.Fields))
+	var order []int
+	for i := range filters {
+		fi := meta.fieldIndexOf(filters[i].Field)
+		if fi < 0 || fi == pkIdx {
+			continue // 主键范围已在调用方换算成 minKey/maxKey
+		}
+		lo, hi, ok := t.indexRangeBounds(fi, filters[i])
+		if !ok {
+			continue
+		}
+		b := bounds[fi]
+		if b == nil {
+			b = &fieldBounds{}
+			bounds[fi] = b
+			order = append(order, fi)
+		}
+		// 编码保序：取更紧的边界（下界取较大者，上界取较小者）
+		if lo != nil && (b.lo == nil || *lo > *b.lo) {
+			b.lo = lo
+		}
+		if hi != nil && (b.hi == nil || *hi < *b.hi) {
+			b.hi = hi
+		}
+	}
+	for _, fi := range order {
+		idxName, ok := t.indexNameForField(meta.Fields[fi].Name)
+		if !ok {
+			continue
+		}
+		tree, ok := t.indexes()[idxName]
+		if !ok || tree == nil {
+			continue
+		}
+		b := bounds[fi]
+		var pks []int64
+		tooWide := false
+		tree.scanRangeStop(b.lo, b.hi, func(_ string, v []int64) bool {
+			if len(pks)+len(v) > maxCandidates {
+				tooWide = true
+				return false
+			}
+			pks = append(pks, v...)
+			return true
+		})
+		if tooWide {
+			return nil, false
+		}
+		// 索引按"索引列"有序给出 pk；上层期望主键序（与顺序扫描一致），
+		// 因此这里统一排序后再回表，结果顺序保持不变。
+		sort.Slice(pks, func(a, c int) bool { return pks[a] < pks[c] })
+		out := make([][]byte, 0, len(pks))
+		for _, pk := range pks {
+			rowData, found := t.pkTree.Get(pk)
+			if !found {
+				continue
+			}
+			if e := decodeExpireAt(rowData); e > 0 && now > e {
+				continue // 过期行不返回（后台 CleanExpired 负责清理）
+			}
+			if !scan.matchRow(meta, rowData) {
+				continue
+			}
+			out = append(out, rowData)
+			if limit >= 0 && len(out) >= limit {
+				break
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// coveringRows 当投影被二级索引完全覆盖时，直接从索引条目构造结果，
+// 不再回表读取整行字节（省掉一次主键树查找 + 一次行解码）。
+// 支持"该索引列上的等值条件"与"该列上的范围条件"两类。
+//
+// 安全前提（不满足即返回 ok=false 走常规回表路径）：
+//   - 全部条件都落在同一个非主键列上，且该列有二级索引；
+//   - 表内从未出现过 TTL 行——过期时间编码在行字节里，跳过回表就看不到它，
+//     否则会把已过期行当有效结果返回；
+//   - 投影列 ⊆ {索引列, 主键}，等值/范围的值类型与列类型一致。
+func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filters []RangeCond, outFields []int, width int, limit int) ([][]interface{}, bool) {
+	if width <= 0 || outFields == nil || (len(conds) == 0 && len(filters) == 0) {
+		return nil, false
+	}
+	if t.ttlRows.Load() {
+		return nil, false
+	}
+	// 全部条件必须指向同一个字段（否则索引条目无法证明其他条件成立）
+	var field string
+	for k := range conds {
+		if field == "" {
+			field = k
+		} else if !strings.EqualFold(field, k) {
+			return nil, false
+		}
+	}
+	for i := range filters {
+		if field == "" {
+			field = filters[i].Field
+		} else if !strings.EqualFold(field, filters[i].Field) {
+			return nil, false
+		}
+	}
+	pkIdx := meta.fieldIndexOf(meta.PK)
+	fi := meta.fieldIndexOf(field)
+	if fi < 0 || fi == pkIdx {
+		return nil, false
+	}
+	for _, of := range outFields {
+		if of != fi && of != pkIdx {
+			return nil, false
+		}
+	}
+	idxName, ok := t.indexNameForField(meta.Fields[fi].Name)
+	if !ok {
+		return nil, false
+	}
+	tree, ok := t.indexes()[idxName]
+	if !ok || tree == nil {
+		return nil, false
+	}
+	scan := newScanConds(meta, conds, filters)
+	typ := meta.Fields[fi].Type
+
+	// emit 把一条索引条目展开成结果行；values 为该索引键对应的字段值。
+	emit := func(val interface{}, pkList []int64, rows [][]interface{}) [][]interface{} {
+		if limit >= 0 && len(rows)+len(pkList) > limit {
+			pkList = pkList[:limit-len(rows)]
+		}
+		for _, pk := range pkList {
+			row := make([]interface{}, width)
+			for i, of := range outFields {
+				if of == fi {
+					row[i] = val
+				} else {
+					row[i] = pk
+				}
+			}
+			rows = append(rows, row)
+		}
+		return rows
+	}
+	// 结果按主键序输出，与顺序扫描路径保持一致（无 ORDER BY 时也稳定）
+	sortPKs := func(pks []int64) {
+		sort.Slice(pks, func(a, c int) bool { return pks[a] < pks[c] })
+	}
+
+	// 等值：直接取索引条目
+	if len(conds) == 1 && len(filters) == 0 {
+		var val interface{}
+		for _, v := range conds {
+			val = v
+		}
+		switch typ {
+		case TypeInt:
+			if _, ok := val.(int64); !ok {
+				return nil, false
+			}
+		case TypeVarchar:
+			if _, ok := val.(string); !ok {
+				return nil, false
+			}
+		case TypeBool:
+			if _, ok := val.(bool); !ok {
+				return nil, false
+			}
+		}
+		pkList, found := tree.Get(t.encodeIndexValue(field, val))
+		if !found {
+			return [][]interface{}{}, true
+		}
+		pkList = append([]int64(nil), pkList...) // 不改树内列表
+		sortPKs(pkList)
+		return emit(val, pkList, make([][]interface{}, 0, len(pkList))), true
+	}
+
+	// 范围：合并该字段上的所有边界（编码保序，字符串可直接比较）
+	if typ != TypeInt && typ != TypeVarchar {
+		return nil, false
+	}
+	var lo, hi *string
+	for i := range filters {
+		loI, hiI, okB := t.indexRangeBounds(fi, filters[i])
+		if !okB {
+			return nil, false // 有无法下推的条件，交给回表路径
+		}
+		if loI != nil && (lo == nil || *loI > *lo) {
+			lo = loI
+		}
+		if hiI != nil && (hi == nil || *hiI < *hi) {
+			hi = hiI
+		}
+	}
+	// 同一索引键可能对应多个主键，键值只在相邻条目变化一次，避免重复解码
+	type pkVal struct {
+		pk  int64
+		val interface{}
+	}
+	pairs := make([]pkVal, 0, 16)
+	tree.scanRangeStop(lo, hi, func(idxKey string, pkList []int64) bool {
+		val := decodeIndexValue(typ, idxKey)
+		// 区间是"偏宽"的（例如 lt v 含 v），用完整谓词剔除端点等边界
+		if !scan.matchField(fi, scanValOf(val)) {
+			return true
+		}
+		for _, pk := range pkList {
+			pairs = append(pairs, pkVal{pk: pk, val: val})
+		}
+		return true
+	})
+	// 全局按主键排序：与顺序扫描路径的结果顺序保持一致
+	sort.Slice(pairs, func(a, c int) bool { return pairs[a].pk < pairs[c].pk })
+	rows := make([][]interface{}, 0, len(pairs))
+	for _, p := range pairs {
+		row := make([]interface{}, width)
+		for i, of := range outFields {
+			if of == fi {
+				row[i] = p.val
+			} else {
+				row[i] = p.pk
+			}
+		}
+		rows = append(rows, row)
+		if limit >= 0 && len(rows) >= limit {
+			break
+		}
+	}
+	return rows, true
+}
+
+// decodeIndexValue 把保序索引键还原成字段原始值（encodeIndexValue 的逆运算）。
+func decodeIndexValue(typ FieldType, key string) interface{} {
+	switch typ {
+	case TypeInt:
+		if len(key) != 8 {
+			return int64(0)
+		}
+		var b [8]byte
+		copy(b[:], key)
+		return int64(binary.BigEndian.Uint64(b[:]))
+	case TypeVarchar:
+		return key
+	}
+	return nil
+}
+
+// scanValOf 把已解码的列值转成 scanVal，复用 matchField 的类型化比较语义。
+func scanValOf(v interface{}) scanVal {
+	switch x := v.(type) {
+	case int64:
+		return scanVal{kind: condInt, i: x}
+	case string:
+		return scanVal{kind: condString, s: x}
+	case bool:
+		return scanVal{kind: condBool, b: x}
+	}
+	return scanVal{kind: condNil}
+}
+
 // fieldValueAt 从编码行中按字段下标直接读取一个值（零拷贝字符串别名），
 // 供 Update/Delete 只提取索引列旧值、跳过整行 decodeRow 的场景。
 // 下标越界或行字节截断时返回 nil。
@@ -1102,6 +1577,9 @@ func (t *Table) Insert(pk int64, row map[string]interface{}, expireAt int64, txn
 			return err
 		}
 	}
+	if expireAt > 0 {
+		t.ttlRows.Store(true)
+	}
 	rowData := encodeRow(t.Meta(), row, nextRowVersion(), expireAt)
 	// 先改内存状态，再写 WAL：Compact 持有 walWriteMu 扫描时快照必然一致，
 	// 扫描期完成的写会在压缩换文件后追加到新 WAL（重放幂等，不会丢失）。
@@ -1132,6 +1610,9 @@ func (t *Table) InsertOrdered(pk int64, values []interface{}, expireAt int64, tx
 		if err := validateRowOrdered(t.Meta(), values); err != nil {
 			return err
 		}
+	}
+	if expireAt > 0 {
+		t.ttlRows.Store(true)
 	}
 	rowData := encodeRowOrdered(t.Meta(), values, nextRowVersion(), expireAt)
 	if !t.pkTree.SetNX(pk, rowData) {
@@ -1181,6 +1662,9 @@ func (t *Table) Update(pk int64, row map[string]interface{}, expireAt int64, txn
 	// 版本号改用全局单调计数器：两个并发事务改同一行时，per-row +1 会得到
 	// 相同的 v+1 从而互相认为"没变化"，提交无法发现写冲突。
 	// 索引列旧值按下标按需提取——不再解码整行 map。
+	if expireAt > 0 {
+		t.ttlRows.Store(true)
+	}
 	newVersion := nextRowVersion()
 	newData := encodeRow(meta, row, newVersion, expireAt)
 
@@ -1228,17 +1712,23 @@ func (t *Table) Delete(pk int64, txnID uint64, replay bool) error {
 // WAL 中已包含完整编码行（encodeRow 输出），恢复时直接写入树，避免 decode→encode 往返。
 // 无二级索引的表走最简路径；有索引的表按需重建索引。
 func (t *Table) replayInsert(pk int64, data []byte) {
-	if !t.pkTree.SetNX(pk, data) {
+	// 重放期无并发读者：用 SetNXMutable 原地插入，避免每次写入克隆整条路径
+	// （COW 下 n 行重放要分配 n·log n 个节点，原地插入只需 n 个）。
+	if !t.pkTree.SetNXMutable(pk, data) {
 		return
 	}
 	// 重放同样要抬高自增计数器：重启后自增不能撞上历史主键
 	t.notePK(pk)
+	// 恢复"存在 TTL 行"标记：覆盖索引据此决定能否跳过回表
+	if decodeExpireAt(data) > 0 {
+		t.ttlRows.Store(true)
+	}
 	if len(t.Meta().Indexes) == 0 {
 		return
 	}
 	row, _, _ := decodeRow(t.Meta(), data)
 	for idxName, fieldName := range t.Meta().Indexes {
-		t.indexAddPK(idxName, t.encodeIndexValue(fieldName, row[fieldName]), pk)
+		t.indexAddPKMutable(idxName, t.encodeIndexValue(fieldName, row[fieldName]), pk)
 	}
 }
 
@@ -1248,20 +1738,20 @@ func (t *Table) replayUpdate(pk int64, data []byte) {
 		return
 	}
 	if len(t.Meta().Indexes) == 0 {
-		t.pkTree.Set(pk, data)
+		t.pkTree.UpdateMutable(pk, data)
 		return
 	}
 	oldRow, _, _ := decodeRow(t.Meta(), oldData)
 	newRow, _, _ := decodeRow(t.Meta(), data)
-	t.pkTree.Set(pk, data)
+	t.pkTree.UpdateMutable(pk, data)
 	for idxName, fieldName := range t.Meta().Indexes {
-		t.updateIndex(fieldName, idxName, oldRow[fieldName], newRow[fieldName], pk)
+		t.updateIndexMutable(fieldName, idxName, oldRow[fieldName], newRow[fieldName], pk)
 	}
 }
 
 func (t *Table) replayDelete(pk int64) {
 	if len(t.Meta().Indexes) == 0 {
-		t.pkTree.Delete(pk)
+		t.pkTree.DeleteMutable(pk)
 		return
 	}
 	oldData, ok := t.pkTree.Get(pk)
@@ -1269,9 +1759,9 @@ func (t *Table) replayDelete(pk int64) {
 		return
 	}
 	oldRow, _, _ := decodeRow(t.Meta(), oldData)
-	t.pkTree.Delete(pk)
+	t.pkTree.DeleteMutable(pk)
 	for idxName, fieldName := range t.Meta().Indexes {
-		t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), pk)
+		t.indexRemovePKMutable(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), pk)
 	}
 }
 
@@ -1365,6 +1855,15 @@ func (t *Table) selectRBytes(conditions map[string]interface{}, filters []RangeC
 			}
 		}
 	}
+	// 二级索引范围下推：索引列上的范围条件（>, >=, <, <=, BETWEEN）
+	// 用索引树的有序扫描收窄候选，避免全表逐行求值。
+	// 候选过多时 indexRangeCandidates 会放弃并返回 used=false，退回下面的顺序扫描。
+	now := time.Now().UnixNano()
+	if len(filters) > 0 {
+		if out, used := t.indexRangeCandidates(meta, scan, filters, limit, now); used {
+			return out
+		}
+	}
 	// 全范围扫描（可被主键范围裁剪）：条件预编译为类型化比较器，
 	// 在行字节上直接求值（零分配），仅命中行进入结果。
 	capHint := 16
@@ -1373,7 +1872,6 @@ func (t *Table) selectRBytes(conditions map[string]interface{}, filters []RangeC
 	}
 	result := make([][]byte, 0, capHint)
 	var expired []int64
-	now := time.Now().UnixNano()
 	t.pkTree.scanRangeStop(minKey, maxKey, func(key int64, value []byte) bool {
 		if e := decodeExpireAt(value); e > 0 && now > e {
 			expired = append(expired, key)
@@ -1776,6 +2274,139 @@ func (t *Table) SelectByPK(pk int64) (map[string]interface{}, bool) {
 
 // ---------------- WAL 操作 ----------------
 
+// writeLogBatch 把一批 INSERT 写成一条 WAL 记录（多行 INSERT / 批量导入）。
+// 与逐条 writeLog 相比：记录头只写一次、只做一次通道交互、CRC 也只算一次。
+func (t *Table) writeLogBatch(txnID uint64, pks []int64, rows [][]byte) error {
+	if t.walFile == nil || len(pks) == 0 {
+		return nil
+	}
+	size := 32
+	for _, r := range rows {
+		size += len(r) + 16
+	}
+	buf := make([]byte, 0, size)
+	buf = append(buf, WALInsertBatch)
+	buf = appendVarUint(buf, uint64(t.tableID))
+	buf = appendVarUint(buf, txnID)
+	buf = appendVarUint(buf, uint64(len(pks)))
+	for i, pk := range pks {
+		buf = appendVarUint(buf, uint64(pk))
+		buf = appendVarUint(buf, uint64(len(rows[i])))
+		buf = append(buf, rows[i]...)
+	}
+	if walCRC.Load() {
+		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
+	}
+	sync := walFsync.Load() && txnID == 0
+	return appendWAL(buf, sync)
+}
+
+// insertBatchOrdered 批量插入（同一语句的多行）。语义与"逐行 txnApply + InsertOrdered"完全一致：
+//   - 事务内登记每行前像（old=nil 表示原本不存在，回滚即删除）；
+//   - 先整体校验 + 编码，失败时没有任何副作用；
+//   - 一条 WAL 记录写完（省掉 n-1 次记录头与通道交互）；
+//   - 二级索引按"索引键"聚合更新：低基数索引从 n 次树写降为每键 1 次。
+func (db *DB) insertBatchOrdered(t *Table, pks []int64, rows [][]interface{}, txnID uint64) error {
+	if len(pks) == 0 {
+		return nil
+	}
+	batchInsertCalls.Add(1) // 测试钩子：确认批量路径确实被使用
+	if t.migrating.Load() {
+		return fmt.Errorf("table %s is being altered, retry later", t.Meta().Name)
+	}
+	meta := t.Meta()
+	// 1) 校验 + 编码（此时尚未触碰任何状态）
+	encoded := make([][]byte, len(pks))
+	for i := range pks {
+		if err := validateRowOrdered(meta, rows[i]); err != nil {
+			return err
+		}
+		encoded[i] = encodeRowOrdered(meta, rows[i], nextRowVersion(), 0)
+	}
+	// 2) 语句内主键去重
+	seen := make(map[int64]struct{}, len(pks))
+	for _, pk := range pks {
+		if _, dup := seen[pk]; dup {
+			return fmt.Errorf("%w: %d", errPKExists, pk)
+		}
+		seen[pk] = struct{}{}
+	}
+	// 3) 与逐行路径相同的写互斥（避免与其他事务交错）
+	if txnID != 0 {
+		db.txnWriteMu.Lock()
+		defer db.txnWriteMu.Unlock()
+	}
+	// 4) 存在性检查（锁内做，避免 TOCTOU）
+	for _, pk := range pks {
+		if _, exists := t.pkTree.Get(pk); exists {
+			return fmt.Errorf("%w: %d", errPKExists, pk)
+		}
+	}
+	// 5) 写入主键树
+	inserted := 0
+	undo := func() {
+		for j := 0; j < inserted; j++ {
+			t.pkTree.Delete(pks[j])
+		}
+		t.rebuildIndexes()
+	}
+	for i, pk := range pks {
+		if !t.pkTree.SetNX(pk, encoded[i]) {
+			undo()
+			return fmt.Errorf("%w: %d", errPKExists, pk)
+		}
+		t.notePK(pk)
+		inserted++
+	}
+	// 6) 二级索引：按索引键聚合，每个键只写一次倒排表
+	if len(meta.Indexes) > 0 {
+		for idxName, fieldName := range meta.Indexes {
+			tree, ok := t.indexes()[idxName]
+			if !ok || tree == nil {
+				continue
+			}
+			fieldIdx := meta.fieldIndexOf(fieldName)
+			buckets := make(map[string][]int64, len(pks))
+			for i := range pks {
+				var val interface{}
+				if fieldIdx >= 0 && fieldIdx < len(rows[i]) {
+					val = rows[i][fieldIdx]
+				}
+				key := t.encodeIndexValue(fieldName, val)
+				buckets[key] = append(buckets[key], pks[i])
+			}
+			for key, added := range buckets {
+				list, _ := tree.Get(key)
+				merged := make([]int64, 0, len(list)+len(added))
+				merged = append(merged, list...)
+				merged = append(merged, added...)
+				tree.Set(key, merged)
+			}
+		}
+	}
+	// 7) 一条 WAL 记录
+	if err := t.writeLogBatch(txnID, pks, encoded); err != nil {
+		undo()
+		return err
+	}
+	// 8) 事务登记（前像为 nil：回滚即删除这些键）
+	if txnID != 0 {
+		name := meta.Name
+		db.txnMu.Lock()
+		if txn, ok := db.txns[txnID]; ok {
+			if txn.Changes[name] == nil {
+				txn.Changes[name] = make(map[int64]txnChange, len(pks))
+			}
+			for i, pk := range pks {
+				txn.Changes[name][pk] = txnChange{old: nil, newVersion: decodeVersion(encoded[i])}
+			}
+			txn.Tables[name] = true
+		}
+		db.txnMu.Unlock()
+	}
+	return nil
+}
+
 func (t *Table) writeLog(cmd byte, txnID uint64, pk int64, data []byte) error {
 	if t.walFile == nil {
 		return nil
@@ -1797,12 +2428,16 @@ func (t *Table) writeLog(cmd byte, txnID uint64, pk int64, data []byte) error {
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	return appendWAL(buf)
+	// batch 模式一律异步返回；fsync 模式下只有“没有后续 COMMIT 可等待”的记录
+	// 才在这里同步等待。事务数据由 CommitTxn 的组提交统一落盘，避免每行/每条
+	// WAL 记录各做一次 fsync；COMMIT 记录本身也异步写，等待在 txnMu 外完成。
+	sync := walFsync.Load() && txnID == 0 && cmd != WALCommit && cmd != WALRollback
+	return appendWAL(buf, sync)
 }
 
-// appendWAL 将记录提交给单写者队列。batch 模式下发送即返回（writer 异步写入缓冲并由定时刷盘）；
-// fsync 模式下发送并等待 writer 将该记录（连同同批并发写者）一起落盘后返回，实现组提交。
-func appendWAL(rec []byte) error {
+// appendWAL 将记录提交给单写者队列。sync=false 时发送即返回；sync=true 时
+// 等待 writer 将该记录（连同同批并发写者）一起 Flush+Sync 后返回。
+func appendWAL(rec []byte, sync bool) error {
 	if err := walFaultErr(); err != nil {
 		return err
 	}
@@ -1810,7 +2445,7 @@ func appendWAL(rec []byte) error {
 		return errWALClosed
 	}
 	entry := walEntry{rec: rec}
-	if walFsync.Load() {
+	if sync {
 		done := make(chan error, 1)
 		entry.sync = true
 		entry.done = done
@@ -1845,11 +2480,15 @@ func (db *DB) flushWAL() error {
 //   - rec      写入 bufio 缓冲（进程内存）；
 //   - rec.sync 或 flush：Flush 到 OS 页缓存并 Sync 落盘；多处 sync 被合并为一次组提交；
 //   - stop     冲刷缓冲后退出（供 Compact 换文件、Close 收尾）。
+// walWriteBufBytes WAL 单写者的 bufio 缓冲大小。启动时按设备落盘延迟调整：
+// 慢盘用更大的缓冲摊薄系统调用与写放大，快盘保持小缓冲以降低内存与延迟。
+var walWriteBufBytes = 256 * 1024
+
 func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
-	bw := bufio.NewWriterSize(file, 256*1024)
+	bw := bufio.NewWriterSize(file, walWriteBufBytes)
 	// writer 本地批量记账：单写者线程内累加字节数，每 32 条（或换文件/冲刷前）
 	// 统一上报。速率桶粒度为 100ms，少量跨桶误差可忽略，换来写路径 31/32
 	// 的取钟与原子累加省略。
@@ -2033,7 +2672,7 @@ func (db *DB) Compact() error {
 	}
 	// 只写临时文件的头，不动全局分帧开关：压缩失败时 writer 仍会在旧文件上追加，
 	// 若提前把开关切成 true，v1/v2 旧文件会被塞进批次头而无法重放。
-	if err := writeWALHeaderV(f, WALVersion3); err != nil {
+	if err := writeWALHeaderV(f, WALVersion4); err != nil {
 		f.Close()
 		return err
 	}
@@ -2254,6 +2893,9 @@ type Transaction struct {
 //   - old != nil && newVersion != 0：更新，old 为事务开始前的行字节
 //   - old == nil && newVersion != 0：插入
 //   - newVersion == 0：删除（old 为删除前的行字节）
+// batchInsertCalls 批量插入路径的调用次数（仅用于测试/诊断，不影响逻辑）。
+var batchInsertCalls atomic.Int64
+
 type txnChange struct {
 	old        []byte
 	newVersion int64
@@ -2279,15 +2921,19 @@ func NewDB(cfg *Config) (*DB, error) {
 		walFile.Close()
 		return nil, err
 	}
+	// 以下任一失败都必须同时关闭文件并释放目录锁，否则同一目录无法再次启动
+	//（崩溃一致性测试发现：坏 WAL 会让目录锁永久泄漏）。
 	info, _ := walFile.Stat()
 	if info.Size() == 0 {
 		if err := writeWALHeader(walFile); err != nil {
 			walFile.Close()
+			releaseDirLock(dirLock)
 			return nil, err
 		}
 	} else {
 		if err := verifyWALHeader(walFile); err != nil {
 			walFile.Close()
+			releaseDirLock(dirLock)
 			return nil, err
 		}
 		// 旧文件按原格式追加（writer 的分帧开关跟文件版本走），
@@ -2296,14 +2942,16 @@ func NewDB(cfg *Config) (*DB, error) {
 		v, err := walHeaderVersion(walFile)
 		if err != nil {
 			walFile.Close()
+			releaseDirLock(dirLock)
 			return nil, err
 		}
-		walFramed.Store(v == WALVersion3)
+		walFramed.Store(v == WALVersion3 || v == WALVersion4)
 	}
 
 	privStore, err := NewPrivilegeStore(cfg.WALDir + "/" + cfg.PrivilegeFile)
 	if err != nil {
 		walFile.Close()
+		releaseDirLock(dirLock)
 		return nil, err
 	}
 
@@ -2324,6 +2972,15 @@ func NewDB(cfg *Config) (*DB, error) {
 	setTrustedProxies(cfg.TrustedProxies)
 	mysqlCfg.load(cfg.WALDir)
 	db.groupCommit = NewGroupCommitter(db, cfg.GroupCommitInterval)
+	// 设备探测：按落盘延迟/核数调整组提交窗口、WAL 缓冲与重放并行度。
+	// 必须在 WAL writer 启动前执行（writer 创建 bufio 时读取缓冲大小）。
+	tune := applyTuning(cfg)
+	db.groupCommit.setWindowBounds(tune.CommitMin, tune.CommitMax, 0)
+	// 索引树实现必须在 loadWAL 之前确定：重放过程就是重建主键树与二级索引树，
+	// 之后再改只会影响新表，导致同一进程里两套结构并存（语义一致但难排查）。
+	setTreeKind(parseTreeKind(cfg.TreeKind))
+	setTreeMode(parseTreeMode(cfg.TreeMode))
+	logf(LOG_VERB, "index tree: %s (%s mode)", currentTreeKind(), currentTreeMode())
 	db.flushTicker = time.NewTicker(cfg.FlushInterval)
 	db.ttlTicker = time.NewTicker(cfg.TTLCleanInterval)
 	db.wg.Add(2)
@@ -2343,6 +3000,22 @@ func NewDB(cfg *Config) (*DB, error) {
 	go db.startMetricsServer()
 
 	if err := db.loadWAL(); err != nil {
+		// 加载失败必须完整回滚：停止已启动的后台循环、关闭监控端口、
+		// 释放数据目录锁并关闭 WAL 文件。
+		// （此前直接 return，导致目录锁泄漏——重启同一目录会一直失败，
+		//   同时后台 goroutine 会带着半初始化的 DB 继续跑。由崩溃一致性测试发现。）
+		close(db.stopCh)
+		db.flushTicker.Stop()
+		db.ttlTicker.Stop()
+		if db.autoCompactTicker != nil {
+			db.autoCompactTicker.Stop()
+		}
+		if srv := db.metricsServer.Load(); srv != nil {
+			srv.Close()
+		}
+		db.wg.Wait()
+		releaseDirLock(dirLock)
+		walFile.Close()
 		return nil, err
 	}
 	// 创建 WAL 写缓冲（loadWAL 完成后，确保文件偏移在末尾）
@@ -2369,7 +3042,7 @@ func NewDB(cfg *Config) (*DB, error) {
 
 // writeWALHeader 新建 WAL 文件时写 v3 头（分帧 + 批量校验）。
 func writeWALHeader(f *os.File) error {
-	if err := writeWALHeaderV(f, WALVersion3); err != nil {
+	if err := writeWALHeaderV(f, WALVersion4); err != nil {
 		return err
 	}
 	walFramed.Store(true)
@@ -2392,8 +3065,8 @@ func verifyWALHeader(f *os.File) error {
 		return err
 	}
 	// v1 紧凑格式版本号即为 1；v2 同格式；v3 为分帧格式（带批次长度与校验和）
-	if version != 1 && version != 2 && version != WALVersion3 {
-		return fmt.Errorf("unsupported WAL version %d, expected %d, 2 or %d", version, WALVersion, WALVersion3)
+	if version != 1 && version != 2 && version != WALVersion3 && version != WALVersion4 {
+		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d or %d", version, WALVersion3, WALVersion4)
 	}
 	var reserved uint32
 	if err := binary.Read(f, binary.BigEndian, &reserved); err != nil {
@@ -2574,21 +3247,22 @@ func (db *DB) loadWAL() error {
 		pendingTxns: make(map[uint64][]walOp),
 		baseOffset:  int64(headerLen),
 	}
+	// 启动段式重放的应用侧：解析与回填重叠进行
+	ctx.startApplier()
+	defer ctx.stopApplier()
 	switch version {
-	case WALVersion3:
-		// v3 分帧：按批流式读入（内存只与最大批次相关，不再整文件入内存）
+	case WALVersion3, WALVersion4:
+		// v3/v4 分帧：按批流式读入（内存只与最大批次相关，不再整文件入内存）
 		// 显式定位到记录区，不依赖 walHeaderVersion 读完后遗留的偏移
 		if _, err := file.Seek(int64(headerLen), io.SeekStart); err != nil {
 			return err
 		}
 		err = ctx.loadV3(st.Size())
-		walLoadRows = ctx.loadedRows
-		ctx.walProgressFinish()
-		if err != nil {
-			return err
-		}
+		// 等所有在途段应用完再统计行数/收尾进度条（异步应用可能仍在跑）
 		ctx.flushPending()
-		return nil
+		walLoadRows = ctx.loadedRows.Load()
+		ctx.walProgressFinish()
+		return err
 	case WALVersion, 2:
 		// 旧格式没有长度前缀，只能整文件读入后顺序切分
 		if st.Size() > 1<<32 {
@@ -2605,11 +3279,11 @@ func (db *DB) loadWAL() error {
 		ctx.atEOF = true
 		return ctx.loadV2()
 	default:
-		return fmt.Errorf("unsupported WAL version %d, expected %d or %d", version, WALVersion, WALVersion3)
+		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d or %d", version, WALVersion3, WALVersion4)
 	}
 }
 
-// walReplayCtx 承载 v1/v2 共用的按表并行重放基础设施
+// walReplayCtx 承载 v1/v2/v3 共用的重放基础设施
 type walReplayCtx struct {
 	db          *DB
 	file        *os.File
@@ -2618,7 +3292,10 @@ type walReplayCtx struct {
 	enableCRC   bool
 	pending     map[string][]walOp
 	pendingTxns map[uint64][]walOp
-	loadedRows  int64
+	// pendingBytes 当前缓冲里记录数据的总字节数，与 pendingOps 共同决定何时切段。
+	pendingOps  int
+	pendingBytes int64
+	loadedRows  atomic.Int64
 	totalRows   int64
 	lastPct     int
 	barDone     bool
@@ -2628,6 +3305,114 @@ type walReplayCtx struct {
 	// atEOF 当前 buf 是否已是文件最后一段：只有这里才允许把残缺记录当崩溃残留截断，
 	// 中间批次的残缺是真正的损坏。
 	atEOF bool
+	// 段式并行：解析（读 varint、切 data 引用）与应用（树插入、索引维护）原本串行
+	// 交替。这里把"应用"交给单个后台 goroutine：解析完一段就投递并继续下一段，
+	// 实现解析与应用重叠；段内仍按表并行。段严格按投递顺序串行应用，因此
+	// "同表记录保持写入顺序"的语义不变。
+	applyCh   chan map[string][]walOp
+	applyWG   *sync.WaitGroup
+	applyDone chan struct{}
+	// progressMu 保护 lastPct/barDone：进度条会被解析侧与应用侧两个 goroutine
+	// 同时刷新（解析推进与段应用完成都会调用 walProgressBar）。
+	progressMu sync.Mutex
+}
+
+// 段式重放参数：单段记录数/字节上限决定流水线的粒度与峰值内存。
+// 默认面向常见机器；启动探测会按核数与内存压力调整（小机器缩小段大小，
+// 大机器限制并行 worker 数量避免调度开销）。
+var (
+	replaySegmentOps   = 65536   // 单段记录数上限
+	replaySegmentBytes = 8 << 20 // 单段数据字节上限（含行载荷）
+)
+
+const replayApplyDepth = 2 // 在途段数：1 = 纯重叠，2 = 再多一段缓冲
+
+// startApplier 启动应用侧 goroutine（每次重放调用一次）。
+func (c *walReplayCtx) startApplier() {
+	if !replayPipeline {
+		// 单核/极小内存：不做流水线。解析完一段就同步回填，
+		// 内存同样按段有界，但省掉 goroutine 与通道开销。
+		return
+	}
+	c.applyCh = make(chan map[string][]walOp, replayApplyDepth)
+	c.applyWG = &sync.WaitGroup{}
+	c.applyDone = make(chan struct{})
+	go func() {
+		defer close(c.applyDone)
+		for seg := range c.applyCh {
+			c.applySegment(seg)
+			c.applyWG.Done()
+		}
+	}()
+}
+
+// stopApplier 冲刷余下段并等待应用侧退出。
+func (c *walReplayCtx) stopApplier() {
+	if c.applyCh == nil {
+		return
+	}
+	close(c.applyCh)
+	<-c.applyDone
+	c.applyCh = nil
+}
+
+// queuePending 把当前缓冲切成一段投递（异步）；缓冲为空时为空操作。
+func (c *walReplayCtx) queuePending() {
+	if len(c.pending) == 0 {
+		return
+	}
+	seg := c.pending
+	// 换成新 map：解析侧继续往新缓冲写，应用侧独占旧 map
+	c.pending = make(map[string][]walOp, len(seg))
+	c.pendingOps = 0
+	c.pendingBytes = 0
+	if c.applyCh == nil {
+		// 同步模式（无流水线）：直接应用这一段
+		c.applySegment(seg)
+		return
+	}
+	c.applyWG.Add(1)
+	c.applyCh <- seg
+}
+
+// drainPending 投递当前缓冲并等待所有在途段应用完成（屏障）。
+// 目录变更、事务边界与重放收尾都必须过这道屏障，保证元数据/顺序可见。
+func (c *walReplayCtx) drainPending() {
+	c.queuePending()
+	if c.applyWG != nil {
+		c.applyWG.Wait()
+	}
+}
+
+// applySegment 应用一段内的全部记录：段内按表并行，同表串行。
+func (c *walReplayCtx) applySegment(seg map[string][]walOp) {
+	if len(seg) == 0 {
+		return
+	}
+	c.walProgressBar(c.loadedRows.Load())
+	workers := replayWorkerCount(len(seg))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var applied atomic.Int64
+	for tableName, ops := range seg {
+		table := c.db.getOrCreateTable(tableName)
+		if table == nil {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(t *Table, recs []walOp) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			for _, op := range recs {
+				c.applyOpOnTable(t, op.cmd, op.pk, op.data)
+			}
+			applied.Add(int64(len(recs))) // 每表一次，而非每行一次
+		}(table, ops)
+	}
+	wg.Wait()
+	c.loadedRows.Add(applied.Load())
+	c.walProgressBar(c.loadedRows.Load())
 }
 
 // walProgressBar 渲染并刷新一条 Minecraft 风味的加载进度条（\r 原地刷新，不换行）。
@@ -2638,6 +3423,8 @@ func (c *walReplayCtx) walProgressBar(rows int64) bool {
 	if total < 100000 {
 		return false
 	}
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
 	var pct int
 	if rows >= total {
 		pct = 100
@@ -2665,16 +3452,22 @@ func (c *walReplayCtx) walProgressFinish() {
 	if c.barDone || c.totalRows < 100000 {
 		return
 	}
+	c.progressMu.Lock()
+	defer c.progressMu.Unlock()
+	if c.barDone {
+		return
+	}
 	width := 24
 	bar := strings.Repeat("#", width)
-	rows := atomic.LoadInt64(&c.loadedRows)
+	rows := c.loadedRows.Load()
 	fmt.Printf("\r[INFO] Loading databases... [%s] 100%% (%d rows)\n", bar, rows)
 	c.barDone = true
 }
 
-// applyOpOnTable 直接应用到已解析的表，避免每 op 一次表查找（RLock + map）。
+// applyOpOnTable 应用一条记录到指定表，不做计数。
+// 计数由调用方在整批/整表应用完后一次性累加：每行一次原子加会让所有并行
+// worker 争用同一 cache line，是大表重放里明显的串行化点。
 func (c *walReplayCtx) applyOpOnTable(t *Table, cmd byte, pk int64, data []byte) {
-	atomic.AddInt64(&c.loadedRows, 1)
 	switch cmd {
 	case WALInsert:
 		t.replayInsert(pk, data)
@@ -2693,33 +3486,10 @@ func (c *walReplayCtx) applyOp(tableName string, cmd byte, pk int64, data []byte
 	c.applyOpOnTable(table, cmd, pk, data)
 }
 
-// 并行应用当前缓冲：不同表互不冲突，可安全并行；同表记录保持顺序。
-// 使用有界 worker 池（GOMAXPROCS）而非每表一 goroutine，避免表很多时线程风暴。
+// flushPending 是同步屏障：投递缓冲并等待全部在途段应用完成。
+// 目录变更、事务 BEGIN、重放收尾都依赖它维持顺序与元数据可见性。
 func (c *walReplayCtx) flushPending() {
-	if len(c.pending) == 0 {
-		return
-	}
-	c.walProgressBar(c.loadedRows)
-	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
-	var wg sync.WaitGroup
-	for tableName, ops := range c.pending {
-		table := c.db.getOrCreateTable(tableName)
-		if table == nil {
-			continue
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(t *Table, recs []walOp) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			for _, op := range recs {
-				c.applyOpOnTable(t, op.cmd, op.pk, op.data)
-			}
-		}(table, ops)
-	}
-	wg.Wait()
-	c.walProgressBar(c.loadedRows)
-	c.pending = make(map[string][]walOp)
+	c.drainPending()
 }
 
 // 崩溃/强杀留下的残缺尾部记录：截断丢弃而不是启动失败
@@ -2750,7 +3520,7 @@ func (c *walReplayCtx) loadV2() error {
 	c.totalRows = c.estimateRows()
 	err := c.parseV2()
 	c.flushPending()
-	walLoadRows = c.loadedRows
+	walLoadRows = c.loadedRows.Load()
 	c.walProgressFinish()
 	return err
 }
@@ -2819,6 +3589,34 @@ func (c *walReplayCtx) estimateRows() int64 {
 		}
 		// 数据记录
 		isTxnCmd := cmd == WALBegin || cmd == WALCommit || cmd == WALRollback
+		if cmd == WALInsertBatch {
+			// [cmd][tableID][txnID][count]([pk][len][data])*count
+			_, ok1 := readVarUint(buf, &pos)
+			_, ok2 := readVarUint(buf, &pos)
+			cnt, ok3 := readVarUint(buf, &pos)
+			if !ok1 || !ok2 || !ok3 {
+				break
+			}
+			for i := uint64(0); i < cnt; i++ {
+				if _, ok := readVarUint(buf, &pos); !ok {
+					break
+				}
+				n, ok := readVarUint(buf, &pos)
+				if !ok {
+					break
+				}
+				if int(n) > len(buf)-pos {
+					pos = len(buf)
+				} else {
+					pos += int(n)
+				}
+				count++
+			}
+			if c.enableCRC && pos+4 <= len(buf) {
+				pos += 4
+			}
+			continue
+		}
 		fields := 1
 		if !isTxnCmd {
 			fields = 3
@@ -2875,7 +3673,7 @@ func (c *walReplayCtx) parseV2() error {
 
 loop:
 	for pos < len(buf) {
-		c.walProgressBar(c.loadedRows)
+		c.walProgressBar(c.loadedRows.Load())
 		recordStart := pos
 		cmd := buf[pos]
 		pos++
@@ -3056,12 +3854,14 @@ loop:
 		}
 
 		// 数据记录：事务命令（BEGIN/COMMIT/ROLLBACK）在写侧不编码表 ID 与 pk/data，
-		// 仅 [cmd][varint txnID]；行记录为 [cmd][varint tableID][varint txnID][varint pk][varint len][data]。
+		// 仅 [cmd][varint txnID]；行记录为 [cmd][varint tableID][varint txnID][varint pk][varint len][data]；
+		// 批量插入为 [cmd][varint tableID][varint txnID][varint count]([varint pk][varint len][data])*count。
 		isTxnCmd := cmd == WALBegin || cmd == WALCommit || cmd == WALRollback
 		var tableName string
 		var txnID uint64
 		var pk int64
 		var data []byte
+		var batchOps []walOp
 		if isTxnCmd {
 			var ok bool
 			txnID, ok = readVarUint(buf, &pos)
@@ -3090,24 +3890,54 @@ loop:
 				}
 				return fmt.Errorf("incomplete txn id")
 			}
-			pkv, ok := readVarUint(buf, &pos)
-			if !ok {
-				if tail(recordStart) {
-					break loop
+			if cmd == WALInsertBatch {
+				// 批量插入：count 组 (pk, data)
+				count, okc := readVarUint(buf, &pos)
+				if !okc {
+					if tail(recordStart) {
+						break loop
+					}
+					return fmt.Errorf("incomplete batch count")
 				}
-				return fmt.Errorf("incomplete pk")
-			}
-			pk = int64(pkv)
-			raw, ok := takeVarBytes(buf, &pos)
-			if !ok {
-				if tail(recordStart) {
-					break loop
+				batchOps = make([]walOp, 0, count)
+				for i := uint64(0); i < count; i++ {
+					pkv, okp := readVarUint(buf, &pos)
+					if !okp {
+						if tail(recordStart) {
+							break loop
+						}
+						return fmt.Errorf("incomplete batch pk")
+					}
+					raw, okr := takeVarBytes(buf, &pos)
+					if !okr {
+						if tail(recordStart) {
+							break loop
+						}
+						return fmt.Errorf("incomplete batch data")
+					}
+					// 同上：行字节必须拷贝，不能引用启动时的整文件缓冲
+					batchOps = append(batchOps, walOp{tableName, WALInsert, int64(pkv), append([]byte(nil), raw...)})
 				}
-				return fmt.Errorf("incomplete record data")
+			} else {
+				pkv, okp := readVarUint(buf, &pos)
+				if !okp {
+					if tail(recordStart) {
+						break loop
+					}
+					return fmt.Errorf("incomplete pk")
+				}
+				pk = int64(pkv)
+				raw, okr := takeVarBytes(buf, &pos)
+				if !okr {
+					if tail(recordStart) {
+						break loop
+					}
+					return fmt.Errorf("incomplete record data")
+				}
+				// 拷贝出记录数据：整个 WAL 在启动时一次性读入内存，若行值直接引用
+				// 该缓冲，载入后大文件字节将随行数据永久驻留无法回收。
+				data = append([]byte(nil), raw...)
 			}
-			// 拷贝出记录数据：整个 WAL 在启动时一次性读入内存，若行值直接引用
-			// 该缓冲，载入后大文件字节将随行数据永久驻留无法回收。
-			data = append([]byte(nil), raw...)
 		}
 
 		if c.enableCRC {
@@ -3129,9 +3959,28 @@ loop:
 		}
 
 		switch cmd {
+		case WALInsertBatch:
+			if txnID == 0 {
+				for _, op := range batchOps {
+					c.pending[tableName] = append(c.pending[tableName], op)
+					c.pendingOps++
+					c.pendingBytes += int64(len(op.data))
+				}
+				if c.pendingOps >= replaySegmentOps || c.pendingBytes >= int64(replaySegmentBytes) {
+					c.queuePending()
+				}
+			} else {
+				c.pendingTxns[txnID] = append(c.pendingTxns[txnID], batchOps...)
+			}
 		case WALInsert, WALUpdate, WALDelete:
 			if txnID == 0 {
 				c.pending[tableName] = append(c.pending[tableName], walOp{tableName, cmd, pk, data})
+				c.pendingOps++
+				c.pendingBytes += int64(len(data))
+				// 攒够一段就投递给应用侧，边解析边回填
+				if c.pendingOps >= replaySegmentOps || c.pendingBytes >= int64(replaySegmentBytes) {
+					c.queuePending()
+				}
 			} else {
 				c.pendingTxns[txnID] = append(c.pendingTxns[txnID], walOp{tableName, cmd, pk, data})
 			}
@@ -3139,8 +3988,13 @@ loop:
 			c.flushPending()
 			c.pendingTxns[txnID] = nil
 		case WALCommit:
+			// 先把在途的非事务段刷完，否则事务写入可能与先前的自动提交写入乱序
+			if len(c.pending) > 0 {
+				c.drainPending()
+			}
 			var curT *Table
 			var curName string
+			var n int64
 			for _, op := range c.pendingTxns[txnID] {
 				if curT == nil || op.table != curName {
 					curT = c.db.getOrCreateTable(op.table)
@@ -3148,8 +4002,10 @@ loop:
 				}
 				if curT != nil {
 					c.applyOpOnTable(curT, op.cmd, op.pk, op.data)
+					n++
 				}
 			}
+			c.loadedRows.Add(n)
 			delete(c.pendingTxns, txnID)
 		case WALRollback:
 			delete(c.pendingTxns, txnID)
@@ -3340,7 +4196,7 @@ func (db *DB) writeCatalogID(meta *TableMeta, fixedID uint32) error {
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	if err := appendWAL(buf); err != nil {
+	if err := appendWAL(buf, false); err != nil {
 		return err
 	}
 	return db.flushWAL()
@@ -3356,7 +4212,7 @@ func (db *DB) writeCatalogDrop(name string) error {
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	if err := appendWAL(buf); err != nil {
+	if err := appendWAL(buf, false); err != nil {
 		return err
 	}
 	return db.flushWAL()
@@ -3371,7 +4227,7 @@ func (db *DB) writeCatalogRename(id uint32, newName string) error {
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	if err := appendWAL(buf); err != nil {
+	if err := appendWAL(buf, false); err != nil {
 		return err
 	}
 	return db.flushWAL()
@@ -3475,13 +4331,16 @@ func (db *DB) CommitTxn(id uint64) error {
 			return err
 		}
 	}
-	// batch 模式下经 GroupCommitter 合并等待一次定时刷盘保证提交持久化；
-	// fsync 模式下 appendWAL 已在 writer 中同步落盘，无需再等（避免双重等待）。
+	// batch 模式：COMMIT 记录入队后立即返回，由 flushLoop 按 flush_interval
+	// 定期落盘（可能丢失最后一个刷盘窗口，配置语义如此）。
+	// fsync 模式：COMMIT 记录同样异步入队，但提交者在这里登记组提交，并在
+	// 释放 txnMu 后等待一次 Flush+Sync。这样多个并发提交可以共享一次 fsync，
+	// 而不是每个事务在 txnMu 内单独等盘。
 	// 等待在锁外进行：Join 仅登记等待者（微秒级），真正的刷盘等待（毫秒级）
 	// 不占 txnMu，让其他事务的冲突检测/落盘登记得以并行——冲突检测本身
 	// 已在上方临界区内完成，等待挪出锁外不削弱正确性。
-	var done <-chan struct{}
-	if !walFsync.Load() {
+	var done <-chan error
+	if walFsync.Load() {
 		done = db.groupCommit.Join()
 	}
 
@@ -3491,7 +4350,9 @@ func (db *DB) CommitTxn(id uint64) error {
 	db.txnMu.Unlock()
 
 	if done != nil {
-		<-done
+		if err := <-done; err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -3733,39 +4594,163 @@ func (db *DB) Backup() error {
 	return nil
 }
 
-// 组提交
+// 组提交：只服务 fsync 模式。把并发提交的 COMMIT 合并成一次
+// flushWAL（bufio.Flush + file.Sync）；同一时刻只允许一个 flush 在飞，
+// 避免前一组还在 fsync 时又排入新的 flush，把 HDD 的磁头来回打断。
 type GroupCommitter struct {
 	db       *DB
-	interval time.Duration
+	interval time.Duration // 配置热更新失败时的兜底窗口
 	mu       sync.Mutex
-	waiters  []chan struct{}
+	waiters  []chan error
 	timer    *time.Timer
+	flushing bool
+	// adaptive 自适应提交窗口：固定窗口在两种极端下都不划算——
+	// 低并发时白等一个窗口才落盘（纯延迟），高并发时窗口太短攒不够批
+	// （fsync 次数降不下来）。这里用"上一批攒了多少人 + 一次 fsync 多贵"
+	// 反馈调节窗口，等价于 PostgreSQL/Kafka 的自适应组提交。
+	adaptive time.Duration
+	// winMin/winMax 自适应窗口的上下界，由启动时的设备探测设定：
+	// 慢盘（机械盘/网络盘）一次 fsync 就要十几毫秒，窗口该开得更大才攒得起批。
+	winMin time.Duration
+	winMax time.Duration
+}
+
+// 自适应窗口的默认上下界：下界避免无意义空等，上界避免明显放大尾延迟。
+const (
+	gcWindowMin = 200 * time.Microsecond
+	gcWindowMax = 20 * time.Millisecond
+)
+
+// setWindowBounds 由设备探测调用，设定窗口上下界与初始窗口。
+func (gc *GroupCommitter) setWindowBounds(minW, maxW, initial time.Duration) {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	if minW > 0 {
+		gc.winMin = minW
+	}
+	if maxW > 0 {
+		gc.winMax = maxW
+	}
+	if initial > 0 {
+		gc.adaptive = initial
+	}
+}
+
+func (gc *GroupCommitter) boundsLocked() (time.Duration, time.Duration) {
+	lo, hi := gc.winMin, gc.winMax
+	if lo <= 0 {
+		lo = gcWindowMin
+	}
+	if hi <= 0 {
+		hi = gcWindowMax
+	}
+	return lo, hi
 }
 
 func NewGroupCommitter(db *DB, interval time.Duration) *GroupCommitter {
 	return &GroupCommitter{db: db, interval: interval}
 }
-func (gc *GroupCommitter) Join() <-chan struct{} {
+
+// commitWindowLocked 计算本次窗口（调用方须持有 gc.mu）。
+func (gc *GroupCommitter) commitWindowLocked() time.Duration {
+	base := gc.interval
+	if gc.db != nil {
+		if d := gc.db.configSnapshot().GroupCommitInterval; d > 0 {
+			base = d
+		}
+	}
+	if base <= 0 {
+		base = 2 * time.Millisecond
+	}
+	if gc.adaptive > 0 {
+		return gc.adaptive
+	}
+	return base
+}
+
+func (gc *GroupCommitter) commitWindow() time.Duration {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
-	ch := make(chan struct{}, 1)
+	return gc.commitWindowLocked()
+}
+
+// observe 用上一批的规模与落盘耗时调整下一批窗口。
+//   - 一批攒到很多写者：说明还有并发，窗口加倍能继续摊薄 fsync；
+//   - 一批只有 1 个写者：等待纯属加延迟，窗口减半；
+//   - 中间规模：小幅放大。
+//
+// 另外把窗口钳制在"一次 fsync 耗时的数倍"以内——再等下去也不会提升吞吐。
+func (gc *GroupCommitter) observe(n int, fsyncCost time.Duration) {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	cur := gc.commitWindowLocked()
+	var next time.Duration
+	switch {
+	case n >= 8:
+		next = cur * 2
+	case n >= 2:
+		next = cur + cur/4
+	default:
+		next = cur / 2
+	}
+	if fsyncCost > 0 {
+		if maxWindow := fsyncCost * 4; next > maxWindow {
+			next = maxWindow
+		}
+	}
+	lo, hi := gc.boundsLocked()
+	if next < lo {
+		next = lo
+	}
+	if next > hi {
+		next = hi
+	}
+	gc.adaptive = next
+}
+
+func (gc *GroupCommitter) Join() <-chan error {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	ch := make(chan error, 1)
 	gc.waiters = append(gc.waiters, ch)
-	if gc.timer == nil {
-		gc.timer = time.AfterFunc(gc.interval, gc.flush)
+	if gc.timer == nil && !gc.flushing {
+		gc.timer = time.AfterFunc(gc.commitWindowLocked(), gc.flush)
 	}
 	return ch
 }
+
 func (gc *GroupCommitter) flush() {
 	gc.mu.Lock()
-	waiters := gc.waiters
-	gc.waiters = nil
-	gc.timer = nil
-	gc.mu.Unlock()
-	if len(waiters) == 0 {
+	if gc.flushing {
+		gc.mu.Unlock()
 		return
 	}
-	gc.db.flushWAL()
+	waiters := gc.waiters
+	if len(waiters) == 0 {
+		gc.timer = nil
+		gc.mu.Unlock()
+		return
+	}
+	gc.waiters = nil
+	gc.timer = nil
+	gc.flushing = true
+	gc.mu.Unlock()
+
+	begin := time.Now()
+	err := gc.db.flushWAL()
+	cost := time.Since(begin)
+	// 无锁区间内更新窗口：不阻塞等待者唤醒
+	gc.observe(len(waiters), cost)
+
 	for _, ch := range waiters {
+		ch <- err
 		close(ch)
 	}
+
+	gc.mu.Lock()
+	gc.flushing = false
+	if len(gc.waiters) > 0 && gc.timer == nil {
+		gc.timer = time.AfterFunc(gc.commitWindowLocked(), gc.flush)
+	}
+	gc.mu.Unlock()
 }

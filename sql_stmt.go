@@ -53,7 +53,7 @@ func (db *DB) renameTable(oldName, newName string) error {
 	if walCRC.Load() {
 		buf = appendU32(buf, crc32.ChecksumIEEE(buf))
 	}
-	if err := appendWAL(buf); err != nil {
+	if err := appendWAL(buf, false); err != nil {
 		return err
 	}
 	db.applyCatalogRenameV2(id, newName)
