@@ -184,11 +184,22 @@ func (k sqlStmtKind) perm() byte {
 	return PermAll
 }
 
+// sqlColumnRef 是 SELECT 投影里的一个列引用。Table 为空表示未限定（`col`），
+// 非空表示限定写法（`t.col` / `db.t.col`，取最后两段）。
+type sqlColumnRef struct {
+	Table  string
+	Column string
+}
+
 // sqlAccess 是一条语句的权限画像。
 type sqlAccess struct {
 	Kind   sqlStmtKind
 	Tables []string // 引用到的物理表（保留原始大小写，比较时统一小写）
 	DB     string   // USE 的目标库 / 库级 DDL 的库名
+	// SELECT 投影里引用到的列（仅 sqlRead 且首词为 SELECT 时填充），
+	// 用于列级读权限校验。Star=true 表示投影中出现裸 `*` 或 `t.*`。
+	Columns []sqlColumnRef
+	Star    bool
 }
 
 // analyzeSQL 对原始 SQL 做权限相关分析。解析失败返回 error（调用方应拒绝）。
@@ -238,6 +249,11 @@ func analyzeSQLTokens(toks []sqlToken) (sqlAccess, error) {
 	}
 
 	a.Tables = extractTableRefs(toks, i, a.Kind, tokUp(head))
+	// SELECT 投影列：列级权限校验的输入。只对首词为 SELECT 的读语句填充
+	//（SHOW / DESCRIBE / EXPLAIN 不返回行数据，不做列级限制）。
+	if a.Kind == sqlRead && tokUp(head) == "SELECT" {
+		a.Columns, a.Star = extractSelectProjection(toks, i)
+	}
 	// USE / CREATE DATABASE / DROP DATABASE：取库名
 	if a.Kind == sqlUse {
 		if j := i + 1; j < len(toks) && isNameToken(toks[j]) {
@@ -369,6 +385,80 @@ func extractTableRefs(toks []sqlToken, start int, kind sqlStmtKind, head string)
 	return names
 }
 
+// extractSelectProjection 从 SELECT 的投影段（SELECT 之后、顶层 FROM 之前）
+// 提取列引用，供列级权限校验。
+//
+// 规则（宁可多判、不可漏判）：
+//   - 顶层裸 `*` / `t.*` → star=true（配置了列白名单时整条 SELECT 被拒）；
+//   - 函数名（紧跟 "(" 的标识符）不算列；函数参数里的标识符仍算列
+//     （COUNT(*) 不算列，COUNT(DISTINCT secret) 会命中 secret）；
+//   - `AS alias` 里的别名不算列；DISTINCT / ALL / TRUE / FALSE / NULL 跳过；
+//   - 限定名 a.b 只取 b（a 视为表名/别名），并把 a 记录到 Table 供多表判断。
+func extractSelectProjection(toks []sqlToken, start int) (cols []sqlColumnRef, star bool) {
+	depth := 0
+	skipAlias := false
+	for j := start + 1; j < len(toks); j++ {
+		t := toks[j]
+		if t.kind == kindEof {
+			break
+		}
+		if t.kind == kindSym {
+			switch t.val {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			case "*":
+				// 只有顶层 * 才是"全部列"；COUNT(*) 里的 * 在括号内，不算。
+				if depth == 0 {
+					star = true
+				}
+			case ",":
+				if depth == 0 {
+					skipAlias = false
+				}
+			}
+			continue
+		}
+		// 顶层 FROM 之后是表引用 / WHERE / ORDER BY，不再属于投影。
+		if depth == 0 && (t.kind == kindKw || t.kind == kindIdent) && tokUp(t) == "FROM" {
+			break
+		}
+		if skipAlias {
+			skipAlias = false
+			continue
+		}
+		if t.kind != kindKw && t.kind != kindIdent && t.kind != kindStr {
+			continue
+		}
+		switch u := tokUp(t); u {
+		case "DISTINCT", "ALL":
+			continue
+		case "AS":
+			skipAlias = true
+			continue
+		case "NULL", "TRUE", "FALSE":
+			continue
+		}
+		// 函数名：紧跟 "(" 的标识符不是列。
+		if j+1 < len(toks) && toks[j+1].kind == kindSym && toks[j+1].val == "(" {
+			continue
+		}
+		// 限定名的前半段（后面紧跟 "."）是表名/别名，真正的列在后面。
+		if j+1 < len(toks) && toks[j+1].kind == kindSym && toks[j+1].val == "." {
+			continue
+		}
+		ref := sqlColumnRef{Column: t.val}
+		if j >= 2 && toks[j-1].kind == kindSym && toks[j-1].val == "." && isNameToken(toks[j-2]) {
+			ref.Table = toks[j-2].val
+		}
+		cols = append(cols, ref)
+	}
+	return cols, star
+}
+
 // ==================== Web 控制台策略 ====================
 
 // canExecSQL 权限引擎：非管理员只允许只读语句，写/DDL 一律拒绝。
@@ -421,6 +511,7 @@ func (u *User) canExecTableSQLIn(sql, curDB string) bool {
 	if err != nil {
 		return false // fail-closed：解析不出来就不放行
 	}
+	resolved := make([]string, 0, len(a.Tables))
 	for _, tn := range a.Tables {
 		lower := strings.ToLower(tn)
 		if strings.HasPrefix(lower, "information_schema.") || strings.HasPrefix(lower, "mysql.") {
@@ -430,6 +521,13 @@ func (u *User) canExecTableSQLIn(sql, curDB string) bool {
 			tn = curDB + "." + tn
 		}
 		if !u.canUseTable(tn) {
+			return false
+		}
+		resolved = append(resolved, tn)
+	}
+	// 列级读权限：与引擎侧 authorizeSQL 同一判定函数，避免两套语义。
+	if a.Kind == sqlRead {
+		if err := u.checkSelectColumns(resolved, a.Columns, a.Star); err != nil {
 			return false
 		}
 	}
@@ -447,6 +545,19 @@ func (db *DB) authorizeSQL(user string, a sqlAccess) error {
 	if user == db.rootUser() {
 		return nil
 	}
+	var u *User
+	if globalUsers != nil {
+		u = globalUsers.Get(user)
+	}
+	// GRANT / REVOKE：权限变更只允许 admin 或 CanManage 执行。
+	// 这里提前放行，避免要求执行者自己先持有 PermDDL；真正的授权范围与目标
+	// 校验在 parseGrant 里完成（同一账号检查会再做一次，双保险）。
+	if a.Kind == sqlGrant {
+		if u != nil && (u.IsAdmin || u.CanManage) {
+			return nil
+		}
+		return fmt.Errorf("permission denied: GRANT/REVOKE requires admin or manage privilege")
+	}
 	perm := a.Kind.perm()
 	if a.Kind == sqlUse {
 		// USE 会改写全局 curDB：只允许管理员通过协议执行（MySQL 连接级 USE 在协议层处理）
@@ -459,10 +570,6 @@ func (db *DB) authorizeSQL(user string, a sqlAccess) error {
 			return nil
 		}
 		return fmt.Errorf("permission denied: %s requires table-level grant", a.Kind)
-	}
-	var u *User
-	if globalUsers != nil {
-		u = globalUsers.Get(user)
 	}
 	for _, t := range a.Tables {
 		lower := strings.ToLower(t)
@@ -482,21 +589,33 @@ func (db *DB) authorizeSQL(user string, a sqlAccess) error {
 			return fmt.Errorf("permission denied: %s on table %s", a.Kind, t)
 		}
 	}
+	// 列级 SELECT 白名单：在表级校验通过之后再判，错误信息能直接指出列名。
+	// 走 acl.go 统一入口，Web 控制台与二进制 / MySQL 协议共用同一语义。
+	if a.Kind == sqlRead && u != nil {
+		if err := u.checkSelectColumns(a.Tables, a.Columns, a.Star); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // authorizeSQLText 便捷版本：分析并校验，返回分析结果供调用方复用。
 // authorizeSQLTokensFast 热路径入口：管理员直接放行，省掉表名提取的切片分配；
 // 非管理员才做完整分析（结果仅用于鉴权，调用方不消费 sqlAccess）。
-func (db *DB) authorizeSQLTokensFast(user string, toks []sqlToken) error {
+func (db *DB) authorizeSQLTokensFast(user string, toks []sqlToken, schema string) error {
 	if user == "" {
 		return fmt.Errorf("permission denied: not authenticated")
 	}
 	if user == db.rootUser() {
 		return nil
 	}
-	_, err := db.authorizeSQLTokens(user, toks)
-	return err
+	a, err := analyzeSQLTokens(toks)
+	if err != nil {
+		return err
+	}
+	// 带连接级默认库：`USE mydb` 之后的未限定表名必须按 mydb.<name> 校验，
+	// 否则表级白名单与列级限制都可能被会话库绕过。
+	return db.authorizeSQLIn(user, a, schema)
 }
 
 // authorizeSQLIn 同 authorizeSQL，但把未限定表名按会话库补齐，

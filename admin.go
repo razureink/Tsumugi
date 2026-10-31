@@ -455,7 +455,9 @@ func (db *DB) handleAdminQuery(w http.ResponseWriter, r *http.Request) {
 	if access.Kind != sqlRead && access.Kind != sqlUse && u != nil {
 		logf(LOG_VERB, "audit: user=%s action=sql kind=%d sql=%q", u.Username, access.Kind, truncateForLog(req.SQL, 200))
 	}
-	columns, rows, affected, rawMsg, err := db.runSQLSchema(req.SQL, nil, 0, schema)
+	// 带执行账号运行：GRANT/REVOKE 需要在解析层知道"谁在执行"（admin/CanManage），
+	// 同时再走一次引擎侧授权，防止 Web 预检与执行之间的语义漂移。
+	columns, rows, affected, rawMsg, err := db.runSQLSchemaAs(user, req.SQL, nil, 0, schema)
 	if err != nil {
 		writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
@@ -637,21 +639,23 @@ func (db *DB) handleUserList(w http.ResponseWriter, r *http.Request) {
 	}
 	list := globalUsers.List()
 	type safeUser struct {
-		Username  string   `json:"username"`
-		IsAdmin   bool     `json:"is_admin"`
-		CanStress bool     `json:"can_stress"`
-		CanManage bool     `json:"can_manage"`
-		Databases []string `json:"databases"`
-		Tables    []string `json:"tables"`
-		CreatedAt int64    `json:"created_at"`
-		LastLogin int64    `json:"last_login"`
+		Username   string              `json:"username"`
+		IsAdmin    bool                `json:"is_admin"`
+		CanStress  bool                `json:"can_stress"`
+		CanManage  bool                `json:"can_manage"`
+		Databases  []string            `json:"databases"`
+		Tables     []string            `json:"tables"`
+		ColumnRead map[string][]string `json:"column_read,omitempty"`
+		CreatedAt  int64               `json:"created_at"`
+		LastLogin  int64               `json:"last_login"`
 	}
 	safe := make([]safeUser, 0, len(list))
 	for _, u := range list {
 		safe = append(safe, safeUser{
 			Username: u.Username, IsAdmin: u.IsAdmin, CanStress: u.CanStress,
 			CanManage: u.CanManage, Databases: u.Databases, Tables: u.Tables,
-			CreatedAt: u.CreatedAt, LastLogin: u.LastLogin,
+			ColumnRead: u.ColumnRead,
+			CreatedAt:  u.CreatedAt, LastLogin: u.LastLogin,
 		})
 	}
 	writeJSON(w, map[string]interface{}{"ok": true, "users": safe})

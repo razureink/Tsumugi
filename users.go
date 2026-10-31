@@ -35,8 +35,14 @@ type User struct {
 	CanManage bool     `json:"can_manage"`
 	Databases []string `json:"databases"` // 空=全部
 	Tables    []string `json:"tables"`    // 空=该库下全部表；值为带前缀的物理表名
-	CreatedAt int64    `json:"created_at"`
-	LastLogin int64    `json:"last_login"`
+	// ColumnRead 列级 SELECT 白名单：表名（小写；可带 "db." 前缀）→ 允许读取的列。
+	//   - 未配置（nil / 空 map / 表名不存在于 map）= 不限制，保持历史行为；
+	//   - 配置后只允许列出的列可读，SELECT *（以及 t.*）一律拒绝；
+	//   - 键存在但值为空切片 = 该表任何列都不可读（REVOKE 掉全部列的结果）。
+	// 列名比较大小写不敏感。持久化随 users.json 一起落盘。
+	ColumnRead map[string][]string `json:"column_read,omitempty"`
+	CreatedAt  int64               `json:"created_at"`
+	LastLogin  int64               `json:"last_login"`
 }
 
 // UserStore 管理所有用户，持久化到 data/users.json。

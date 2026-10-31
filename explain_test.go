@@ -112,49 +112,50 @@ func TestExplainOnlySelect(t *testing.T) {
 	}
 }
 
-// TestSlowQueryLog 超阈值语句必须进慢查询日志，且 SHOW SLOWQUERIES 能查出来。
+// TestSlowQueryLog 慢查询日志到 SHOW SLOWQUERIES 的链路必须通。
+// 这里直接调用 recordSlowQuery 而不是"跑一条真的慢语句"：
+// 真实耗时会随机器抖动（1ns 阈值偶尔测到 0ns），把测试变成 flaky。
+// 阈值门控的语义由 TestSlowQueryDisabled 覆盖。
 func TestSlowQueryLog(t *testing.T) {
 	resetSlowQueries()
+	defer resetSlowQueries()
+
 	db, closeDB := explainDB(t)
 	defer closeDB()
-	// 必须在 NewDB **之后**设置：NewDB 会按 cfg.SlowQueryMS 覆盖全局阈值。
-	SetSlowQueryThreshold(time.Nanosecond) // 所有语句都算慢
-	defer SetSlowQueryThreshold(0)
 
-	// 阈值生效之后必须真的执行一条语句，否则日志当然是空的
-	//（SHOW SLOWQUERIES 本身在结果返回后才记账，不会包含自己）
-	if _, _, _, _, err := db.runSQL("CREATE TABLE slow_probe (id INT PRIMARY KEY)"); err != nil {
-		t.Fatalf("probe: %v", err)
-	}
+	recordSlowQuery("dave", 42*time.Millisecond, "SELECT * FROM big WHERE x = 1", 7, false)
 
 	cols, rows, _, _, err := db.runSQL("SHOW SLOWQUERIES")
 	if err != nil {
 		t.Fatalf("SHOW SLOWQUERIES: %v", err)
 	}
 	if len(rows) == 0 {
-		t.Fatal("慢查询日志为空（阈值 1ns 下应有记录）")
+		t.Fatal("慢查询日志为空")
 	}
 	idx := map[string]int{}
 	for i, c := range cols {
 		idx[c] = i
 	}
-	// 至少要能取到 SQL 文本与耗时
-	found := false
+	var hit []interface{}
 	for _, r := range rows {
-		sqlText, _ := r[idx["sql_text"]].(string)
-		if strings.Contains(strings.ToUpper(sqlText), "SLOW_PROBE") {
-			found = true
-			if ms, ok := r[idx["query_time_ms"]].(float64); !ok || ms < 0 {
-				t.Fatalf("query_time_ms 非法: %v", r[idx["query_time_ms"]])
-			}
+		if s, _ := r[idx["sql_text"]].(string); strings.Contains(s, "big") {
+			hit = r
 			break
 		}
 	}
-	if !found {
-		t.Fatal("慢查询日志里找不到刚执行的 CREATE TABLE")
+	if hit == nil {
+		t.Fatalf("SHOW SLOWQUERIES 里找不到刚记录的语句: %v", rows)
+	}
+	if ms, ok := hit[idx["query_time_ms"]].(float64); !ok || ms < 41 || ms > 43 {
+		t.Fatalf("query_time_ms=%v want ~42", hit[idx["query_time_ms"]])
+	}
+	if got := hit[idx["user"]]; got != "dave" {
+		t.Fatalf("user=%v", got)
+	}
+	if got := hit[idx["rows_sent"]]; got != int64(7) {
+		t.Fatalf("rows_sent=%v", got)
 	}
 }
-
 // TestSlowQueryDisabled 阈值为 0 时不得记录任何东西（正常路径零开销）。
 func TestSlowQueryDisabled(t *testing.T) {
 	resetSlowQueries()

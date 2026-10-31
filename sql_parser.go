@@ -573,7 +573,7 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 		}()
 	}
 	if user != "" {
-		if aerr := db.authorizeSQLTokensFast(user, toks); aerr != nil {
+		if aerr := db.authorizeSQLTokensFast(user, toks, schema); aerr != nil {
 			err = aerr
 			return
 		}
@@ -988,6 +988,10 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 		"KILL", "DO", "HELP", "RESET", "SET", "SETS":
 		// SET 的完整语义（autocommit 等）由协议层处理；这里统一返回 OK
 		return db.parseNoOpStmt(p)
+	case "GRANT":
+		return db.parseGrant(p, false)
+	case "REVOKE":
+		return db.parseGrant(p, true)
 	case "CALL":
 		err = fmt.Errorf("stored procedures are not supported")
 		return

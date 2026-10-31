@@ -24,7 +24,8 @@ const (
 	ERTableExistsError    = 1050 // 表已存在
 	ERBadFieldError       = 1054 // 未知列
 	ERWrongValueCount     = 1136 // 列数与值数不匹配
-	ERDBAccessDenied      = 1044 // 无权限
+	ERDBAccessDenied      = 1044 // 无权限（库/表级）
+	ERColumnAccessDenied  = 1142 // 无权限（列级 SELECT 被拒）
 	ERTruncatedWrongValue = 1366 // 值类型不匹配
 	ERDataTooLong         = 1406 // 数据超长
 	ERParseError          = 1064 // 语法错误（兜底）
@@ -52,7 +53,7 @@ func sqlStateFor(code int) string {
 		return "22001"
 	case ERTruncatedWrongValue:
 		return "HY000"
-	case ERDBAccessDenied:
+	case ERDBAccessDenied, ERColumnAccessDenied:
 		return "42000"
 	case ERParseError:
 		return "42000"
@@ -94,6 +95,9 @@ func mysqlErrno(err error) int {
 	case strings.Contains(low, "column count mismatch"),
 		strings.Contains(low, "wrong value count"):
 		return ERWrongValueCount
+	case strings.Contains(low, "column access denied"):
+		// 列级 SELECT 被拒：1142（区别于表/库级的 1044）。
+		return ERColumnAccessDenied
 	case strings.Contains(low, "permission denied"),
 		strings.Contains(low, "access denied"),
 		strings.Contains(low, "admin-only"):
