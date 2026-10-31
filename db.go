@@ -3600,6 +3600,8 @@ func NewDB(cfg *Config) (*DB, error) {
 	// 之后再改只会影响新表，导致同一进程里两套结构并存（语义一致但难排查）。
 	setTreeKind(parseTreeKind(cfg.TreeKind))
 	setTreeMode(parseTreeMode(cfg.TreeMode))
+	// 慢查询阈值：0 表示关闭（正常路径零开销）
+	SetSlowQueryThreshold(time.Duration(cfg.SlowQueryMS) * time.Millisecond)
 	logf(LOG_VERB, "index tree: %s (%s mode)", currentTreeKind(), currentTreeMode())
 	db.flushTicker = time.NewTicker(cfg.FlushInterval)
 	db.ttlTicker = time.NewTicker(cfg.TTLCleanInterval)

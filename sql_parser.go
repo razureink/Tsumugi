@@ -558,6 +558,20 @@ func (db *DB) runSQLTokensAs(user string, toks []sqlToken, sql string, params []
 // runSQLTokensAsOut 与 runSQLTokensAs 相同，但把语句级输出（自增主键）写进 out。
 // 协议层用它回填 MySQL OK 包的 last insert id（GORM 等 ORM 依赖它取自增主键）。
 func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params []interface{}, txnID uint64, schema string, out *sqlOut) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	// 慢查询计时：这里是所有 SQL 的唯一入口，保证不漏统计。
+	// 阈值关闭时（<=0）不付任何代价。
+	if thr := slowQueryThreshold.Load(); thr > 0 {
+		begin := time.Now()
+		defer func() {
+			d := time.Since(begin)
+			if d < time.Duration(thr) {
+				return
+			}
+			recordSlowQuery(user, d, sql, len(rows), err != nil)
+			logf(LOG_WARN, "slow query %v user=%q rows=%d: %s",
+				d.Round(time.Millisecond), user, len(rows), firstWords(sql, 80))
+		}()
+	}
 	if user != "" {
 		if aerr := db.authorizeSQLTokensFast(user, toks); aerr != nil {
 			err = aerr
@@ -753,6 +767,24 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 			columns = []string{"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}
 			return
 		}
+		// SHOW SLOWQUERIES：本项目的慢查询日志（MySQL 用 mysql.slow_log 表，
+		// 这里提供等价的可查视图，便于运维直接 SELECT 查看）。
+		if p.matchKeyword("SLOWQUERIES") || p.matchKeyword("SLOW_QUERIES") {
+			columns = []string{"start_time", "query_time_ms", "user", "rows_sent", "failed", "sql_text"}
+			entries := snapshotSlowQueries()
+			rows = make([][]interface{}, 0, len(entries))
+			for _, e := range entries {
+				rows = append(rows, []interface{}{
+					e.At.Format("2006-01-02 15:04:05.000"),
+					float64(e.Dur.Microseconds()) / 1000.0,
+					e.User,
+					int64(e.Rows),
+					boolToInt(e.Failed),
+					e.SQL,
+				})
+			}
+			return
+		}
 		if p.matchKeyword("TRIGGERS") {
 			columns = []string{"Trigger", "Event", "Table", "Statement", "Timing", "Created", "sql_mode", "Definer", "character_set_client"}
 			return
@@ -928,6 +960,8 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 			rows = append(rows, []interface{}{dmeta.Indexes[idxName], "INDEX(" + idxName + ")", "", "MUL"})
 		}
 		return
+	case "EXPLAIN":
+		return db.handleExplain(p)
 	case "SELECT":
 		return db.parseSelect(p)
 	case "INSERT":

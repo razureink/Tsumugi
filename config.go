@@ -83,6 +83,9 @@ type Config struct {
 	//                 长扫描期间写入被阻塞，且不再有快照隔离
 	// 切换需重启（树无法原地更换并发策略）。
 	TreeMode string
+	// SlowQueryMS 慢查询阈值（毫秒）；0 = 关闭记录。超阈值语句进环形缓冲，
+	// 可用 SHOW SLOWQUERIES 查看。默认 500ms（MySQL 默认 10s，这里更贴近内存库）。
+	SlowQueryMS int
 }
 
 // loadDotEnvKV 读取 .env 文件（若存在），返回 KEY=VALUE 映射与是否成功。
@@ -147,6 +150,7 @@ type configFile struct {
 	TxnConflict        *string  `json:"txn_conflict,omitempty"`
 	TreeKind           *string  `json:"tree_kind,omitempty"`
 	TreeMode           *string  `json:"tree_mode,omitempty"`
+	SlowQueryMS        *int     `json:"slow_query_ms,omitempty"`
 }
 
 // loadConfigFile 从 /config/tsumugi.json 读取 Tsumugi 自身配置（若存在）。
@@ -253,6 +257,9 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	if raw.TreeMode != nil {
 		cfg.TreeMode = *raw.TreeMode
 	}
+	if raw.SlowQueryMS != nil {
+		cfg.SlowQueryMS = *raw.SlowQueryMS
+	}
 	return existed, true
 }
 
@@ -292,6 +299,7 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 		TxnConflict:        str(cfg.TxnConflict),
 		TreeKind:           str(cfg.TreeKind),
 		TreeMode:           str(cfg.TreeMode),
+		SlowQueryMS:        intp(cfg.SlowQueryMS),
 	}
 }
 
@@ -327,6 +335,11 @@ func applyEnvToConfig(cfg *Config) {
 	}
 	if v := os.Getenv("TSUMUGI_TXN_CONFLICT"); v == "error" || v == "last_write_wins" {
 		cfg.TxnConflict = v
+	}
+	if v := os.Getenv("TSUMUGI_SLOW_QUERY_MS"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil && n >= 0 {
+			cfg.SlowQueryMS = n
+		}
 	}
 	if v := os.Getenv("TSUMUGI_TREE_MODE"); v != "" {
 		switch strings.ToLower(v) {
@@ -543,6 +556,7 @@ func loadConfig() *Config {
 		TxnConflict:         "error",
 		TreeKind:            "llrb",
 		TreeMode:            "cow",
+		SlowQueryMS:         500,
 	}
 	// 顺序很重要：先读已有配置文件（单一事实源），再把 .env 叠加其上。
 	// 旧实现先应用 .env 再读文件，升级用户带残留 .env 时自定义配置会被默认值覆盖。
