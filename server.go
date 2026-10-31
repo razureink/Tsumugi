@@ -758,7 +758,10 @@ func readFieldValue(r io.Reader) (string, interface{}, error) {
 			return "", nil, fmt.Errorf("read int value failed")
 		}
 		return string(fName), v, nil
-	case TypeVarchar:
+	case TypeVarchar, TypeDate, TypeDatetime, TypeDecimal, TypeText, TypeBlob:
+		// 新增类型在这套内部二进制协议里没有专属 wire 格式：统一按长度前缀
+		// 字符串接收，再由写入路径按列类型做精确转换（日期文本 / 十进制文本 /
+		// 文本字节）。这样旧客户端只需用 TypeVarchar 发送就也能写入新列。
 		vLen, err := rU16(r)
 		if err != nil {
 			return "", nil, fmt.Errorf("read varchar length failed")

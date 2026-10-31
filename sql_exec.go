@@ -78,6 +78,14 @@ func (db *DB) parseSelectGeneral(p *sqlParser) (columns []string, rows [][]inter
 		err = e
 		return
 	}
+	// 单表通用路径（DISTINCT / GROUP BY / 表达式投影）同样用 Go 值比较条件，
+	// 需要把日期/十进制常量折算成存储值。多表 JOIN 的列归属无法在这里可靠
+	// 判定，保持原样（见最终报告的降级说明）。
+	if len(plan.tables) == 1 {
+		if t := db.getTable(plan.tables[0].name); t != nil {
+			coerceExprConsts(plan.where, t.Meta())
+		}
+	}
 	columns, rows, err = db.execSelectPlan(p, plan)
 	if err != nil {
 		return

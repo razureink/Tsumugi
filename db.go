@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,11 +24,50 @@ import (
 
 type FieldType byte
 
+// 字段类型。类型字节会原样写入 catalog WAL，因此新类型只能**追加**在末尾，
+// 绝不能重排/复用已有数值，否则旧文件会被解析成错误的列类型。
 const (
 	TypeInt FieldType = iota
 	TypeVarchar
 	TypeBool
+	// TypeDate：DATE。行内是 int64 Unix 纳秒（UTC 当日 00:00:00）。
+	TypeDate
+	// TypeDatetime：DATETIME。行内是 int64 Unix 纳秒（UTC）。
+	TypeDatetime
+	// TypeDecimal：DECIMAL(p,s)。行内是 int64 定点：
+	// 真实值 = 存储值 / 10^s，其中 s 存在 Field.Len（DECIMAL 没有字节长度
+	// 语义，复用这个槽位可避免改动 catalog 记录格式）。
+	TypeDecimal
+	// TypeText：TEXT。uint32 长度前缀 + 原始字节，NULL 哨兵 0xFFFFFFFF。
+	TypeText
+	// TypeBlob：BLOB。编码与 TEXT 相同，内容按字节原样保存。
+	TypeBlob
 )
+
+// ---- A5 新类型的存储编码与精度边界 ----
+// 行布局保持 [version i64][expireAt i64][字段...]，字段顺序与 meta.Fields 一致：
+//
+//	DATE      8 字节 int64：UTC 零点起的 Unix 纳秒。写入时把时间截断到
+//	          当日 00:00:00（UTC），所以同一天的任意时刻都编码为同一个值。
+//	DATETIME  8 字节 int64：UTC Unix 纳秒。可表示区间约为
+//	          1677-09-21T00:12:44Z ~ 2262-04-11T23:47:16Z（int64 纳秒上限）。
+//	DECIMAL   8 字节 int64 定点：值 = 存储值 / 10^scale，scale 取 Field.Len。
+//	          受 int64 约束，绝对值上限约为 9.22e18 / 10^scale：
+//	            scale 0 → ±9.22e18（18~19 位整数）
+//	            scale 2 → ±9.22e16（16 位整数 + 2 位小数）
+//	            scale 6 → ±9.22e12（12 位整数 + 6 位小数）
+//	          scale 最大 9；文本解析按"四舍五入到 scale、远离零"处理多余小数位。
+//	          溢出（超出 int64）在写入校验阶段直接报错，绝不静默回绕。
+//	TEXT/BLOB 4 字节 uint32 长度 + 原始字节，长度上限 0xFFFFFFFE 字节
+//	          （约 4GB，远高于 VARCHAR 的 65534）；0xFFFFFFFF 为 NULL 哨兵，
+//	          与 VARCHAR 的 0xFFFF 哨兵同理。
+//
+// 有意降级（见最终报告）：DATE/DATETIME/DECIMAL 解码后返回 int64
+// （DATE/DATETIME=纳秒时间戳，DECIMAL=放大 10^scale 的整数），不会格式化成
+// 'YYYY-MM-DD' / '12.34'。这样比较、索引键、ORDER BY 都能复用同一套整数内核
+// 且保持全序；格式化输出留待后续阶段，避免在扫描热路径上每行重新解析。
+// 另：DATE/DATETIME/DECIMAL 没有 NULL 语义（NULL 落 0），与既有 INT 一致；
+// 只有 VARCHAR/TEXT/BLOB 用哨兵长度区分 NULL。
 
 // 权限位
 const (
@@ -426,11 +466,13 @@ func encodeRow(meta *TableMeta, values map[string]interface{}, version int64, ex
 		v := values[f.Name]
 		vals[i] = v
 		switch f.Type {
-		case TypeInt:
+		case TypeInt, TypeDate, TypeDatetime, TypeDecimal:
 			size += 8
 		case TypeVarchar:
 			s, _ := v.(string)
 			size += 2 + len(s)
+		case TypeText, TypeBlob:
+			size += 4 + len(valueString(v))
 		case TypeBool:
 			size += 1
 		}
@@ -445,6 +487,10 @@ func encodeRow(meta *TableMeta, values map[string]interface{}, version int64, ex
 			// 兼容 int/uint/float/字符串：表达式求值常产出 float64，
 			// 旧实现只认 int64，其它类型静默写成 0（数据损坏）。
 			buf = appendI64(buf, coerceInt(v))
+		case TypeDate, TypeDatetime:
+			buf = appendI64(buf, coerceTime(v, f.Type == TypeDate))
+		case TypeDecimal:
+			buf = appendI64(buf, coerceDecimal(v, f.Len))
 		case TypeVarchar:
 			if v == nil {
 				// NULL 标记：合法长度上限 65534，0xFFFF 借作 NULL 哨兵，
@@ -457,6 +503,17 @@ func encodeRow(meta *TableMeta, values map[string]interface{}, version int64, ex
 				s = s[:maxVarcharLen] // 写入路径已校验，这里只是防御性截断
 			}
 			buf = appendU16(buf, uint16(len(s)))
+			buf = append(buf, s...)
+		case TypeText, TypeBlob:
+			if v == nil {
+				buf = appendU32(buf, textNullMarker)
+				continue
+			}
+			s := valueString(v)
+			if len(s) > maxTextLen {
+				s = s[:maxTextLen] // 写入路径已校验，这里只是防御性截断
+			}
+			buf = appendU32(buf, uint32(len(s)))
 			buf = append(buf, s...)
 		case TypeBool:
 			var b byte
@@ -477,19 +534,256 @@ const (
 	varcharNullMarker = 0xFFFF
 )
 
+// TEXT/BLOB 编码常量：长度前缀 4 字节，NULL 哨兵用全 1。
+const (
+	maxTextLen     = 0xFFFFFFFE
+	textNullMarker = 0xFFFFFFFF
+)
+
+// decimalMaxScale DECIMAL 支持的最大小数位。取 9 是为了让 scale=9 时仍有
+// 9 位整数位（int64 上限 9.22e18 / 1e9 ≈ 9.22e9），覆盖面足够而实现简单。
+const decimalMaxScale = 9
+
+// valueString 把写入值转成 TEXT/BLOB 的字节序列。SQL 字面量是 string，
+// 二进制客户端/表达式可能给 []byte 或数字——后者按 MySQL 的隐式转换处理。
+func valueString(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case []byte:
+		return string(x)
+	}
+	return toStr(v)
+}
+
+// scalePow10 返回 10^scale（scale 已在 DDL 阶段限制在 0..decimalMaxScale）。
+func scalePow10(scale int) int64 {
+	p := int64(1)
+	for i := 0; i < scale; i++ {
+		p *= 10
+	}
+	return p
+}
+
+// mulPow10 n * 10^scale，溢出返回 ok=false。
+func mulPow10(n int64, scale int) (int64, bool) {
+	p := scalePow10(scale)
+	if n > 0 && n > math.MaxInt64/p {
+		return 0, false
+	}
+	if n < 0 && n < math.MinInt64/p {
+		return 0, false
+	}
+	return n * p, true
+}
+
+// parseDecimalText 把十进制文本精确转成 scale 位定点整数。
+// 多余小数位按"四舍五入、远离零"处理（与 MySQL 一致）；任何溢出/非法字符
+// 返回 ok=false，由调用方报错而不是写进一个错误的值。
+// 不支持科学计数法（'1e3' 会被拒绝）——DECIMAL 语义上不接受它。
+func parseDecimalText(s string, scale int) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	neg := false
+	switch s[0] {
+	case '+':
+		s = s[1:]
+	case '-':
+		neg = true
+		s = s[1:]
+	}
+	if s == "" {
+		return 0, false
+	}
+	intPart, fracPart := s, ""
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		intPart, fracPart = s[:i], s[i+1:]
+	}
+	if intPart == "" && fracPart == "" {
+		return 0, false
+	}
+	var ip int64
+	if intPart != "" {
+		n, err := strconv.ParseInt(intPart, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		ip = n
+	}
+	var frac int64
+	for i := 0; i < scale; i++ {
+		frac *= 10
+		if i < len(fracPart) {
+			d := fracPart[i]
+			if d < '0' || d > '9' {
+				return 0, false
+			}
+			frac += int64(d - '0')
+		}
+	}
+	for i := scale; i < len(fracPart); i++ {
+		if d := fracPart[i]; d < '0' || d > '9' {
+			return 0, false
+		}
+	}
+	pow := scalePow10(scale)
+	if ip > (math.MaxInt64-frac)/pow {
+		return 0, false
+	}
+	val := ip*pow + frac
+	if len(fracPart) > scale && fracPart[scale] >= '5' {
+		if val == math.MaxInt64 {
+			return 0, false
+		}
+		val++
+	}
+	if neg {
+		val = -val
+	}
+	return val, true
+}
+
+// decimalFromFloat 把浮点值转成 scale 位定点整数（四舍五入）。
+// 注意 float64 只有 ~15~17 位有效数字：超过该精度的十进制字面量在进入这里
+// 之前就已经失真，精确十进制请用字符串字面量写入。
+func decimalFromFloat(f float64, scale int) (int64, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	scaled := math.Round(f * float64(scalePow10(scale)))
+	// float64(math.MaxInt64) 恰为 2^63，用 >= 判定避免边界上的未定义转换。
+	if scaled >= 9223372036854775808.0 || scaled < -9223372036854775808.0 {
+		return 0, false
+	}
+	return int64(scaled), true
+}
+
+// coerceDecimalScaled 把任意写入值折算成 DECIMAL 的定点 int64。
+// nil 落 0（与 INT 的 NULL 语义一致，见类型注释）。
+func coerceDecimalScaled(v interface{}, scale int) (int64, bool) {
+	if scale < 0 || scale > decimalMaxScale {
+		return 0, false
+	}
+	switch x := v.(type) {
+	case nil:
+		return 0, true
+	case int64:
+		return mulPow10(x, scale)
+	case int:
+		return mulPow10(int64(x), scale)
+	case int32:
+		return mulPow10(int64(x), scale)
+	case float64:
+		return decimalFromFloat(x, scale)
+	case float32:
+		return decimalFromFloat(float64(x), scale)
+	case string:
+		return parseDecimalText(x, scale)
+	case []byte:
+		return parseDecimalText(string(x), scale)
+	case bool:
+		if x {
+			return scalePow10(scale), true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// coerceDecimal 同 coerceDecimalScaled，但失败时静默返回 0。
+// 仅用于"校验已通过"的编码路径（validateRow* 先跑一遍并报错）。
+func coerceDecimal(v interface{}, scale int) int64 {
+	n, _ := coerceDecimalScaled(v, scale)
+	return n
+}
+
+// coerceTimeNanos 把写入值折算成 Unix 纳秒：
+//   - int64/int/float64 视为已经是 Unix 纳秒（二进制协议/程序化写入）；
+//   - 字符串按 parseSQLTime 解析（'2024-01-02'、'2024-01-02 03:04:05'、
+//     纯数字字符串按其 Unix 秒解释——沿用 parseSQLTime 的既有行为）；
+//   - dateOnly=true 时截断到 UTC 当日 00:00:00，供 DATE 使用。
+//
+// 时区约定：无时区后缀的日期文本按 UTC 解析（time.Parse 的默认行为），
+// 存储层不保存时区信息。
+func coerceTimeNanos(v interface{}, dateOnly bool) (int64, bool) {
+	switch x := v.(type) {
+	case nil:
+		return 0, true
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case int32:
+		return int64(x), true
+	case float64:
+		return int64(x), true
+	case float32:
+		return int64(x), true
+	case time.Time:
+		return timeNanos(x, dateOnly), true
+	case string:
+		t, ok := parseSQLTime(x)
+		if !ok {
+			return 0, false
+		}
+		return timeNanos(t, dateOnly), true
+	case []byte:
+		return coerceTimeNanos(string(x), dateOnly)
+	}
+	return 0, false
+}
+
+// timeNanos 转 Unix 纳秒；DATE 截断到 UTC 零点。
+func timeNanos(t time.Time, dateOnly bool) int64 {
+	if dateOnly {
+		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	return t.UnixNano()
+}
+
+func coerceTime(v interface{}, dateOnly bool) int64 {
+	n, _ := coerceTimeNanos(v, dateOnly)
+	return n
+}
+
+// encodeOrderedInt64 符号位翻转的 8 字节大端编码：负数也能按字节序正确排序。
+// 新类型（DATE/DATETIME/DECIMAL）统一使用；旧的 TypeInt 编码保持不变，
+// 以免改变既有索引数据里已写入的键（INT 负数范围下推的缺陷另案处理）。
+func encodeOrderedInt64(n int64) string {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(n)^(1<<63))
+	return string(b[:])
+}
+
+func decodeOrderedInt64(key string) int64 {
+	if len(key) != 8 {
+		return 0
+	}
+	var b [8]byte
+	copy(b[:], key)
+	return int64(binary.BigEndian.Uint64(b[:]) ^ (1 << 63))
+}
+
 // encodeRowOrdered 按 meta.Fields 顺序直接编码，不做 map 查找（SQL 位置参数快速路径）。
 func encodeRowOrdered(meta *TableMeta, values []interface{}, version int64, expireAt int64) []byte {
 	size := 16
 	for i, f := range meta.Fields {
 		var s string
 		switch f.Type {
-		case TypeInt:
+		case TypeInt, TypeDate, TypeDatetime, TypeDecimal:
 			size += 8
 		case TypeVarchar:
 			if i < len(values) {
 				s, _ = values[i].(string)
 			}
 			size += 2 + len(s)
+		case TypeText, TypeBlob:
+			if i < len(values) {
+				s = valueString(values[i])
+			}
+			size += 4 + len(s)
 		case TypeBool:
 			size += 1
 		}
@@ -505,6 +799,10 @@ func encodeRowOrdered(meta *TableMeta, values []interface{}, version int64, expi
 		switch f.Type {
 		case TypeInt:
 			buf = appendI64(buf, coerceInt(v))
+		case TypeDate, TypeDatetime:
+			buf = appendI64(buf, coerceTime(v, f.Type == TypeDate))
+		case TypeDecimal:
+			buf = appendI64(buf, coerceDecimal(v, f.Len))
 		case TypeVarchar:
 			if v == nil {
 				buf = appendU16(buf, varcharNullMarker)
@@ -515,6 +813,17 @@ func encodeRowOrdered(meta *TableMeta, values []interface{}, version int64, expi
 				s = s[:maxVarcharLen]
 			}
 			buf = appendU16(buf, uint16(len(s)))
+			buf = append(buf, s...)
+		case TypeText, TypeBlob:
+			if v == nil {
+				buf = appendU32(buf, textNullMarker)
+				continue
+			}
+			s := valueString(v)
+			if len(s) > maxTextLen {
+				s = s[:maxTextLen]
+			}
+			buf = appendU32(buf, uint32(len(s)))
 			buf = append(buf, s...)
 		case TypeBool:
 			var b byte
@@ -541,6 +850,15 @@ func decodeRow(meta *TableMeta, data []byte) (map[string]interface{}, int64, int
 			} else {
 				row[f.Name] = int64(0)
 			}
+		case TypeDate, TypeDatetime, TypeDecimal:
+			// 三者都是定长 int64；DATE=UTC 纳秒、DATETIME=UTC 纳秒、
+			// DECIMAL=放大 10^scale 的定点整数（见文件头的类型说明）。
+			v, ok := readI64(data, &pos)
+			if ok {
+				row[f.Name] = v
+			} else {
+				row[f.Name] = int64(0)
+			}
 		case TypeVarchar:
 			l, ok := readU16(data, &pos)
 			if ok && l == varcharNullMarker {
@@ -548,6 +866,16 @@ func decodeRow(meta *TableMeta, data []byte) (map[string]interface{}, int64, int
 			} else if ok && pos+int(l) <= len(data) {
 				// 树内行字节不可变（COW），别名零拷贝即可；字符串在 Go 中不可变，
 				// 调用方无法改写这些字节（回归 C：每行 varchar 省一次堆分配）。
+				row[f.Name] = unsafeString(data[pos : pos+int(l)])
+				pos += int(l)
+			} else {
+				row[f.Name] = ""
+			}
+		case TypeText, TypeBlob:
+			l, ok := readU32(data, &pos)
+			if ok && l == textNullMarker {
+				row[f.Name] = nil
+			} else if ok && int(l) <= len(data)-pos {
 				row[f.Name] = unsafeString(data[pos : pos+int(l)])
 				pos += int(l)
 			} else {
@@ -584,11 +912,24 @@ func decodeRowFlat(meta *TableMeta, data []byte, into []interface{}) []interface
 		case TypeInt:
 			v, _ := readI64(data, &pos)
 			into[i] = v
+		case TypeDate, TypeDatetime, TypeDecimal:
+			v, _ := readI64(data, &pos)
+			into[i] = v
 		case TypeVarchar:
 			l, _ := readU16(data, &pos)
 			if l == varcharNullMarker {
 				into[i] = nil
 			} else if l > 0 && pos+int(l) <= len(data) {
+				into[i] = unsafeString(data[pos : pos+int(l)])
+				pos += int(l)
+			} else {
+				into[i] = ""
+			}
+		case TypeText, TypeBlob:
+			l, _ := readU32(data, &pos)
+			if l == textNullMarker {
+				into[i] = nil
+			} else if l > 0 && int(l) <= len(data)-pos {
 				into[i] = unsafeString(data[pos : pos+int(l)])
 				pos += int(l)
 			} else {
@@ -641,7 +982,7 @@ func (a *rowArena) row() []interface{} {
 // interface{}，只推进读取位置。行格式由 encodeRow 写出，字段顺序与 meta 一致。
 func skipField(data []byte, pos *int, typ FieldType) {
 	switch typ {
-	case TypeInt:
+	case TypeInt, TypeDate, TypeDatetime, TypeDecimal:
 		*pos += 8
 	case TypeVarchar:
 		if *pos+2 > len(data) {
@@ -650,6 +991,15 @@ func skipField(data []byte, pos *int, typ FieldType) {
 		}
 		l, _ := readU16(data, pos)
 		if l != varcharNullMarker {
+			*pos += int(l)
+		}
+	case TypeText, TypeBlob:
+		if *pos+4 > len(data) {
+			*pos = len(data)
+			return
+		}
+		l, _ := readU32(data, pos)
+		if l != textNullMarker {
 			*pos += int(l)
 		}
 	case TypeBool:
@@ -676,11 +1026,24 @@ func decodeRowProjected(meta *TableMeta, data []byte, into []interface{}, fieldT
 		case TypeInt:
 			v, _ := readI64(data, &pos)
 			into[out] = v
+		case TypeDate, TypeDatetime, TypeDecimal:
+			v, _ := readI64(data, &pos)
+			into[out] = v
 		case TypeVarchar:
 			l, _ := readU16(data, &pos)
 			if l == varcharNullMarker {
 				into[out] = nil
 			} else if l > 0 && pos+int(l) <= len(data) {
+				into[out] = unsafeString(data[pos : pos+int(l)])
+				pos += int(l)
+			} else {
+				into[out] = ""
+			}
+		case TypeText, TypeBlob:
+			l, _ := readU32(data, &pos)
+			if l == textNullMarker {
+				into[out] = nil
+			} else if l > 0 && int(l) <= len(data)-pos {
 				into[out] = unsafeString(data[pos : pos+int(l)])
 				pos += int(l)
 			} else {
@@ -1002,19 +1365,49 @@ func NewTable(meta *TableMeta, walFile *os.File) *Table {
 }
 
 // encodeIndexValue 将索引列值编码为可排序的索引键。
-// int64 用大端 8 字节保证数值序 == 字节序；string 直接零拷贝返回
-// （字符串不可变，树内可安全持有；旧版 []byte(v) 每次更新索引要拷贝一次）。
+// int64 用大端 8 字节保证数值序 == 字节序；string 返回**折叠规范形**
+// （utf8mb4_general_ci）：WHERE name='abc' 走索引时也要能命中 'ABC'，
+// 所以索引键必须与比较语义使用同一套折叠，二者缺一不可。
+//
+// 类型相关（列类型从 meta 查，调用方无需传）：
+//   - TypeInt：保持历史的大端编码（负数不保序，属于既有缺陷，另案处理）；
+//   - DATE/DATETIME/DECIMAL：符号位翻转的大端编码，负数也正确保序；
+//   - VARCHAR/TEXT/BLOB：foldKey 折叠；BLOB 也折叠（等值语义与 TEXT 一致，
+//     二进制原样相等必然折叠后相等，不影响正确性，只放宽了大小写）；
+//   - BOOL：单字节 0/1。
 func (t *Table) encodeIndexValue(fieldName string, val interface{}) string {
-	switch v := val.(type) {
-	case int64:
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], uint64(v))
-		return string(b[:])
-	case string:
-		return v
-	default:
-		return ""
+	meta := t.Meta()
+	ftype := TypeVarchar
+	scale := 0
+	if fi := meta.fieldIndexOf(fieldName); fi >= 0 {
+		ftype = meta.Fields[fi].Type
+		scale = meta.Fields[fi].Len
 	}
+	switch ftype {
+	case TypeInt:
+		switch v := val.(type) {
+		case int64:
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], uint64(v))
+			return string(b[:])
+		}
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(coerceInt(val)))
+		return string(b[:])
+	case TypeDate, TypeDatetime:
+		return encodeOrderedInt64(coerceTime(val, ftype == TypeDate))
+	case TypeDecimal:
+		return encodeOrderedInt64(coerceDecimal(val, scale))
+	case TypeBool:
+		if b, ok := val.(bool); ok && b {
+			return "\x01"
+		}
+		return "\x00"
+	case TypeVarchar, TypeText, TypeBlob:
+		s := valueString(val)
+		return foldKey(s)
+	}
+	return ""
 }
 
 func (t *Table) updateIndex(fieldName, idxName string, oldVal, newVal interface{}, pk int64) {
@@ -1147,9 +1540,42 @@ func (t *Table) indexNameForField(field string) (string, bool) {
 // indexRangeBounds 把范围条件换算成二级索引键区间。
 // 区间允许"偏宽"（例如 lt v 直接用到 v 为止，而不去算 v 的前驱）：命中后
 // 仍由完整谓词精筛，所以宁可多取也不能漏。返回 ok=false 表示该条件无法下推。
+//
+// 注意：索引键的编码方式必须与这里换算出的边界一致——
+//   - VARCHAR/TEXT/BLOB 的键是折叠形，边界也走 encodeIndexValue 折叠；
+//   - DATE/DATETIME/DECIMAL 的键是符号位翻转的 int64，边界用同一编码；
+//   - INT 保持历史编码（见 encodeIndexValue）。
 func (t *Table) indexRangeBounds(fieldIdx int, f RangeCond) (lo, hi *string, ok bool) {
 	meta := t.Meta()
-	switch meta.Fields[fieldIdx].Type {
+	typ := meta.Fields[fieldIdx].Type
+	scale := meta.Fields[fieldIdx].Len
+	// orderedIntBounds 收拢 DATE/DATETIME/DECIMAL 的 int64 量纲：
+	// 三者都折算成整数后与 encodeOrderedInt64 一一对应。
+	orderedIntBounds := func(v int64, v2 int64, has2 bool) (*string, *string, bool) {
+		switch f.Op {
+		case "gt":
+			if v == math.MaxInt64 {
+				return nil, nil, false // 无可行上界，交给全表过滤
+			}
+			s := encodeOrderedInt64(v + 1)
+			return &s, nil, true
+		case "ge":
+			s := encodeOrderedInt64(v)
+			return &s, nil, true
+		case "lt", "le":
+			// 含端点扫描，等值行由精筛剔除（无法便捷求前驱）
+			s := encodeOrderedInt64(v)
+			return nil, &s, true
+		case "between":
+			if !has2 {
+				return nil, nil, false
+			}
+			l, h := encodeOrderedInt64(v), encodeOrderedInt64(v2)
+			return &l, &h, true
+		}
+		return nil, nil, false
+	}
+	switch typ {
 	case TypeInt:
 		v, okv := toInt64OK(f.Val)
 		if !okv {
@@ -1158,7 +1584,7 @@ func (t *Table) indexRangeBounds(fieldIdx int, f RangeCond) (lo, hi *string, ok 
 		switch f.Op {
 		case "gt":
 			if v == math.MaxInt64 {
-				return nil, nil, false // 无可行上界，交给全表过滤
+				return nil, nil, false
 			}
 			s := t.encodeIndexValue(f.Field, v+1)
 			return &s, nil, true
@@ -1166,7 +1592,6 @@ func (t *Table) indexRangeBounds(fieldIdx int, f RangeCond) (lo, hi *string, ok 
 			s := t.encodeIndexValue(f.Field, v)
 			return &s, nil, true
 		case "lt", "le":
-			// 含端点扫描，等值行由精筛剔除（编码保序，无法便捷求前驱）
 			s := t.encodeIndexValue(f.Field, v)
 			return nil, &s, true
 		case "between":
@@ -1178,22 +1603,45 @@ func (t *Table) indexRangeBounds(fieldIdx int, f RangeCond) (lo, hi *string, ok 
 			hiS := t.encodeIndexValue(f.Field, v2)
 			return &loS, &hiS, true
 		}
-	case TypeVarchar:
-		s, okS := f.Val.(string)
-		if !okS {
+	case TypeDate, TypeDatetime:
+		dateOnly := typ == TypeDate
+		v, okv := coerceTimeNanos(f.Val, dateOnly)
+		if !okv {
 			return nil, nil, false
 		}
-		switch f.Op {
-		case "gt", "ge":
-			return &s, nil, true
-		case "lt", "le":
-			return nil, &s, true
-		case "between":
-			s2, ok2 := f.Val2.(string)
+		if f.Op == "between" {
+			v2, ok2 := coerceTimeNanos(f.Val2, dateOnly)
 			if !ok2 {
 				return nil, nil, false
 			}
-			return &s, &s2, true
+			return orderedIntBounds(v, v2, true)
+		}
+		return orderedIntBounds(v, 0, false)
+	case TypeDecimal:
+		v, okv := coerceDecimalScaled(f.Val, scale)
+		if !okv {
+			return nil, nil, false
+		}
+		if f.Op == "between" {
+			v2, ok2 := coerceDecimalScaled(f.Val2, scale)
+			if !ok2 {
+				return nil, nil, false
+			}
+			return orderedIntBounds(v, v2, true)
+		}
+		return orderedIntBounds(v, 0, false)
+	case TypeVarchar, TypeText, TypeBlob:
+		switch f.Op {
+		case "gt", "ge":
+			s := t.encodeIndexValue(f.Field, f.Val)
+			return &s, nil, true
+		case "lt", "le":
+			s := t.encodeIndexValue(f.Field, f.Val)
+			return nil, &s, true
+		case "between":
+			l := t.encodeIndexValue(f.Field, f.Val)
+			h := t.encodeIndexValue(f.Field, f.Val2)
+			return &l, &h, true
 		}
 	}
 	return nil, nil, false
@@ -1290,7 +1738,10 @@ func (t *Table) indexRangeCandidates(meta *TableMeta, scan *scanConds, filters [
 //   - 全部条件都落在同一个非主键列上，且该列有二级索引；
 //   - 表内从未出现过 TTL 行——过期时间编码在行字节里，跳过回表就看不到它，
 //     否则会把已过期行当有效结果返回；
-//   - 投影列 ⊆ {索引列, 主键}，等值/范围的值类型与列类型一致。
+//   - 投影列 ⊆ {索引列, 主键}，等值/范围的值类型与列类型一致；
+//   - 索引列是字符串（VARCHAR/TEXT/BLOB）时，投影**不得包含该列自身**：
+//     折叠索引键只保存小写规范形，拿它当结果值会改变数据。只投影主键
+//     （如 SELECT id FROM t WHERE email='x'）仍可走覆盖索引。
 func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filters []RangeCond, outFields []int, width int, limit int) ([][]interface{}, bool) {
 	if width <= 0 || outFields == nil || (len(conds) == 0 && len(filters) == 0) {
 		return nil, false
@@ -1334,6 +1785,16 @@ func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filt
 	}
 	scan := newScanConds(meta, conds, filters)
 	typ := meta.Fields[fi].Type
+	// 字符串列的索引键是折叠形，无法还原原始大小写。因此只有"投影不含该
+	// 字符串列本身"时覆盖索引才安全：`SELECT id FROM t WHERE email='x'`
+	// 只需主键，可以直接由索引产出；`SELECT email FROM ...` 必须回表。
+	if typ == TypeVarchar || typ == TypeText || typ == TypeBlob {
+		for _, of := range outFields {
+			if of == fi {
+				return nil, false
+			}
+		}
+	}
 
 	// emit 把一条索引条目展开成结果行；values 为该索引键对应的字段值。
 	emit := func(val interface{}, pkList []int64, rows [][]interface{}) [][]interface{} {
@@ -1364,21 +1825,32 @@ func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filt
 		for _, v := range conds {
 			val = v
 		}
+		// 索引键必须用**原始条件值**编码：DECIMAL 的 encodeIndexValue 会自己
+		// 乘 10^scale，如果先折算再传进去会二次放大（查不到任何行）。
+		idxKey := t.encodeIndexValue(field, val)
 		switch typ {
 		case TypeInt:
 			if _, ok := val.(int64); !ok {
 				return nil, false
 			}
-		case TypeVarchar:
-			if _, ok := val.(string); !ok {
+		case TypeDate, TypeDatetime:
+			n, okn := coerceTimeNanos(val, typ == TypeDate)
+			if !okn {
 				return nil, false
 			}
+			val = n
+		case TypeDecimal:
+			n, okn := coerceDecimalScaled(val, meta.Fields[fi].Len)
+			if !okn {
+				return nil, false
+			}
+			val = n
 		case TypeBool:
 			if _, ok := val.(bool); !ok {
 				return nil, false
 			}
 		}
-		pkList, found := tree.Get(t.encodeIndexValue(field, val))
+		pkList, found := tree.Get(idxKey)
 		if !found {
 			return [][]interface{}{}, true
 		}
@@ -1387,8 +1859,12 @@ func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filt
 		return emit(val, pkList, make([][]interface{}, 0, len(pkList))), true
 	}
 
-	// 范围：合并该字段上的所有边界（编码保序，字符串可直接比较）
-	if typ != TypeInt && typ != TypeVarchar {
+	// 范围：合并该字段上的所有边界（数值类键保序，字符串键按折叠形比较）。
+	// 字符串列走到这里时投影必然不含该列（上面已判定），因此只需匹配索引键、
+	// 结果值只取主键，折叠形不会泄漏到输出。
+	switch typ {
+	case TypeInt, TypeDate, TypeDatetime, TypeDecimal, TypeVarchar, TypeText, TypeBlob:
+	default:
 		return nil, false
 	}
 	var lo, hi *string
@@ -1442,6 +1918,8 @@ func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filt
 }
 
 // decodeIndexValue 把保序索引键还原成字段原始值（encodeIndexValue 的逆运算）。
+// 字符串类的键是折叠形（已丢失原始大小写），只用于区间精筛，不能作为结果值；
+// 覆盖索引路径对字符串列已关闭（见 coveringRows）。
 func decodeIndexValue(typ FieldType, key string) interface{} {
 	switch typ {
 	case TypeInt:
@@ -1451,8 +1929,12 @@ func decodeIndexValue(typ FieldType, key string) interface{} {
 		var b [8]byte
 		copy(b[:], key)
 		return int64(binary.BigEndian.Uint64(b[:]))
-	case TypeVarchar:
+	case TypeDate, TypeDatetime, TypeDecimal:
+		return decodeOrderedInt64(key)
+	case TypeVarchar, TypeText, TypeBlob:
 		return key
+	case TypeBool:
+		return len(key) == 1 && key[0] == 1
 	}
 	return nil
 }
@@ -1480,19 +1962,24 @@ func (m *TableMeta) fieldValueAt(data []byte, idx int) interface{} {
 	pos := 16
 	for i := 0; i < idx; i++ {
 		switch m.Fields[i].Type {
-		case TypeInt:
+		case TypeInt, TypeDate, TypeDatetime, TypeDecimal:
 			pos += 8
 		case TypeVarchar:
 			if pos+2 > len(data) {
 				return nil
 			}
 			pos += 2 + (int(data[pos])<<8 | int(data[pos+1]))
+		case TypeText, TypeBlob:
+			if pos+4 > len(data) {
+				return nil
+			}
+			pos += 4 + (int(data[pos])<<24 | int(data[pos+1])<<16 | int(data[pos+2])<<8 | int(data[pos+3]))
 		case TypeBool:
 			pos++
 		}
 	}
 	switch m.Fields[idx].Type {
-	case TypeInt:
+	case TypeInt, TypeDate, TypeDatetime, TypeDecimal:
 		v, _ := readI64(data, &pos)
 		return v
 	case TypeVarchar:
@@ -1501,7 +1988,23 @@ func (m *TableMeta) fieldValueAt(data []byte, idx int) interface{} {
 		}
 		l := int(data[pos])<<8 | int(data[pos+1])
 		pos += 2
+		if l == int(varcharNullMarker) {
+			return nil
+		}
 		if pos+l > len(data) {
+			return nil
+		}
+		return unsafeString(data[pos : pos+l])
+	case TypeText, TypeBlob:
+		if pos+4 > len(data) {
+			return nil
+		}
+		l := int(data[pos])<<24 | int(data[pos+1])<<16 | int(data[pos+2])<<8 | int(data[pos+3])
+		pos += 4
+		if uint32(l) == textNullMarker {
+			return nil
+		}
+		if l < 0 || pos+l > len(data) {
 			return nil
 		}
 		return unsafeString(data[pos : pos+l])
@@ -1541,11 +2044,8 @@ func coerceInt(v interface{}) int64 {
 // 长度前缀静默截断（写入成功但数据损坏），这里显式报错。
 func validateRowValues(meta *TableMeta, row map[string]interface{}) error {
 	for _, f := range meta.Fields {
-		if f.Type != TypeVarchar {
-			continue
-		}
-		if s, ok := row[f.Name].(string); ok && len(s) > maxVarcharLen {
-			return fmt.Errorf("value too long for column %s (max %d bytes, got %d)", f.Name, maxVarcharLen, len(s))
+		if err := validateFieldValue(f, row[f.Name]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1554,11 +2054,48 @@ func validateRowValues(meta *TableMeta, row map[string]interface{}) error {
 // validateRowOrdered 校验按 meta.Fields 顺序传入的值。
 func validateRowOrdered(meta *TableMeta, values []interface{}) error {
 	for i, f := range meta.Fields {
-		if f.Type != TypeVarchar || i >= len(values) {
-			continue
+		if i >= len(values) {
+			break
 		}
-		if s, ok := values[i].(string); ok && len(s) > maxVarcharLen {
+		if err := validateFieldValue(f, values[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFieldValue 单列写入校验。之所以在编码前单独跑一遍：
+// 编码函数为了热路径不带 error 返回值，无法就地报错；而"长度超限被截断"、
+// "十进制溢出回绕"、"日期文本无法解析"这类问题一旦静默发生就是数据损坏。
+func validateFieldValue(f Field, v interface{}) error {
+	switch f.Type {
+	case TypeVarchar:
+		if s, ok := v.(string); ok && len(s) > maxVarcharLen {
 			return fmt.Errorf("value too long for column %s (max %d bytes, got %d)", f.Name, maxVarcharLen, len(s))
+		}
+	case TypeText, TypeBlob:
+		if v == nil {
+			return nil
+		}
+		if s := valueString(v); len(s) > maxTextLen {
+			return fmt.Errorf("value too long for column %s (max %d bytes, got %d)", f.Name, maxTextLen, len(s))
+		}
+	case TypeDate, TypeDatetime:
+		if v == nil {
+			return nil
+		}
+		if _, ok := coerceTimeNanos(v, f.Type == TypeDate); !ok {
+			return fmt.Errorf("invalid %s value for column %s: %v", fieldTypeName(f.Type), f.Name, v)
+		}
+	case TypeDecimal:
+		if v == nil {
+			return nil
+		}
+		if f.Len > decimalMaxScale {
+			return fmt.Errorf("column %s has unsupported DECIMAL scale %d (max %d)", f.Name, f.Len, decimalMaxScale)
+		}
+		if _, ok := coerceDecimalScaled(v, f.Len); !ok {
+			return fmt.Errorf("DECIMAL value out of range or malformed for column %s (scale %d): %v", f.Name, f.Len, v)
 		}
 	}
 	return nil
@@ -1962,6 +2499,12 @@ func newScanConds(meta *TableMeta, conditions map[string]interface{}, filters []
 		sc.eqs = make([]scanEq, 0, len(conditions))
 		for k, v := range conditions {
 			e := scanEq{idx: meta.fieldIndexOf(k)}
+			var ftype FieldType
+			var scale int
+			if e.idx >= 0 {
+				ftype = meta.Fields[e.idx].Type
+				scale = meta.Fields[e.idx].Len
+			}
 			switch c := v.(type) {
 			case nil:
 				e.kind = condNil
@@ -1976,6 +2519,26 @@ func newScanConds(meta *TableMeta, conditions map[string]interface{}, filters []
 			default:
 				e.kind = condOther
 			}
+			// 新类型在比较层统一折算成 int64，与行值同量纲：
+			// 否则 'WHERE d = '2024-01-02''（字符串）与行里的纳秒永远不等。
+			// 折算失败（文本不像日期/十进制）保持原 kind，与行值类型不符 →
+			// matchField 返回 false，而不是把错误值当 0 比较。
+			if e.idx >= 0 && v != nil {
+				switch ftype {
+				case TypeDate, TypeDatetime:
+					if n, ok := coerceTimeNanos(v, ftype == TypeDate); ok {
+						e.kind, e.i = condInt, n
+					} else {
+						e.kind = condOther
+					}
+				case TypeDecimal:
+					if n, ok := coerceDecimalScaled(v, scale); ok {
+						e.kind, e.i = condInt, n
+					} else {
+						e.kind = condOther
+					}
+				}
+			}
 			if e.idx > sc.maxIdx {
 				sc.maxIdx = e.idx
 			}
@@ -1988,14 +2551,44 @@ func newScanConds(meta *TableMeta, conditions map[string]interface{}, filters []
 			fs := &sc.filters[i]
 			fs.idx = meta.fieldIndexOf(filters[i].Field)
 			fs.op = filters[i].Op
-			fs.a = newScanCmp(filters[i].Val)
-			fs.b = newScanCmp(filters[i].Val2)
+			var ftype FieldType
+			var scale int
+			if fs.idx >= 0 {
+				ftype = meta.Fields[fs.idx].Type
+				scale = meta.Fields[fs.idx].Len
+			}
+			fs.a = newScanCmpTyped(filters[i].Val, ftype, scale)
+			fs.b = newScanCmpTyped(filters[i].Val2, ftype, scale)
 			if fs.idx > sc.maxIdx {
 				sc.maxIdx = fs.idx
 			}
 		}
 	}
 	return sc
+}
+
+// newScanCmpTyped 按列类型预编译比较值：DATE/DATETIME/DECIMAL 折算成 int64，
+// 其余类型沿用 newScanCmp 的动态类型语义。
+func newScanCmpTyped(v interface{}, ftype FieldType, scale int) scanCmp {
+	switch ftype {
+	case TypeDate, TypeDatetime:
+		if v == nil {
+			return scanCmp{kind: condNil}
+		}
+		if n, ok := coerceTimeNanos(v, ftype == TypeDate); ok {
+			return scanCmp{kind: condInt, i: n}
+		}
+		return scanCmp{kind: condOther}
+	case TypeDecimal:
+		if v == nil {
+			return scanCmp{kind: condNil}
+		}
+		if n, ok := coerceDecimalScaled(v, scale); ok {
+			return scanCmp{kind: condInt, i: n}
+		}
+		return scanCmp{kind: condOther}
+	}
+	return newScanCmp(v)
 }
 
 func newScanCmp(v interface{}) scanCmp {
@@ -2051,6 +2644,16 @@ func (sc *scanConds) matchRow(meta *TableMeta, data []byte) bool {
 			} else {
 				v = scanVal{kind: condInt} // 截断零值 0
 			}
+		case TypeDate, TypeDatetime, TypeDecimal:
+			// 与 decodeRow 一致的定长 int64 解码；截断时按零值 0 求值。
+			if pos+8 <= len(data) {
+				v = scanVal{kind: condInt, i: int64(uint64(data[pos])<<56 | uint64(data[pos+1])<<48 |
+					uint64(data[pos+2])<<40 | uint64(data[pos+3])<<32 | uint64(data[pos+4])<<24 |
+					uint64(data[pos+5])<<16 | uint64(data[pos+6])<<8 | uint64(data[pos+7]))}
+				pos += 8
+			} else {
+				v = scanVal{kind: condInt}
+			}
 		case TypeVarchar:
 			if pos+2 <= len(data) {
 				l := int(data[pos])<<8 | int(data[pos+1])
@@ -2060,6 +2663,21 @@ func (sc *scanConds) matchRow(meta *TableMeta, data []byte) bool {
 					pos += l
 				} else {
 					v = scanVal{kind: condString} // 截断零值 ""
+				}
+			} else {
+				v = scanVal{kind: condString} // 截断零值 ""
+			}
+		case TypeText, TypeBlob:
+			if pos+4 <= len(data) {
+				l := int(data[pos])<<24 | int(data[pos+1])<<16 | int(data[pos+2])<<8 | int(data[pos+3])
+				pos += 4
+				if uint32(l) == textNullMarker {
+					v = scanVal{kind: condString} // NULL 与 "" 同样不匹配等值条件
+				} else if l >= 0 && l <= len(data)-pos {
+					v = scanVal{kind: condString, s: unsafeString(data[pos : pos+l])}
+					pos += l
+				} else {
+					v = scanVal{kind: condString}
 				}
 			} else {
 				v = scanVal{kind: condString} // 截断零值 ""
@@ -2094,7 +2712,8 @@ func (sc *scanConds) matchField(fi int, v scanVal) bool {
 				return false
 			}
 		case condString:
-			if v.kind != condString || v.s != e.s {
+			// utf8mb4_general_ci：等值忽略大小写，与索引键的折叠编码一致。
+			if v.kind != condString || !eqFold(v.s, e.s) {
 				return false
 			}
 		case condBool:
@@ -2148,7 +2767,7 @@ func (c *scanCmp) cmpRow(v scanVal) int {
 		}
 	case condString:
 		if c.kind == condString {
-			return strings.Compare(v.s, c.s)
+			return cmpFold(v.s, c.s)
 		}
 	}
 	return 0 // bool 行值 / 类型不可比
@@ -2235,13 +2854,9 @@ func cmpVal(v, other interface{}) int {
 	as, aokS := v.(string)
 	bs, bokS := other.(string)
 	if aokS && bokS {
-		if as < bs {
-			return -1
-		}
-		if as > bs {
-			return 1
-		}
-		return 0
+		// 字符串按 utf8mb4_general_ci 折叠比较：与 WHERE / ORDER BY / 索引键
+		// 使用同一套语义，避免"过滤命中但排序位置相反"这类不一致。
+		return cmpFold(as, bs)
 	}
 	return 0
 }
@@ -2480,6 +3095,7 @@ func (db *DB) flushWAL() error {
 //   - rec      写入 bufio 缓冲（进程内存）；
 //   - rec.sync 或 flush：Flush 到 OS 页缓存并 Sync 落盘；多处 sync 被合并为一次组提交；
 //   - stop     冲刷缓冲后退出（供 Compact 换文件、Close 收尾）。
+//
 // walWriteBufBytes WAL 单写者的 bufio 缓冲大小。启动时按设备落盘延迟调整：
 // 慢盘用更大的缓冲摊薄系统调用与写放大，快盘保持小缓冲以降低内存与延迟。
 var walWriteBufBytes = 256 * 1024
@@ -2672,12 +3288,12 @@ func (db *DB) Compact() error {
 	}
 	// 只写临时文件的头，不动全局分帧开关：压缩失败时 writer 仍会在旧文件上追加，
 	// 若提前把开关切成 true，v1/v2 旧文件会被塞进批次头而无法重放。
-	if err := writeWALHeaderV(f, WALVersion4); err != nil {
+	if err := writeWALHeaderV(f, WALVersion5); err != nil {
 		f.Close()
 		return err
 	}
 	w := bufio.NewWriterSize(f, 64*1024)
-	// 压缩产物是 v3 文件，因此记录必须按批分帧写入，
+	// 压缩产物是 v5 文件，因此记录必须按批分帧写入，
 	// 直接写裸记录会让重放时把首条记录当成批次长度解析。
 	wb := &walBatchWriter{w: w}
 
@@ -2896,6 +3512,7 @@ type Transaction struct {
 //   - old != nil && newVersion != 0：更新，old 为事务开始前的行字节
 //   - old == nil && newVersion != 0：插入
 //   - newVersion == 0：删除（old 为删除前的行字节）
+//
 // batchInsertCalls 批量插入路径的调用次数（仅用于测试/诊断，不影响逻辑）。
 var batchInsertCalls atomic.Int64
 
@@ -2948,7 +3565,7 @@ func NewDB(cfg *Config) (*DB, error) {
 			releaseDirLock(dirLock)
 			return nil, err
 		}
-		walFramed.Store(v == WALVersion3 || v == WALVersion4)
+		walFramed.Store(v == WALVersion3 || v == WALVersion4 || v == WALVersion5)
 	}
 
 	privStore, err := NewPrivilegeStore(cfg.WALDir + "/" + cfg.PrivilegeFile)
@@ -3043,9 +3660,9 @@ func NewDB(cfg *Config) (*DB, error) {
 	return db, nil
 }
 
-// writeWALHeader 新建 WAL 文件时写 v3 头（分帧 + 批量校验）。
+// writeWALHeader 新建 WAL 文件时写 v5 头（分帧 + 批量校验）。
 func writeWALHeader(f *os.File) error {
-	if err := writeWALHeaderV(f, WALVersion4); err != nil {
+	if err := writeWALHeaderV(f, WALVersion5); err != nil {
 		return err
 	}
 	walFramed.Store(true)
@@ -3067,9 +3684,9 @@ func verifyWALHeader(f *os.File) error {
 	if err := binary.Read(f, binary.BigEndian, &version); err != nil {
 		return err
 	}
-	// v1 紧凑格式版本号即为 1；v2 同格式；v3 为分帧格式（带批次长度与校验和）
-	if version != 1 && version != 2 && version != WALVersion3 && version != WALVersion4 {
-		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d or %d", version, WALVersion3, WALVersion4)
+	// v1 紧凑格式版本号即为 1；v2 同格式；v3/v4/v5 为分帧格式（带批次长度与校验和）
+	if version != 1 && version != 2 && version != WALVersion3 && version != WALVersion4 && version != WALVersion5 {
+		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d, %d or %d", version, WALVersion3, WALVersion4, WALVersion5)
 	}
 	var reserved uint32
 	if err := binary.Read(f, binary.BigEndian, &reserved); err != nil {
@@ -3254,8 +3871,9 @@ func (db *DB) loadWAL() error {
 	ctx.startApplier()
 	defer ctx.stopApplier()
 	switch version {
-	case WALVersion3, WALVersion4:
-		// v3/v4 分帧：按批流式读入（内存只与最大批次相关，不再整文件入内存）
+	case WALVersion3, WALVersion4, WALVersion5:
+		// v3/v4/v5 分帧：按批流式读入（内存只与最大批次相关，不再整文件入内存）
+		// 三个版本的分帧布局一致，复用 loadV3；版本号只用于标识记录语义差异。
 		// 显式定位到记录区，不依赖 walHeaderVersion 读完后遗留的偏移
 		if _, err := file.Seek(int64(headerLen), io.SeekStart); err != nil {
 			return err
@@ -3282,7 +3900,7 @@ func (db *DB) loadWAL() error {
 		ctx.atEOF = true
 		return ctx.loadV2()
 	default:
-		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d or %d", version, WALVersion3, WALVersion4)
+		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d, %d or %d", version, WALVersion3, WALVersion4, WALVersion5)
 	}
 }
 
@@ -3296,12 +3914,12 @@ type walReplayCtx struct {
 	pending     map[string][]walOp
 	pendingTxns map[uint64][]walOp
 	// pendingBytes 当前缓冲里记录数据的总字节数，与 pendingOps 共同决定何时切段。
-	pendingOps  int
+	pendingOps   int
 	pendingBytes int64
-	loadedRows  atomic.Int64
-	totalRows   int64
-	lastPct     int
-	barDone     bool
+	loadedRows   atomic.Int64
+	totalRows    int64
+	lastPct      int
+	barDone      bool
 	// baseOffset 当前 buf 在文件中的起始偏移（v2 = 文件头长度；v3 = 当前批次 payload 起点）。
 	// truncateTail 用它把"缓冲内相对偏移"换算成文件绝对偏移。
 	baseOffset int64

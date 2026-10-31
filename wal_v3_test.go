@@ -65,8 +65,8 @@ func TestWALV3MultiBatchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
-	if v := binary.BigEndian.Uint32(data[len(WALMagic):]); v != WALVersion4 {
-		t.Fatalf("WAL version = %d, want %d (upstream+1)", v, WALVersion4)
+	if v := binary.BigEndian.Uint32(data[len(WALMagic):]); v != WALVersion5 {
+		t.Fatalf("WAL version = %d, want %d (v4+1)", v, WALVersion5)
 	}
 	frames := walV3Frames(t, data)
 	if len(frames) < 2 {

@@ -1502,12 +1502,22 @@ func (mc *mysqlConn) handleFieldList(payload []byte) {
 	}
 	meta := t.Meta()
 	for _, f := range meta.Fields {
-		colType := byte(0x0f)
+		colType := byte(0x0f) // VARCHAR 默认（string 在 MySQL 里也是 VAR_STRING）
 		switch f.Type {
 		case TypeInt:
-			colType = 0x08
+			colType = 0x08 // LONGLONG
 		case TypeBool:
-			colType = 0x01
+			colType = 0x01 // TINY
+		case TypeDate:
+			colType = 0x0a // DATE
+		case TypeDatetime:
+			colType = 0x0c // DATETIME
+		case TypeDecimal:
+			colType = 0x00 // NEWDECIMAL
+		case TypeText:
+			colType = 0xfc // BLOB（文本协议按 lenenc 字符串传输）
+		case TypeBlob:
+			colType = 0xfc // BLOB
 		}
 		var buf []byte
 		buf = mc.appendColumnDef(buf, "def", mc.schemaName(), meta.Name, meta.Name, f.Name, f.Name, colType)

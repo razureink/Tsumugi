@@ -125,18 +125,48 @@ func fieldTypeName(t FieldType) string {
 		return "VARCHAR"
 	case TypeBool:
 		return "BOOL"
+	case TypeDate:
+		return "DATE"
+	case TypeDatetime:
+		return "DATETIME"
+	case TypeDecimal:
+		return "DECIMAL"
+	case TypeText:
+		return "TEXT"
+	case TypeBlob:
+		return "BLOB"
 	}
 	return "UNKNOWN"
 }
 
+// fieldTypeDecl 返回带参数的 DDL 类型文本（SHOW CREATE / DESCRIBE / COLUMN_TYPE）。
+// 只有 DECIMAL 需要参数：精度 p 在 DDL 解析时校验但不落盘（存储上限由 int64
+// 决定），这里按支持的最大精度 18 回显，确保 DECIMAL(10,2) 的 scale 能往返。
+func fieldTypeDecl(f Field) string {
+	if f.Type == TypeDecimal {
+		return fmt.Sprintf("DECIMAL(18,%d)", f.Len)
+	}
+	return fieldTypeName(f.Type)
+}
+
 func parseFieldType(s string) (FieldType, error) {
 	switch strings.ToUpper(s) {
-	case "INT", "INTEGER", "INT64", "BIGINT":
+	case "INT", "INTEGER", "INT64", "BIGINT", "SMALLINT", "TINYINT", "MEDIUMINT":
 		return TypeInt, nil
-	case "VARCHAR", "STRING", "TEXT", "CHAR":
+	case "VARCHAR", "STRING", "CHAR":
 		return TypeVarchar, nil
+	case "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT":
+		return TypeText, nil
+	case "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "VARBINARY", "BINARY":
+		return TypeBlob, nil
 	case "BOOL", "BOOLEAN":
 		return TypeBool, nil
+	case "DATE":
+		return TypeDate, nil
+	case "DATETIME", "TIMESTAMP":
+		return TypeDatetime, nil
+	case "DECIMAL", "NUMERIC", "DEC", "FIXED":
+		return TypeDecimal, nil
 	}
 	return 0, fmt.Errorf("unsupported type: %s", s)
 }

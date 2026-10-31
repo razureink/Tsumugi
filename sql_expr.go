@@ -945,7 +945,8 @@ func sqlValueEqual(a, b interface{}) bool {
 	as, aok := a.(string)
 	bs, bok := b.(string)
 	if aok && bok {
-		return as == bs
+		// IN 的字符串等值同样忽略大小写（IN 本质是一串 = 的并集）。
+		return eqFold(as, bs)
 	}
 	return false
 }
@@ -974,6 +975,61 @@ func toStr(v interface{}) string {
 		return strconv.FormatFloat(f, 'g', -1, 64)
 	}
 	return fmt.Sprint(v)
+}
+
+// coerceExprConsts 把表达式里与 DATE/DATETIME/DECIMAL 列比较的常量折算成
+// 行内存储值（纳秒 / 定点整数）。表达式求值（compareOp → cmpVal）只看 Go 值，
+// 没有列类型信息：不折算的话 `UPDATE t SET ... WHERE amount = 12.34` 会拿
+// 行里的 1234 与 12.34 比较，永远不命中。
+//
+// 只处理"列 op 常量"与 BETWEEN/IN 的常量位；列与列、表达式与常量不处理
+// （后者无法在编译期确定列类型）。
+func coerceExprConsts(e *expr, meta *TableMeta) {
+	if e == nil {
+		return
+	}
+	if e.kind == exFunc && len(e.args) >= 2 {
+		switch e.fn {
+		case "=", "<>", "!=", ">", "<", ">=", "<=":
+			if len(e.args) == 2 {
+				for i := 0; i < 2; i++ {
+					col, con := e.args[i], e.args[1-i]
+					if col.kind == exCol && con.kind == exConst {
+						if fi := meta.fieldIndexOf(col.col); fi >= 0 {
+							con.val = coerceCondLiteral(meta.Fields[fi], con.val)
+						}
+					}
+				}
+			}
+		case "BETWEEN", "NOTBETWEEN":
+			if len(e.args) == 3 && e.args[0].kind == exCol {
+				if fi := meta.fieldIndexOf(e.args[0].col); fi >= 0 {
+					for _, con := range e.args[1:] {
+						if con.kind == exConst {
+							con.val = coerceCondLiteral(meta.Fields[fi], con.val)
+						}
+					}
+				}
+			}
+		case "IN", "NOTIN":
+			if e.args[0].kind == exCol {
+				if fi := meta.fieldIndexOf(e.args[0].col); fi >= 0 {
+					for _, con := range e.args[1:] {
+						if con.kind == exConst {
+							con.val = coerceCondLiteral(meta.Fields[fi], con.val)
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, a := range e.args {
+		coerceExprConsts(a, meta)
+	}
+	for _, w := range e.when {
+		coerceExprConsts(w, meta)
+	}
+	coerceExprConsts(e.els, meta)
 }
 
 func clampInt(n int64, lo, hi int64) int64 {

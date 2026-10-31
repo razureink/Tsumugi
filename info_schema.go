@@ -238,7 +238,7 @@ func (db *DB) infoSchemaRecords(name string) []map[string]interface{} {
 					"CHARACTER_MAXIMUM_LENGTH": nil, "CHARACTER_OCTET_LENGTH": nil,
 					"NUMERIC_PRECISION": nil, "NUMERIC_SCALE": nil, "DATETIME_PRECISION": nil,
 					"CHARACTER_SET_NAME": "utf8mb4", "COLLATION_NAME": "utf8mb4_unicode_ci",
-					"COLUMN_TYPE": colType, "COLUMN_KEY": key, "EXTRA": "", "PRIVILEGES": "",
+					"COLUMN_TYPE": fieldTypeDecl(f), "COLUMN_KEY": key, "EXTRA": "", "PRIVILEGES": "",
 					"COLUMN_COMMENT": "", "GENERATION_EXPRESSION": "",
 				})
 			}
@@ -444,7 +444,7 @@ func (db *DB) describeTable(ref tableRef) (columns []string, rows [][]interface{
 		}
 		rows = append(rows, []interface{}{
 			f.Name,
-			fieldTypeName(f.Type),
+			fieldTypeDecl(f),
 			"YES",
 			key,
 			nil,
@@ -528,7 +528,7 @@ func (db *DB) createTableStmt(tblName string) string {
 			sb.WriteString(",\n")
 		}
 		first = false
-		sb.WriteString("  `" + f.Name + "` " + fieldTypeName(f.Type))
+		sb.WriteString("  `" + f.Name + "` " + fieldTypeDecl(f))
 		if t.Meta().PK == f.Name {
 			sb.WriteString(" NOT NULL")
 		}

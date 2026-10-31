@@ -107,6 +107,14 @@ func (db *DB) AlterTableModifyColumn(name, col string, ftype FieldType, flen int
 			row[col] = coerceInt(v)
 		case TypeBool:
 			row[col] = truthy(v)
+		case TypeDate, TypeDatetime:
+			row[col] = coerceTime(v, ftype == TypeDate)
+		case TypeDecimal:
+			row[col] = coerceDecimal(v, flen)
+		case TypeText, TypeBlob:
+			if v != nil {
+				row[col] = valueString(v)
+			}
 		case TypeVarchar:
 			if v != nil {
 				if s, ok := v.(string); ok {

@@ -1652,6 +1652,11 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	}
 	// 扫描 + 过滤 + 投影
 	if hasOR {
+		// 条件字面量先按列类型折算（DATE/DATETIME → 纳秒，DECIMAL → 定点整数），
+		// 这条路径用 decodeRowFlat 的原始值做 Go 层比较，不经过 scanConds 的
+		// 类型折算；不折算会让 `WHERE amount = 12.34 OR id = 1` 拿 1234 与
+		// 12.34 直接比较而漏行。
+		normalizeGroupCondValues(meta, orGroups)
 		// 全表扫描 + 逐行谓词求值（OR 或 LIKE / IS NULL 等不可下推条件）：
 		// 条件字段预解析为下标，行 flat 解码后求值、命中行内联投影，
 		// 全程不为扫描行物化 map（此前每行一个 map 是该路径最大分配源）。
@@ -1781,6 +1786,46 @@ func (p *sqlParser) expectEnd() error {
 	return nil
 }
 
+// coerceCondLiteral 把条件字面量折算成该列的存储表示：
+// DATE/DATETIME → Unix 纳秒，DECIMAL → 放大 10^scale 的定点整数。
+// 其余类型原样返回；转换失败也原样返回（由上层比较自然不命中）。
+func coerceCondLiteral(f Field, v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch f.Type {
+	case TypeDate, TypeDatetime:
+		if n, ok := coerceTimeNanos(v, f.Type == TypeDate); ok {
+			return n
+		}
+	case TypeDecimal:
+		if n, ok := coerceDecimalScaled(v, f.Len); ok {
+			return n
+		}
+	}
+	return v
+}
+
+// normalizeGroupCondValues 把 OR / 不可下推路径的条件字面量折算成存储值。
+// 这条路径（rowMatchGroupsFlat → evalCond）只看到解码后的 Go 值，没有列类型
+// 信息，必须在这里补上折算。
+func normalizeGroupCondValues(meta *TableMeta, groups []andGroup) {
+	for gi := range groups {
+		for ci := range groups[gi] {
+			c := &groups[gi][ci]
+			fi := meta.fieldIndexOf(c.field)
+			if fi < 0 {
+				continue
+			}
+			f := meta.Fields[fi]
+			c.val = coerceCondLiteral(f, c.val)
+			if c.op == "BETWEEN" {
+				c.val2 = coerceCondLiteral(f, c.val2)
+			}
+		}
+	}
+}
+
 // condsFromGroups 单一 AND 组时提取等值条件供系统表过滤；含 OR 时返回 nil。
 func condsFromGroups(orGroups []andGroup) map[string]interface{} {
 	if len(orGroups) != 1 {
@@ -1834,7 +1879,9 @@ func cmpCell(a, b interface{}) int {
 	as, aokS := a.(string)
 	bs, bokS := b.(string)
 	if aokS && bokS {
-		return strings.Compare(as, bs)
+		// 与 WHERE 的字符集语义保持一致：ORDER BY 也按 utf8mb4_general_ci
+		// 折叠比较，否则会出现"过滤认为相等、排序却把它们排到两端"的矛盾。
+		return cmpFold(as, bs)
 	}
 	return 0
 }
@@ -1929,22 +1976,24 @@ func evalCond(v interface{}, c *rawCond) bool {
 	vs, vok := v.(string)
 	bs, bokS := c.val.(string)
 	if vok && bokS {
+		// 字符串条件按 utf8mb4_general_ci 折叠：OR / LIKE 等不可下推条件
+		// 走的是这条通用谓词路径，语义必须与 scanConds 的字节级内核一致。
 		switch c.op {
 		case "=":
-			return vs == bs
+			return eqFold(vs, bs)
 		case "<>", "!=":
-			return vs != bs
+			return !eqFold(vs, bs)
 		case ">":
-			return vs > bs
+			return cmpFold(vs, bs) > 0
 		case "<":
-			return vs < bs
+			return cmpFold(vs, bs) < 0
 		case ">=":
-			return vs >= bs
+			return cmpFold(vs, bs) >= 0
 		case "<=":
-			return vs <= bs
+			return cmpFold(vs, bs) <= 0
 		case "BETWEEN":
 			b2, b2ok := c.val2.(string)
-			return b2ok && vs >= bs && vs <= b2
+			return b2ok && cmpFold(vs, bs) >= 0 && cmpFold(vs, b2) <= 0
 		}
 		return false
 	}
@@ -2796,6 +2845,63 @@ func skipToParen(p *sqlParser) {
 	}
 }
 
+// parseColumnType 解析 "类型[(参数[,参数])]"；三个 DDL 分支（CREATE /
+// ALTER MODIFY / ALTER ADD）共用，避免 DECIMAL(p,s) 这类双参数类型各写一遍。
+//
+// 返回值 flen 的含义随类型不同：
+//   - VARCHAR(len)：显示长度（不参与行编码，上限由 maxVarcharLen 决定）；
+//   - DECIMAL(p,s)：**scale s**（存进 Field.Len，行内是放大 10^s 的定点整数）。
+//     精度 p 只做合法性校验（p-s ≤ 18，s ≤ decimalMaxScale），不落盘；
+//   - 其它类型：0。
+func (p *sqlParser) parseColumnType() (FieldType, int, error) {
+	typeTok := p.next()
+	if typeTok.kind != kindKw && typeTok.kind != kindIdent {
+		return 0, 0, fmt.Errorf("expected column type")
+	}
+	ftype, err := parseFieldType(typeTok.val)
+	if err != nil {
+		return 0, 0, err
+	}
+	flen := 0
+	if ftype == TypeVarchar {
+		flen = 255
+	}
+	q := p.next()
+	if q.kind != kindSym || q.val != "(" {
+		p.i-- // 回退已读符号
+		return ftype, flen, nil
+	}
+	num := p.next()
+	if num.kind != kindNum {
+		return 0, 0, fmt.Errorf("expected length")
+	}
+	precision, _ := strconv.Atoi(num.val)
+	if ftype == TypeDecimal {
+		scale := 0
+		if p.matchSym(",") {
+			n2 := p.next()
+			if n2.kind != kindNum {
+				return 0, 0, fmt.Errorf("expected DECIMAL scale")
+			}
+			scale, _ = strconv.Atoi(n2.val)
+		}
+		if scale < 0 || scale > decimalMaxScale {
+			return 0, 0, fmt.Errorf("DECIMAL scale %d out of range (0..%d)", scale, decimalMaxScale)
+		}
+		if precision <= 0 || precision-scale > 18 {
+			return 0, 0, fmt.Errorf("DECIMAL(%d,%d) out of range: integer digits must be 1..18", precision, scale)
+		}
+		flen = scale
+	} else {
+		flen = precision
+	}
+	if q := p.next(); q.kind != kindSym || q.val != ")" {
+		return 0, 0, fmt.Errorf("expected )")
+	}
+	return ftype, flen, nil
+}
+
+// parseCreateTable 解析 CREATE TABLE ...。
 func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	p.next() // CREATE
 	if !p.matchKeyword("TABLE") {
@@ -2889,33 +2995,10 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 			err = e
 			return
 		}
-		typeTok := p.next()
-		if typeTok.kind != kindKw && typeTok.kind != kindIdent {
-			err = fmt.Errorf("expected type after %s", fname)
-			return
-		}
-		ftype, e := parseFieldType(typeTok.val)
+		ftype, flen, e := p.parseColumnType()
 		if e != nil {
 			err = e
 			return
-		}
-		flen := 0
-		if ftype == TypeVarchar {
-			flen = 255
-		}
-		if q := p.next(); q.kind == kindSym && q.val == "(" {
-			num := p.next()
-			if num.kind != kindNum {
-				err = fmt.Errorf("expected length")
-				return
-			}
-			flen, _ = strconv.Atoi(num.val)
-			if q := p.next(); q.kind != kindSym || q.val != ")" {
-				err = fmt.Errorf("expected )")
-				return
-			}
-		} else {
-			p.i-- // 回退已读符号
 		}
 		// 行内 PRIMARY KEY / 其它列属性（NOT NULL、DEFAULT、AUTO_INCREMENT、
 		// UNIQUE、KEY、COMMENT、COLLATE、CHARACTER SET、ON UPDATE ...）一律容忍并跳过，
@@ -3266,29 +3349,10 @@ func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interfac
 				}
 			}
 		}
-		typeTok := p.next()
-		ftype, e := parseFieldType(typeTok.val)
+		ftype, flen, e := p.parseColumnType()
 		if e != nil {
 			err = e
 			return
-		}
-		flen := 0
-		if ftype == TypeVarchar {
-			flen = 255
-		}
-		if q := p.next(); q.kind == kindSym && q.val == "(" {
-			num := p.next()
-			if num.kind != kindNum {
-				err = fmt.Errorf("expected length")
-				return
-			}
-			flen, _ = strconv.Atoi(num.val)
-			if q := p.next(); q.kind != kindSym || q.val != ")" {
-				err = fmt.Errorf("expected )")
-				return
-			}
-		} else {
-			p.i--
 		}
 		// 跳过列属性（NOT NULL / DEFAULT ... 等）
 		for {
@@ -3369,29 +3433,10 @@ func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interfac
 			err = e
 			return
 		}
-		typeTok := p.next()
-		ftype, e := parseFieldType(typeTok.val)
+		ftype, flen, e := p.parseColumnType()
 		if e != nil {
 			err = e
 			return
-		}
-		flen := 0
-		if ftype == TypeVarchar {
-			flen = 255
-		}
-		if q := p.next(); q.kind == kindSym && q.val == "(" {
-			num := p.next()
-			if num.kind != kindNum {
-				err = fmt.Errorf("expected length")
-				return
-			}
-			flen, _ = strconv.Atoi(num.val)
-			if q := p.next(); q.kind != kindSym || q.val != ")" {
-				err = fmt.Errorf("expected )")
-				return
-			}
-		} else {
-			p.i-- // 回退已读符号
 		}
 		// 追加新字段（保持既有字段序），重写 catalog。
 		// 必须走引擎的写时复制路径：published meta 不可原地修改，

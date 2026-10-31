@@ -32,6 +32,13 @@ const (
 	// 因此用独立版本号标识，避免与远端写出的 WAL 混淆。
 	// 读取侧同时兼容 v1/v2/v3/v4；写入一律用 v4。
 	WALVersion4 = WALVersion3 + 1
+	// WALVersion5 当前写入版本 = v4 + 1。
+	// 分帧格式与 v3/v4 完全相同（同一套 loadV3），差异在记录语义：
+	// A5 新增 DATE/DATETIME/DECIMAL/TEXT/BLOB 列类型，并把 VARCHAR 的比较与
+	// 索引键改成 utf8mb4_general_ci 折叠。旧版本代码读到这些行会按错误的
+	// 列类型解码、按未折叠的索引键查找，因此必须用新版本号把文件标记出来。
+	// 读取侧兼容 1/2/3/4/5；写入（新建文件、Compact 重写）一律用 v5。
+	WALVersion5 = WALVersion4 + 1
 	// 读取侧预读缓冲（不影响单批内存上限）
 	walReadAheadBytes = 1 << 20
 	// 批次头的固定开销：4 字节 CRC
@@ -40,7 +47,7 @@ const (
 
 // 写入侧单批上限：超过就切批，避免一次攒出巨大缓冲。
 // 默认值面向普通 SSD；启动时的设备探测会按落盘延迟/内存压力调整
-//（慢盘用更大批次减少帧头与系统调用，小内存用更小批次限制峰值占用）。
+// （慢盘用更大批次减少帧头与系统调用，小内存用更小批次限制峰值占用）。
 var (
 	walBatchMaxBytes   = 1 << 20 // 1MB
 	walBatchMaxRecords = 256

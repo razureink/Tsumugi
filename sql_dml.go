@@ -123,6 +123,8 @@ func (db *DB) parseUpdate(p *sqlParser) (columns []string, rows [][]interface{},
 	}
 	// 校验 SET 列存在
 	meta := t.Meta()
+	// WHERE 里的日期/十进制常量折算成行内存储值，否则表达式路径永远不命中。
+	coerceExprConsts(where, meta)
 	for _, s := range sets {
 		if meta.fieldIndexOf(s.col) < 0 {
 			err = fmt.Errorf("unknown column %q in SET", s.col)
@@ -277,6 +279,7 @@ func (db *DB) parseDelete(p *sqlParser) (columns []string, rows [][]interface{},
 		return
 	}
 	meta := t.Meta()
+	coerceExprConsts(where, meta)
 	if pk, ok := pointPK(where, meta.PK); ok && limit != 0 {
 		if e := db.txnApply(p.txnID, t, pk, func() error {
 			return t.Delete(pk, p.txnID, false)
