@@ -29,7 +29,8 @@ import (
 
 const (
 	protocolVersion  = 10
-	defaultCollation = 45 // utf8mb4_general_ci
+	defaultCollation = 45     // utf8mb4_general_ci
+	statusInTrans    = 0x0001 // SERVER_STATUS_IN_TRANS
 	statusAutocommit = 0x0002
 	longFlagOpened   = 0x0080
 
@@ -53,6 +54,7 @@ const (
 	clientLongPassword               = 1 << 0
 	clientLongFlag                   = 1 << 2
 	clientConnectWithDB              = 1 << 3
+	clientCompress                   = 1 << 5
 	clientProtocol41                 = 1 << 9
 	clientTransactions               = 1 << 13
 	clientSecureConnection           = 1 << 15
@@ -60,12 +62,25 @@ const (
 	clientPSMultiResults             = 1 << 18
 	clientPluginAuth                 = 1 << 19
 	clientPluginAuthLenEncClientData = 1 << 21
+	clientDeprecateEOF               = 1 << 24
 )
 
+// serverCapabilities 只声明本实现真正会做的能力：
+//   - PROTOCOL_41 / LONG_PASSWORD / LONG_FLAG / TRANSACTIONS / SECURE_CONNECTION：
+//     握手与 OK/ERR 包都按 4.1 格式、带 status flags 与 SQLSTATE；
+//   - CONNECT_WITH_DB：认证包里解析 db 名（readAuth）；
+//   - PLUGIN_AUTH / PLUGIN_AUTH_LENENC_CLIENT_DATA：握手带插件名、支持 AuthSwitch、
+//     认证响应支持 lenenc 编码；
+//   - DEPRECATE_EOF：协商成功后按 deprecate EOF 语义发 OK(0xfe) 代替 EOF，
+//     列定义块后不再发 EOF（见 writeEOF / writeEndOfResultSet）；
+//   - COMPRESS：协商成功后启用 zlib 压缩协议（mysql_compress.go）。
+//
+// 刻意不声明：SSL（未实现 TLS）、MULTI_STATEMENTS、MULTI_RESULTS / PS_MULTI_RESULTS
+// （每条命令只产生一个结果集，CALL/存储过程也不支持）、SESSION_TRACK、CONNECT_ATTRS。
+// 声明了却不实现会让客户端在等待某个永远不会到达的包时卡死。
 const serverCapabilities = clientLongPassword | clientLongFlag | clientConnectWithDB |
-	clientProtocol41 | clientTransactions | clientSecureConnection |
-	clientMultiResults | clientPSMultiResults |
-	clientPluginAuth | clientPluginAuthLenEncClientData
+	clientCompress | clientProtocol41 | clientTransactions | clientSecureConnection |
+	clientPluginAuth | clientPluginAuthLenEncClientData | clientDeprecateEOF
 
 var errBadPacket = fmt.Errorf("bad packet")
 var errAccessDenied = fmt.Errorf("access denied")
@@ -154,12 +169,21 @@ type mysqlConn struct {
 	nextStmt uint32 // 下一个可用的 prepared 语句 ID
 	prepared map[uint32]*mysqlPreparedStmt
 	// longData COM_STMT_SEND_LONG_DATA 累积缓冲，key = stmtID<<16 | paramID
-	longData    map[uint32]map[uint16][]byte
-	inTxn       bool
-	txnID       uint64
-	autocommit  bool // SET autocommit=0 后写语句进入隐式事务
-	implicitTxn uint64
-	sessID      uint64 // 会话注册表 ID（SHOW PROCESSLIST 用）
+	longData map[uint32]map[uint16][]byte
+	// longBytes 每条语句已累积的长数据总字节数，用于总量钳制（防内存耗尽）
+	longBytes map[uint32]int
+	// capabilities 客户端握手能力位与 serverCapabilities 的交集：
+	// 只有双方都支持的能力才生效（压缩、deprecate EOF 都以此为准）。
+	capabilities uint32
+	compress     bool  // 协商成功并已启用压缩协议
+	compSeq      uint8 // 压缩帧序号（与包序号独立）
+	compReader   *mysqlCompReader
+	compWriter   *mysqlCompWriter
+	inTxn        bool
+	txnID        uint64
+	autocommit   bool // SET autocommit=0 后写语句进入隐式事务
+	implicitTxn  uint64
+	sessID       uint64 // 会话注册表 ID（SHOW PROCESSLIST 用）
 	// isoLevel 事务隔离级别。引擎当前只提供 READ COMMITTED 语义，
 	// 客户端显式设置其它级别时必须报错，而不是静默按 RC 运行——
 	// 否则应用以为拿到了 REPEATABLE READ 的读快照，实际会出现不可重复读。
@@ -177,6 +201,8 @@ type mysqlPreparedStmt struct {
 
 func (mc *mysqlConn) handle() {
 	defer mc.conn.Close()
+	// 连接结束时把缓存的 token 切片归还池（此前断连会把这些切片连同语句一起丢给 GC）
+	defer mc.releasePrepared()
 	defer func() {
 		if r := recover(); r != nil {
 			logf(LOG_ERR, "mysql conn panic: %v", r)
@@ -193,6 +219,12 @@ func (mc *mysqlConn) handle() {
 		return
 	}
 	mc.authed = true
+	// 压缩从认证 OK 之后的第一个命令开始（握手/认证包不压缩）。
+	if mc.capabilities&clientCompress != 0 {
+		if err := mc.enableCompression(); err != nil {
+			return
+		}
+	}
 	// 读/写超时分开维护（等待超时取广告的 wait_timeout）。
 	// 旧实现握手时用 SetDeadline 设了"读+写"的固定 120s，主循环只续读，
 	// 于是连接存活 2 分钟后任何写入都会 i/o timeout 被断开（连接池必现）。
@@ -239,7 +271,7 @@ func (mc *mysqlConn) handle() {
 			mc.db.stats.IncCmd("EXECUTE")
 			mc.handleExecute(payload)
 		case comStmtFetch:
-			// 未声明 CLIENT_PS_MULTI_RESULTS / 游标支持：明确报错而不是静默丢弃
+			// 未声明游标 / PS_MULTI_RESULTS：明确报错而不是静默丢弃
 			mc.sendError(1235, "cursor fetch is not supported")
 		case comStmtClose:
 			mc.handleStmtClose(payload)
@@ -248,16 +280,16 @@ func (mc *mysqlConn) handle() {
 		case comStmtSendLong:
 			mc.handleSendLong(payload)
 		case comSetOption:
-			// COM_SET_OPTION：无多语句支持，回 EOF 表示"保持现状"
-			var eof []byte
-			eof = append(eof, 0xfe, 0x00, 0x00, 0x02, 0x00)
-			mc.writePacket(eof)
+			// COM_SET_OPTION：无多语句支持，回终止包表示"保持现状"。
+			// 协商了 deprecate EOF 时按协议用 0xfe 头的 OK 包代替 EOF。
+			mc.writeEndOfResultSet()
 		default:
 			mc.sendError(1047, fmt.Sprintf("unknown command %d", cmd))
 		}
 		// 每个命令处理后一次性 flush：多条结果包（列定义+行）合成更大的 TCP 写块，
 		// 大幅减少系统调用，同时保持包边界（读侧按头解析）。
-		if err := mc.bw.Flush(); err != nil {
+		// 启用压缩时还需要把缓冲的字节压成压缩帧写出。
+		if err := mc.flushOut(); err != nil {
 			return
 		}
 	}
@@ -287,6 +319,45 @@ func (mc *mysqlConn) handleInitDB(name string) {
 
 func (mc *mysqlConn) writePacket(payload []byte) error {
 	return writeMysqlPacket(mc.bw, &mc.seq, payload)
+}
+
+// flushOut 把缓冲的响应真正写出：先落 bufio，再落压缩帧（若已启用压缩）。
+func (mc *mysqlConn) flushOut() error {
+	if err := mc.bw.Flush(); err != nil {
+		return err
+	}
+	if mc.compWriter != nil {
+		return mc.compWriter.Flush()
+	}
+	return nil
+}
+
+// enableCompression 在认证完成后切换到压缩协议。
+// 此时认证 OK 已经 flush 完毕，旧的 bufio 为空；重新包一层压缩写入器，
+// 之后的每个响应都会在 flushOut 时压成压缩帧。
+func (mc *mysqlConn) enableCompression() error {
+	if err := mc.bw.Flush(); err != nil {
+		return err
+	}
+	mc.compress = true
+	mc.compSeq = 0
+	mc.compReader = &mysqlCompReader{br: mc.br, seq: &mc.compSeq}
+	mc.compWriter = &mysqlCompWriter{w: mc.conn, seq: &mc.compSeq}
+	mc.bw = bufio.NewWriterSize(mc.compWriter, 64*1024)
+	return nil
+}
+
+// releasePrepared 归还连接上仍存活的 prepared 语句占用的 token 切片。
+func (mc *mysqlConn) releasePrepared() {
+	for _, st := range mc.prepared {
+		if st.toks != nil {
+			putSQLTokens(st.toks)
+			st.toks = nil
+		}
+	}
+	mc.prepared = nil
+	mc.longData = nil
+	mc.longBytes = nil
 }
 
 // writeMysqlPacket 发送一个（可能多分片的）MySQL 包。用栈上 4 字节头部并分开写，
@@ -345,7 +416,7 @@ func (mc *mysqlConn) readPacket() (byte, []byte, error) {
 // 总长度受 maxMySQLPacket 钳制：多分片续包不设上限会被恶意客户端无限撑大内存。
 func (mc *mysqlConn) readRawPacket() (byte, []byte, error) {
 	var hdr [4]byte
-	if _, err := io.ReadFull(mc.br, hdr[:]); err != nil {
+	if err := mc.readFull(hdr[:]); err != nil {
 		return 0, nil, err
 	}
 	length := int(hdr[0]) | int(hdr[1])<<8 | int(hdr[2])<<16
@@ -360,7 +431,7 @@ func (mc *mysqlConn) readRawPacket() (byte, []byte, error) {
 		return 0, nil, fmt.Errorf("packet exceeds limit before authentication")
 	}
 	payload := make([]byte, length)
-	if _, err := io.ReadFull(mc.br, payload); err != nil {
+	if err := mc.readFull(payload); err != nil {
 		return 0, nil, err
 	}
 	// 多分片拼接
@@ -368,18 +439,27 @@ func (mc *mysqlConn) readRawPacket() (byte, []byte, error) {
 		if len(payload)+0xffffff > limit {
 			return 0, nil, fmt.Errorf("packet exceeds max_allowed_packet")
 		}
-		if _, err := io.ReadFull(mc.br, hdr[:]); err != nil {
+		if err := mc.readFull(hdr[:]); err != nil {
 			return 0, nil, err
 		}
 		length = int(hdr[0]) | int(hdr[1])<<8 | int(hdr[2])<<16
 		mc.seq = hdr[3] + 1
 		chunk := make([]byte, length)
-		if _, err := io.ReadFull(mc.br, chunk); err != nil {
+		if err := mc.readFull(chunk); err != nil {
 			return 0, nil, err
 		}
 		payload = append(payload, chunk...)
 	}
 	return 0, payload, nil
+}
+
+// readFull 读满 b：启用压缩时从压缩帧的解压流里读，否则直接读 socket。
+func (mc *mysqlConn) readFull(b []byte) error {
+	if mc.compReader != nil {
+		return mc.compReader.ReadFull(b)
+	}
+	_, err := io.ReadFull(mc.br, b)
+	return err
 }
 
 // ---- 长度编码 ----
@@ -485,37 +565,24 @@ func (mc *mysqlConn) readAuth() error {
 		mc.bw.Flush()
 		return errBadPacket
 	}
+	// 记录客户端请求的能力位，并与服务端声明求交集：
+	// 只有双方都支持的能力才生效（压缩、deprecate EOF 都以此为准）。
+	mc.capabilities = binary.LittleEndian.Uint32(payload[0:4]) & serverCapabilities
 	pos += 4 + 4 + 1 + 23 // capabilities + maxpacket + charset + reserved
 	user := readNulString(payload, &pos)
 	mc.user = user
-	// 认证响应：长度编码（CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA 或 1 字节 / 0xfc 两字节形式）
-	authLen := 0
+	// 认证响应：CLIENT_SECURE_CONNECTION / CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+	// 下都是长度编码（1 字节或 0xfc/0xfd/0xfe 前缀），统一按 lenenc 解析。
+	var authResp []byte
 	if pos < len(payload) {
-		switch first := payload[pos]; {
-		case first < 251:
-			authLen = int(first)
-			pos++
-		case first == 0xfc:
-			if pos+3 > len(payload) {
-				mc.sendError(1045, "bad auth response length")
-				mc.bw.Flush()
-				return errBadPacket
-			}
-			authLen = int(payload[pos+1]) | int(payload[pos+2])<<8
-			pos += 3
-		default:
-			mc.sendError(1045, "unsupported auth response encoding")
-			mc.bw.Flush()
-			return errBadPacket
-		}
-		if pos+authLen > len(payload) {
+		b, err := readLenEncByteSlice(payload, &pos)
+		if err != nil {
 			mc.sendError(1045, "bad auth response length")
 			mc.bw.Flush()
 			return errBadPacket
 		}
+		authResp = b
 	}
-	authResp := payload[pos : pos+authLen]
-	pos += authLen
 	// 数据库名（CLIENT_CONNECT_WITH_DB 时位于插件名之前）；插件名（CLIENT_PLUGIN_AUTH）。
 	plugin := "mysql_native_password"
 	var clientDB string
@@ -930,16 +997,16 @@ func (mc *mysqlConn) handlePrepare(sql string) {
 	buf = appendU16LE(buf, 0)         // warning count
 	mc.writePacket(buf)
 
-	// 参数定义包（每参数一个，之后 EOF）
+	// 参数定义包（每参数一个）
 	for i := 0; i < n; i++ {
 		buf = buf[:0]
 		buf = mc.appendColumnDef(buf, "def", mc.schemaName(), "", "", "?", "?", 0x0f)
 		mc.writePacket(buf)
 	}
-	if n > 0 {
-		buf = buf[:0]
-		buf = append(buf, 0xfe, 0x00, 0x00, 0x02, 0x00)
-		mc.writePacket(buf)
+	// 参数定义块结束：按协议在协商了 CLIENT_DEPRECATE_EOF 时不再发任何终止包，
+	// 否则发 EOF。多发一个包会让客户端把它当成下一条响应而错位。
+	if n > 0 && mc.capabilities&clientDeprecateEOF == 0 {
+		mc.writeEOF()
 	}
 }
 
@@ -975,7 +1042,9 @@ func (mc *mysqlConn) schemaName() string {
 
 // handleExecute 响应 COM_STMT_EXECUTE：解析二进制协议参数并执行。
 func (mc *mysqlConn) handleExecute(payload []byte) {
-	if len(payload) < 10 {
+	// 命令字节已被裁剪：4B id + 1B flags + 4B iteration = 9B 是最小体
+	// （0 参数语句就恰好是 9B，不能按 10B 判定畸形）。
+	if len(payload) < 9 {
 		mc.sendError(1243, "malformed COM_STMT_EXECUTE")
 		return
 	}
@@ -985,6 +1054,9 @@ func (mc *mysqlConn) handleExecute(payload []byte) {
 		mc.sendError(1243, "statement not found")
 		return
 	}
+	// 长数据只在本次 EXECUTE 中有效：无论成功失败都要清掉，
+	// 否则残留数据会污染下一次执行（MySQL 同样在 execute 结束时丢弃）。
+	defer mc.clearLongData(stmtID)
 	// 信息函数（DATABASE()/USER() 等）需要连接上下文
 	setSessionContext(mc.schema, mc.user)
 	flags := uint8(payload[4])
@@ -1024,8 +1096,15 @@ func (mc *mysqlConn) handleExecute(payload []byte) {
 			mc.sendError(1243, "no cached parameter types to reuse")
 			return
 		}
-		// 按类型解析二进制值
+		// 按类型解析二进制值。
+		// 关键：COM_STMT_SEND_LONG_DATA 送过长数据的参数，客户端在 EXECUTE 包里
+		// 不再带值（只带类型），因此必须先判定长数据并跳过解析，否则会因
+		// "truncated param value" 把正常的 long data 执行判成畸形包。
 		for i := 0; i < st.paramCount; i++ {
+			if ld, ok := mc.takeLongData(stmtID, uint16(i)); ok {
+				params[i] = string(ld)
+				continue
+			}
 			if nullBitmap[i/8]&(1<<uint(i%8)) != 0 {
 				params[i] = nil
 				continue
@@ -1034,10 +1113,6 @@ func (mc *mysqlConn) handleExecute(payload []byte) {
 			if err != nil {
 				mc.sendError(1243, err.Error())
 				return
-			}
-			// COM_STMT_SEND_LONG_DATA 送来的大字段覆盖包内空值
-			if ld, ok := mc.takeLongData(stmtID, uint16(i)); ok {
-				v = string(ld)
 			}
 			params[i] = v
 		}
@@ -1271,71 +1346,92 @@ func readTimeParam(payload []byte, pos *int) (interface{}, error) {
 
 func (mc *mysqlConn) handleStmtClose(payload []byte) {
 	if len(payload) < 4 {
+		// COM_STMT_CLOSE 没有响应体：畸形包也不能回 ERR，
+		// 否则客户端不会读取该包，后续命令全部错位。
 		return
 	}
 	stmtID := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16 | uint32(payload[3])<<24
 	if st := mc.prepared[stmtID]; st != nil && st.toks != nil {
 		putSQLTokens(st.toks)
+		st.toks = nil
 	}
 	delete(mc.prepared, stmtID)
 	// long data 缓冲一并清理（此前只删 prepared，longData 泄漏到断连）
 	delete(mc.longData, stmtID)
+	delete(mc.longBytes, stmtID)
 }
 
+// handleStmtReset 响应 COM_STMT_RESET：保留语句本身，清空参数状态后回 OK。
+// 需要清掉的连接级状态：COM_STMT_SEND_LONG_DATA 累积缓冲、缓存的参数类型
+// （客户端在 reset 后会重新发送类型数组）。MySQL 客户端（如 libmysql 的
+// mysql_stmt_reset）会据此把 send_types_to_server 重新置 1。
 func (mc *mysqlConn) handleStmtReset(payload []byte) {
 	if len(payload) < 4 {
 		mc.sendError(1243, "malformed COM_STMT_RESET")
 		return
 	}
 	stmtID := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16 | uint32(payload[3])<<24
-	if _, ok := mc.prepared[stmtID]; !ok {
+	st, ok := mc.prepared[stmtID]
+	if !ok {
 		mc.sendError(1243, "statement not found")
 		return
 	}
-	delete(mc.longData, stmtID)
+	mc.clearLongData(stmtID)
+	st.paramTypes = nil
 	mc.writeOK()
 }
 
 // handleSendLong 累积长数据到参数缓冲区（COM_STMT_SEND_LONG_DATA）。
-// 校验语句存在性并钳制总量（此前任意 stmtID 无上限累积，构成内存耗尽向量）。
+// 该命令没有响应体：任何错误都只能静默丢弃，不能回 ERR（会与后续响应错位）。
+// 校验语句存在性、参数下标与总量，避免任意 stmtID/paramID 无上限累积内存。
 func (mc *mysqlConn) handleSendLong(payload []byte) {
 	if len(payload) < 6 {
 		return
 	}
 	stmtID := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16 | uint32(payload[3])<<24
-	if _, ok := mc.prepared[stmtID]; !ok {
+	st, ok := mc.prepared[stmtID]
+	if !ok {
 		return // 未知语句：静默丢弃（与 MySQL 行为一致）
 	}
 	paramID := uint16(payload[4]) | uint16(payload[5])<<8
+	if int(paramID) >= st.paramCount {
+		return // 越界参数：丢弃，不为其分配缓冲
+	}
 	chunk := payload[6:]
+	if len(chunk) == 0 {
+		return
+	}
 	if mc.longData == nil {
 		mc.longData = make(map[uint32]map[uint16][]byte)
+		mc.longBytes = make(map[uint32]int)
+	}
+	// 单条语句所有参数的长数据总量限制在 max_allowed_packet
+	if mc.longBytes[stmtID]+len(chunk) > maxMySQLPacket {
+		return
 	}
 	m := mc.longData[stmtID]
 	if m == nil {
 		m = make(map[uint16][]byte)
 		mc.longData[stmtID] = m
 	}
-	if len(m[paramID])+len(chunk) > maxMySQLPacket {
-		return // 超过 max_allowed_packet：忽略多余数据
-	}
 	m[paramID] = append(m[paramID], chunk...)
+	mc.longBytes[stmtID] += len(chunk)
 }
 
-// takeLongData 取出并清除某参数的 long data（一次性，与 MySQL 语义一致）。
+// takeLongData 读取某参数已累积的长数据（不清空，整条语句在 EXECUTE 结束时统一清理）。
 func (mc *mysqlConn) takeLongData(stmtID uint32, paramID uint16) ([]byte, bool) {
 	m := mc.longData[stmtID]
 	if m == nil {
 		return nil, false
 	}
 	b, ok := m[paramID]
-	if ok {
-		delete(m, paramID)
-		if len(m) == 0 {
-			delete(mc.longData, stmtID)
-		}
-	}
 	return b, ok
+}
+
+// clearLongData 清掉某语句的长数据缓冲与计数。
+func (mc *mysqlConn) clearLongData(stmtID uint32) {
+	delete(mc.longData, stmtID)
+	delete(mc.longBytes, stmtID)
 }
 
 // sendResultSet 发送结果集。列类型按首行实际值推断：
@@ -1372,9 +1468,10 @@ func (mc *mysqlConn) sendResultSet(columns []string, rows [][]interface{}) {
 		buf = appendU16LE(buf, 0) // filler
 		mc.writePacket(buf)
 	}
-	buf = buf[:0]
-	buf = append(buf, 0xfe, 0x00, 0x00, 0x02, 0x00) // EOF（列定义结束）
-	mc.writePacket(buf)
+	// 列定义结束：协商了 deprecate EOF 时不发任何包（客户端按列数直接读行）。
+	if mc.capabilities&clientDeprecateEOF == 0 {
+		mc.writeEOF()
+	}
 	for _, r := range rows {
 		buf = buf[:0]
 		for _, v := range r {
@@ -1382,9 +1479,8 @@ func (mc *mysqlConn) sendResultSet(columns []string, rows [][]interface{}) {
 		}
 		mc.writePacket(buf)
 	}
-	buf = buf[:0]
-	buf = append(buf, 0xfe, 0x00, 0x00, 0x02, 0x00) // EOF（行结束）
-	mc.writePacket(buf)
+	// 行流结束：EOF 或 deprecate EOF 下的 OK(0xfe)。
+	mc.writeEndOfResultSet()
 }
 
 // columnTypesFor 推断结果集列类型：取首行实际值；首行为 NULL 时向后找第一个非空值，
@@ -1417,9 +1513,10 @@ func (mc *mysqlConn) sendBinaryResultSet(columns []string, rows [][]interface{})
 		buf = mc.appendColumnDef(buf, "def", schema, "", "", columns[i], columns[i], types[i])
 		mc.writePacket(buf)
 	}
-	buf = buf[:0]
-	buf = append(buf, 0xfe, 0x00, 0x00, 0x02, 0x00) // EOF: 列定义结束
-	mc.writePacket(buf)
+	// 列定义结束：deprecate EOF 下省略
+	if mc.capabilities&clientDeprecateEOF == 0 {
+		mc.writeEOF()
+	}
 
 	nullLen := (len(columns) + 7 + 2) / 8
 	var nulls [64]byte
@@ -1453,9 +1550,8 @@ func (mc *mysqlConn) sendBinaryResultSet(columns []string, rows [][]interface{})
 		}
 		mc.writePacket(buf)
 	}
-	buf = buf[:0]
-	buf = append(buf, 0xfe, 0x00, 0x00, 0x02, 0x00) // EOF: 行结束
-	mc.writePacket(buf)
+	// 行流结束：EOF 或 deprecate EOF 下的 OK(0xfe)
+	mc.writeEndOfResultSet()
 }
 
 // appendBinaryCell 按列类型编码一个二进制行值（NULL 由 null bitmap 表示，不在此处理）。
@@ -1532,7 +1628,8 @@ func (mc *mysqlConn) handleFieldList(payload []byte) {
 		buf = mc.appendColumnDef(buf, "def", mc.schemaName(), meta.Name, meta.Name, f.Name, f.Name, colType)
 		mc.writePacket(buf)
 	}
-	mc.writePacket([]byte{0xfe, 0x00, 0x00, 0x02, 0x00})
+	// 字段列表结束：EOF（或 deprecate EOF 下的 OK(0xfe)）
+	mc.writeEndOfResultSet()
 }
 
 // mysqlColLen 返回列定义中的最大显示宽度（按类型）。
@@ -1888,6 +1985,38 @@ func firstWord(sql string) string {
 	return sql
 }
 
+// statusFlags 返回 OK/EOF 包里应携带的 status flags：
+// autocommit 模式、是否处于显式/隐式事务。JDBC 等客户端依赖 IN_TRANS
+// 判断事务是否活跃，恒定返回 0x0002 会让连接池误判。
+func (mc *mysqlConn) statusFlags() uint16 {
+	var s uint16
+	if mc.autocommit {
+		s |= statusAutocommit
+	}
+	if mc.inTxn || mc.implicitTxn != 0 {
+		s |= statusInTrans
+	}
+	return s
+}
+
+// writeEOF 发送 EOF 包：0xfe + warnings(2) + status(2)。
+func (mc *mysqlConn) writeEOF() {
+	s := mc.statusFlags()
+	mc.writePacket([]byte{0xfe, 0x00, 0x00, byte(s), byte(s >> 8)})
+}
+
+// writeEndOfResultSet 发送结果集（列定义块/行流）的终止包：
+// 未协商 CLIENT_DEPRECATE_EOF 时是 EOF；协商后按 deprecate EOF 语义
+// 改用 0xfe 头的 OK 包：0xfe + affected(0) + insert_id(0) + status(2) + warnings(2)。
+func (mc *mysqlConn) writeEndOfResultSet() {
+	if mc.capabilities&clientDeprecateEOF == 0 {
+		mc.writeEOF()
+		return
+	}
+	s := mc.statusFlags()
+	mc.writePacket([]byte{0xfe, 0x00, 0x00, byte(s), byte(s >> 8), 0x00, 0x00})
+}
+
 func (mc *mysqlConn) writeOK() {
 	mc.writeOKAffected(0)
 }
@@ -1905,7 +2034,7 @@ func (mc *mysqlConn) writeOKAffectedID(affected int64, lastInsertID int64) {
 	buf = append(buf, 0x00)
 	buf = appendLenEncInt(buf, uint64(affected)) // affected rows
 	buf = appendLenEncInt(buf, uint64(lastInsertID))
-	buf = appendU16LE(buf, statusAutocommit) // status flags
+	buf = appendU16LE(buf, mc.statusFlags()) // status flags
 	buf = appendU16LE(buf, 0)                // warnings
 	mc.writePacket(buf)
 }
