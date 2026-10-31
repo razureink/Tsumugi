@@ -10,6 +10,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -976,6 +977,69 @@ func (s *Server) handleSelect(session *Session) {
 	}
 }
 
+// runSQLSessionAsOut 执行一条 SQL，并维护**会话级**事务状态。
+//
+// 背景：SQL 执行器每次调用都新建 parser，事务状态无法跨语句保存，
+// 所以事务语句必须在协议层拦截（MySQL 协议路径已经是这么做的）。
+// 这里为原生协议/CLI 补齐同样的语义，避免 BEGIN/COMMIT/ROLLBACK 变成静默 no-op
+// （那会让客户端以为在事务里，实际每条语句都自动提交）。
+func (db *DB) runSQLSessionAsOut(session *Session, sql string, out *sqlOut) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	fw := strings.ToUpper(firstWord(sql))
+	switch fw {
+	case "BEGIN", "START":
+		// 已在事务中：MySQL 会隐式提交前一个事务
+		if session.inTxn {
+			_ = db.CommitTxn(session.txnID)
+			session.inTxn = false
+			session.txnID = 0
+		}
+		session.txnID = db.BeginTxn()
+		session.inTxn = true
+		return nil, nil, 0, "Query OK", nil
+	case "COMMIT":
+		if !session.inTxn {
+			return nil, nil, 0, "Query OK", nil
+		}
+		id := session.txnID
+		session.inTxn = false
+		session.txnID = 0
+		if e := db.CommitTxn(id); e != nil {
+			return nil, nil, 0, "", e
+		}
+		return nil, nil, 0, "Query OK", nil
+	case "ROLLBACK":
+		// ROLLBACK TO [SAVEPOINT] name 不是整事务回滚，交给执行器（保存点路径）
+		if isRollbackToSavepoint(sql) {
+			return db.runSQLSchemaAsOut(session.user, sql, nil, session.txnID, "", out)
+		}
+		if !session.inTxn {
+			return nil, nil, 0, "Query OK", nil
+		}
+		id := session.txnID
+		session.inTxn = false
+		session.txnID = 0
+		if e := db.RollbackTxn(id); e != nil {
+			return nil, nil, 0, "", e
+		}
+		return nil, nil, 0, "Query OK", nil
+	}
+	// 普通语句：带上会话事务号，使写操作加入该事务
+	return db.runSQLSchemaAsOut(session.user, sql, nil, session.txnID, "", out)
+}
+
+// isRollbackToSavepoint 判断是否为 ROLLBACK TO [SAVEPOINT] xxx。
+func isRollbackToSavepoint(sql string) bool {
+	lower := strings.ToLower(sql)
+	i := strings.Index(lower, "rollback")
+	if i < 0 {
+		return false
+	}
+	rest := strings.TrimSpace(lower[i+len("rollback"):])
+	rest = strings.TrimPrefix(rest, "work")
+	rest = strings.TrimSpace(rest)
+	return strings.HasPrefix(rest, "to")
+}
+
 // ---- 通用 SQL 执行（CLI 使用）----
 func (s *Server) handleQuerySQL(session *Session) {
 	s.db.stats.IncCmd("QUERY_SQL")
@@ -990,8 +1054,12 @@ func (s *Server) handleQuerySQL(session *Session) {
 		return
 	}
 	// 以会话账号执行：内部统一做表级授权（此前完全不做权限校验）
+	// 事务语句必须在协议层拦截并维护会话级事务状态：
+	// SQL 执行器是"每语句一个 parser"，parseTxnControl 无法把事务传递到下一条语句，
+	// 因此以前 BEGIN/COMMIT/ROLLBACK 走 SQL 文本路径时全是静默 no-op（等于自动提交）。
 	var out sqlOut
-	columns, rows, affected, rawMsg, err := s.db.runSQLAsOut(session.user, string(sqlBytes), &out)
+	stmt := string(sqlBytes)
+	columns, rows, affected, rawMsg, err := s.db.runSQLSessionAsOut(session, stmt, &out)
 	if err != nil {
 		s.writeError(session, err.Error())
 		return
