@@ -679,7 +679,7 @@ func (mc *mysqlConn) handleQuery(sql string) {
 			mc.sendExprResult(sql)
 			return
 		}
-		mc.sendError(1064, "you have an error in your SQL syntax near '"+firstWord(sql)+"': "+err.Error())
+		mc.sendSQLError(err)
 		return
 	}
 	if len(columns) == 0 {
@@ -981,7 +981,7 @@ func (mc *mysqlConn) handleExecute(payload []byte) {
 	var out sqlOut
 	columns, rows, affected, _, err := mc.db.runSQLTokensAsOut(mc.user, st.toks, st.sql, params, txnID, mc.schema, &out)
 	if err != nil {
-		mc.sendError(1064, "you have an error in your SQL syntax near '"+firstWord(st.sql)+"': "+err.Error())
+		mc.sendSQLError(err)
 		return
 	}
 	if len(columns) == 0 {
@@ -1831,11 +1831,27 @@ func (mc *mysqlConn) writeOKAffectedID(affected int64, lastInsertID int64) {
 }
 
 func (mc *mysqlConn) sendError(code int, msg string) {
+	mc.sendErrorState(code, sqlStateFor(code), msg)
+}
+
+// sendErrorState 允许指定 SQLSTATE（不同 errno 对应不同状态类）。
+func (mc *mysqlConn) sendErrorState(code int, sqlState, msg string) {
+	if len(sqlState) != 5 {
+		sqlState = "HY000"
+	}
 	var buf []byte
 	buf = append(buf, 0xff)
 	buf = appendU16LE(buf, uint16(code))
 	buf = append(buf, '#')
-	buf = append(buf, []byte("42000")...)
+	buf = append(buf, []byte(sqlState)...)
 	buf = append(buf, []byte(msg)...)
 	mc.writePacket(buf)
+}
+
+// sendSQLError 按错误内容挑选 MySQL errno 与 SQLSTATE 后上报。
+// ORM 依赖这些码做分支（1062 重复键、1213 死锁重试、1146 缺表迁移…），
+// 一律返回 1064 会让客户端行为错误。
+func (mc *mysqlConn) sendSQLError(err error) {
+	code := mysqlErrno(err)
+	mc.sendErrorState(code, sqlStateFor(code), mysqlErrText(err))
 }
