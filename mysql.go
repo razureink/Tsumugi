@@ -128,7 +128,15 @@ func startMySQLServer(db *DB, port int) {
 		go func() {
 			defer active.Add(-1)
 			defer conns.Delete(conn)
-			(&mysqlConn{db: db, conn: conn, autocommit: true}).handle()
+			host := ""
+			if addr := conn.RemoteAddr(); addr != nil {
+				host = addr.String()
+			}
+			sessID := registerSession("mysql", "", host)
+			defer unregisterSession(sessID)
+			mc := &mysqlConn{db: db, conn: conn, autocommit: true, sessID: sessID}
+			defer touchSession(sessID, func(sv *sessionView) { sv.Command = "Quit" })
+			mc.handle()
 		}()
 	}
 }
@@ -151,6 +159,7 @@ type mysqlConn struct {
 	txnID       uint64
 	autocommit  bool // SET autocommit=0 后写语句进入隐式事务
 	implicitTxn uint64
+	sessID      uint64 // 会话注册表 ID（SHOW PROCESSLIST 用）
 	// isoLevel 事务隔离级别。引擎当前只提供 READ COMMITTED 语义，
 	// 客户端显式设置其它级别时必须报错，而不是静默按 RC 运行——
 	// 否则应用以为拿到了 REPEATABLE READ 的读快照，实际会出现不可重复读。

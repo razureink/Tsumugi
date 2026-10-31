@@ -764,7 +764,9 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 			return
 		}
 		if p.matchKeyword("PROCESSLIST") {
-			columns = []string{"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}
+			// 真实会话列表（原生 + MySQL 协议共用注册表）
+			columns = processlistColumns
+			rows = processlistRows()
 			return
 		}
 		// SHOW SLOWQUERIES：本项目的慢查询日志（MySQL 用 mysql.slow_log 表，

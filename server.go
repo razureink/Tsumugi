@@ -186,9 +186,10 @@ type Session struct {
 	bw    *bufio.Writer
 	user  string
 	auth  bool
-	inTxn bool
-	txnID uint64
-	db    *DB
+	inTxn  bool
+	txnID  uint64
+	db     *DB
+	sessID uint64 // 会话注册表 ID（SHOW PROCESSLIST 用）
 }
 
 // read 从会话缓冲读取指定字节数（优先用 bufio，减少 syscall）。
@@ -294,6 +295,14 @@ func (s *Server) handleConn(conn net.Conn) {
 			logf(LOG_ERR, "connection handler panic: %v\nstack: %s", r, buf[:n])
 		}
 	}()
+	// 登记会话：SCHOW PROCESSLIST / 运维排查需要看到"谁在跑什么"
+	host := ""
+	if addr := conn.RemoteAddr(); addr != nil {
+		host = addr.String()
+	}
+	sessID := registerSession("native", "", host)
+	defer unregisterSession(sessID)
+
 	session := &Session{
 		conn: conn,
 		br:   bufio.NewReaderSize(conn, 32*1024),
@@ -458,6 +467,10 @@ func (s *Server) handleAuth(session *Session) {
 		loginLimit.Reset(key)
 		session.auth = true
 		session.user = uname
+		touchSession(session.sessID, func(sv *sessionView) {
+			sv.User = uname
+			sv.Command = "Sleep"
+		})
 		s.writeOK(session)
 		logf(LOG_VERB, "auth success: %s", session.user)
 	} else {
@@ -1099,7 +1112,14 @@ func (s *Server) handleQuerySQL(session *Session) {
 	// 因此以前 BEGIN/COMMIT/ROLLBACK 走 SQL 文本路径时全是静默 no-op（等于自动提交）。
 	var out sqlOut
 	stmt := string(sqlBytes)
+	// 更新会话可见状态：PROCESSLIST 能看到正在执行的语句
+	touchSession(session.sessID, func(sv *sessionView) {
+		sv.Command = "Query"
+		sv.LastSQL = firstWords(stmt, 200)
+		sv.LastAt = time.Now()
+	})
 	columns, rows, affected, rawMsg, err := s.db.runSQLSessionAsOut(session, stmt, &out)
+	touchSession(session.sessID, func(sv *sessionView) { sv.Command = "Sleep" })
 	if err != nil {
 		s.writeError(session, err.Error())
 		return
