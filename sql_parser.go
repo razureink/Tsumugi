@@ -2959,7 +2959,9 @@ func (db *DB) parseCreateTable(p *sqlParser) (columns []string, rows [][]interfa
 		err = e
 		return
 	}
-	name = db.qualifyTable(name)
+	// 按**连接级** schema 限定（COM_INIT_DB / USE 后的库），而不是全局 curDB：
+	// 多连接各自 USE 不同库时，全局 curDB 会让 DDL 落到错误的库。
+	name = db.qualifyTableIn(name, p.curSchema(db))
 	if ifExists {
 		if db.getTable(name) != nil {
 			rawMsg = "Query OK"
@@ -3244,7 +3246,9 @@ func (db *DB) parseDropTable(p *sqlParser) (columns []string, rows [][]interface
 		err = e
 		return
 	}
-	name = db.qualifyTable(name)
+	// 按**连接级** schema 限定（COM_INIT_DB / USE 后的库），而不是全局 curDB：
+	// 多连接各自 USE 不同库时，全局 curDB 会让 DDL 落到错误的库。
+	name = db.qualifyTableIn(name, p.curSchema(db))
 	db.mu.Lock()
 	_, ok := db.catalog[name]
 	db.mu.Unlock()
@@ -3313,7 +3317,9 @@ func (db *DB) parseAlterTable(p *sqlParser) (columns []string, rows [][]interfac
 		err = e
 		return
 	}
-	name = db.qualifyTable(name)
+	// 按**连接级** schema 限定（COM_INIT_DB / USE 后的库），而不是全局 curDB：
+	// 多连接各自 USE 不同库时，全局 curDB 会让 DDL 落到错误的库。
+	name = db.qualifyTableIn(name, p.curSchema(db))
 	t := db.getTable(name)
 	if t == nil {
 		err = fmt.Errorf("table not found: %s", name)
