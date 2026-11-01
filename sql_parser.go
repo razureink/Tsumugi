@@ -1755,7 +1755,7 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 		// 无 WHERE 条件的快速路径：只解码选中列，跳过未选中的 varchar 等字段，
 		// 也不再生成完整 flat 行后二次投影。
 		rows = t.selectRowsProjected(minKey, maxKey, scanLimit, fieldToOut, len(cols))
-	} else if cov, okCov := t.coveringRows(meta, conds, filters, colIdx, len(cols), scanLimit); okCov {
+	} else if cov, okCov := t.coveringRows(meta, conds, filters, colIdx, len(cols), scanLimit, minKey, maxKey); okCov {
 		// 覆盖索引：投影列全在二级索引条目里（索引列 + 主键），
 		// 直接从索引构造结果，省掉回表（主键树查找 + 行解码）。
 		rows = cov

@@ -193,7 +193,7 @@ func TestCoveringIndexDisabledByTTL(t *testing.T) {
 	}
 	// 覆盖索引此时可用
 	if _, ok := tbl.coveringRows(tbl.Meta(),
-		map[string]interface{}{"email": "a@x"}, nil, []int{0}, 1, -1); !ok {
+		map[string]interface{}{"email": "a@x"}, nil, []int{0}, 1, -1, nil, nil); !ok {
 		t.Fatal("covering should be available without TTL rows")
 	}
 	// 写入一条带过期时间的行后，标记置位，覆盖索引必须停用
@@ -204,7 +204,7 @@ func TestCoveringIndexDisabledByTTL(t *testing.T) {
 		t.Fatal("ttlRows should be set after inserting TTL row")
 	}
 	if _, ok := tbl.coveringRows(tbl.Meta(),
-		map[string]interface{}{"email": "a@x"}, nil, []int{0}, 1, -1); ok {
+		map[string]interface{}{"email": "a@x"}, nil, []int{0}, 1, -1, nil, nil); ok {
 		t.Fatal("covering must be disabled once table has TTL rows")
 	}
 	// 功能仍然正确（走回表路径）

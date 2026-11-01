@@ -1742,12 +1742,24 @@ func (t *Table) indexRangeCandidates(meta *TableMeta, scan *scanConds, filters [
 //   - 索引列是字符串（VARCHAR/TEXT/BLOB）时，投影**不得包含该列自身**：
 //     折叠索引键只保存小写规范形，拿它当结果值会改变数据。只投影主键
 //     （如 SELECT id FROM t WHERE email='x'）仍可走覆盖索引。
-func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filters []RangeCond, outFields []int, width int, limit int) ([][]interface{}, bool) {
+func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filters []RangeCond, outFields []int, width int, limit int, minKey, maxKey *int64) ([][]interface{}, bool) {
 	if width <= 0 || outFields == nil || (len(conds) == 0 && len(filters) == 0) {
 		return nil, false
 	}
 	if t.ttlRows.Load() {
 		return nil, false
+	}
+	// 主键范围（SQL 层折叠成 minKey/maxKey，不进 filters）必须在这里过滤：
+	// 覆盖索引只按索引键取候选，不知道外层的主键范围，否则
+	// "WHERE 索引列=x AND id > N" 会返回范围外的行。
+	inPKRange := func(pk int64) bool {
+		if minKey != nil && pk < *minKey {
+			return false
+		}
+		if maxKey != nil && pk > *maxKey {
+			return false
+		}
+		return true
 	}
 	// 全部条件必须指向同一个字段（否则索引条目无法证明其他条件成立）
 	var field string
@@ -1797,11 +1809,15 @@ func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filt
 	}
 
 	// emit 把一条索引条目展开成结果行；values 为该索引键对应的字段值。
+	// 注意：先按主键范围过滤，再应用 limit——否则先截断会漏掉范围内靠后的行。
 	emit := func(val interface{}, pkList []int64, rows [][]interface{}) [][]interface{} {
-		if limit >= 0 && len(rows)+len(pkList) > limit {
-			pkList = pkList[:limit-len(rows)]
-		}
 		for _, pk := range pkList {
+			if !inPKRange(pk) {
+				continue
+			}
+			if limit >= 0 && len(rows) >= limit {
+				break
+			}
 			row := make([]interface{}, width)
 			for i, of := range outFields {
 				if of == fi {
@@ -1893,6 +1909,9 @@ func (t *Table) coveringRows(meta *TableMeta, conds map[string]interface{}, filt
 			return true
 		}
 		for _, pk := range pkList {
+			if !inPKRange(pk) {
+				continue
+			}
 			pairs = append(pairs, pkVal{pk: pk, val: val})
 		}
 		return true
