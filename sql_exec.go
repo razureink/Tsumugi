@@ -8,9 +8,12 @@ package main
 // 只有检测到上述特性时才走这里，因此简单查询的性能不受影响。
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -917,6 +920,15 @@ func joinRows(rowSets [][]map[string]interface{}, pl *selectPlan) []map[string]i
 		if i < len(pl.on) {
 			on = pl.on[i]
 		}
+		// 左/右连接：无匹配也保留左行（右表列取 NULL）；INNER/CROSS 不保留
+		leftJoin := i < len(pl.joinTypes) && (pl.joinTypes[i] == "LEFT" || pl.joinTypes[i] == "RIGHT")
+		// 等值连接优先走哈希：把 O(N*M) 的嵌套循环降为 O(N+M)。
+		// 哈希只做**候选收窄**，每个候选仍求值完整 ON，因此多条件/非等值
+		// 部分语义不变；无法安全建键时自动退回嵌套循环。
+		if out, ok := hashJoinStep(acc, set, alias, on, leftJoin); ok {
+			acc = out
+			continue
+		}
 		next := make([]map[string]interface{}, 0, len(acc)*len(set))
 		for _, left := range acc {
 			matched := false
@@ -927,8 +939,6 @@ func joinRows(rowSets [][]map[string]interface{}, pl *selectPlan) []map[string]i
 					matched = true
 				}
 			}
-			// 左/右连接：无匹配也保留左行（右表列取 NULL）；INNER/CROSS 不保留
-			leftJoin := i < len(pl.joinTypes) && (pl.joinTypes[i] == "LEFT" || pl.joinTypes[i] == "RIGHT")
 			if !matched && on != nil && leftJoin {
 				next = append(next, mergeRow(left, nil, alias))
 			}
@@ -936,6 +946,231 @@ func joinRows(rowSets [][]map[string]interface{}, pl *selectPlan) []map[string]i
 		acc = next
 	}
 	return acc
+}
+
+// hashJoinSteps 测试钩子：确认哈希连接路径真的被使用。
+var hashJoinSteps atomic.Int64
+
+// hashJoinDisabled 测试钩子：强制走嵌套循环，用于新旧路径差分对拍。
+var hashJoinDisabled atomic.Bool
+
+// joinKeyMode 连接键的语义模式。只允许"两侧同类型"：
+// 数值与数值、字符串与字符串。混合类型在 cmpVal 里是特例（返回 0），
+// 无法安全建哈希键，必须退回嵌套循环。
+type joinKeyMode uint8
+
+const (
+	jmNone joinKeyMode = iota
+	jmNum
+	jmStr
+)
+
+func joinModeOf(v interface{}) joinKeyMode {
+	switch v.(type) {
+	case int, int32, int64, float32, float64:
+		return jmNum
+	case string, []byte:
+		return jmStr
+	}
+	return jmNone
+}
+
+// joinKeyOf 生成保守的连接键：**在 `=` 下相等的值必须得到相同键**。
+// 额外合并一些值（例如大小写不同的字符串）是安全的，因为候选还会再
+// 用完整 ON 过滤一遍；漏合并则会产生错误结果。
+func joinKeyOf(v interface{}, mode joinKeyMode) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	switch mode {
+	case jmNum:
+		n, ok := toNum(v)
+		if !ok {
+			return "", false
+		}
+		if n == 0 {
+			n = 0 // 归一 -0，cmpVal 认为 -0 == 0
+		}
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], math.Float64bits(n))
+		return "n" + string(b[:]), true
+	case jmStr:
+		s, ok := v.(string)
+		if !ok {
+			if bb, ok2 := v.([]byte); ok2 {
+				s = string(bb)
+			} else {
+				return "", false
+			}
+		}
+		// 与 cmpFold 一致：utf8mb4 CI 下 'ABC' 与 'abc' 是同一个键。
+		return "s" + foldKey(s), true
+	}
+	return "", false
+}
+
+// collectEqPairs 收集 ON 里"列 = 列"的等值合取项（穿透 AND）。
+func collectEqPairs(e *expr, out *[][2]*expr) {
+	if e == nil {
+		return
+	}
+	if e.kind == exFunc && e.fn == "AND" && len(e.args) == 2 {
+		collectEqPairs(e.args[0], out)
+		collectEqPairs(e.args[1], out)
+		return
+	}
+	if e.kind == exFunc && e.fn == "=" && len(e.args) == 2 &&
+		e.args[0].kind == exCol && e.args[1].kind == exCol {
+		*out = append(*out, [2]*expr{e.args[0], e.args[1]})
+	}
+}
+
+// pickJoinKey 判定一对列等值中哪一侧属于右表，并确认两侧类型可哈希。
+// 注意不能靠 "eval 是否返回 nil" 判断：eval 对限定列名在找不到限定键时
+// 会回退到未限定列（u.id 在右表行上会读到右表自己的 id），两侧都可能非空。
+func pickJoinKey(pr [2]*expr, acc, set []map[string]interface{}, alias string) (right, left *expr, mode joinKeyMode, ok bool) {
+	// 1) 限定表名最可靠：table == 右表别名 的一侧属于右表
+	t0 := strings.ToLower(pr[0].table)
+	t1 := strings.ToLower(pr[1].table)
+	a := strings.ToLower(alias)
+	switch {
+	case t0 == a && t1 != a:
+		right, left = pr[0], pr[1]
+	case t1 == a && t0 != a:
+		right, left = pr[1], pr[0]
+	default:
+		// 2) 未限定列：右表有、左表没有，才算右表列
+		r0 := columnInRight(pr[0], alias, set, acc)
+		r1 := columnInRight(pr[1], alias, set, acc)
+		switch {
+		case r0 && !r1:
+			right, left = pr[0], pr[1]
+		case r1 && !r0:
+			right, left = pr[1], pr[0]
+		default:
+			return nil, nil, jmNone, false
+		}
+	}
+
+	// 右侧取第一个非 NULL 样本判定类型
+	rm := jmNone
+	trials := 8
+	if len(set) < trials {
+		trials = len(set)
+	}
+	for t := 0; t < trials; t++ {
+		if v := right.eval(mergeRow(nil, set[t], alias)); v != nil {
+			rm = joinModeOf(v)
+			break
+		}
+	}
+	if rm == jmNone {
+		return nil, nil, jmNone, false
+	}
+	// 左表达式必须能取到同类型值，否则混合类型语义不安全
+	lm := jmNone
+	for _, l := range acc {
+		if v := left.eval(l); v != nil {
+			lm = joinModeOf(v)
+			break
+		}
+	}
+	if lm != rm {
+		return nil, nil, jmNone, false
+	}
+	// 非限定列名被左表同名未限定列遮蔽时，合并后取到的是左值，
+	// 与"右行键"不一致 → 不能建哈希。
+	if right.kind == exCol && right.table == "" {
+		k := lowerKey(right.col)
+		for _, l := range acc {
+			if _, exists := l[k]; exists {
+				return nil, nil, jmNone, false
+			}
+		}
+	}
+	return right, left, rm, true
+}
+
+// columnInRight 判断未限定列是否只属于右表（右表有该列且左表没有）。
+func columnInRight(e *expr, alias string, set, acc []map[string]interface{}) bool {
+	if e == nil || e.kind != exCol {
+		return false
+	}
+	if e.table != "" {
+		return strings.EqualFold(e.table, alias)
+	}
+	if len(set) == 0 {
+		return false
+	}
+	k := lowerKey(e.col)
+	if _, ok := set[0][k]; !ok {
+		return false
+	}
+	for _, l := range acc {
+		if _, ok := l[k]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+// hashJoinStep 尝试用等值键做一次哈希连接。返回 (结果, true) 表示已处理；
+// (nil, false) 表示保留给嵌套循环（语义完全一致，只是更慢）。
+func hashJoinStep(acc, set []map[string]interface{}, alias string, on *expr, leftJoin bool) ([]map[string]interface{}, bool) {
+	if hashJoinDisabled.Load() || on == nil || len(set) == 0 || len(acc) == 0 {
+		return nil, false
+	}
+	var pairs [][2]*expr
+	collectEqPairs(on, &pairs)
+	if len(pairs) == 0 {
+		return nil, false
+	}
+	for _, pr := range pairs {
+		rightExpr, leftExpr, mode, ok := pickJoinKey(pr, acc, set, alias)
+		if !ok {
+			continue
+		}
+		// 右侧建桶：NULL 键不参与等值匹配
+		buckets := make(map[string][]map[string]interface{}, len(set))
+		for _, r := range set {
+			m := mergeRow(nil, r, alias)
+			kv, kok := joinKeyOf(rightExpr.eval(m), mode)
+			if !kok {
+				continue
+			}
+			buckets[kv] = append(buckets[kv], r)
+		}
+		if len(buckets) == 0 {
+			// 右表连接键全为 NULL：INNER 无结果；外连接全部补 NULL
+			out := make([]map[string]interface{}, 0, len(acc))
+			if leftJoin {
+				for _, l := range acc {
+					out = append(out, mergeRow(l, nil, alias))
+				}
+			}
+			return out, true
+		}
+		out := make([]map[string]interface{}, 0, len(acc))
+		for _, l := range acc {
+			matched := false
+			if kv, kok := joinKeyOf(leftExpr.eval(l), mode); kok {
+				for _, r := range buckets[kv] {
+					merged := mergeRow(l, r, alias)
+					// 哈希只收窄候选：完整 ON 仍要成立（多条件/残余谓词）
+					if truthy(on.eval(merged)) {
+						out = append(out, merged)
+						matched = true
+					}
+				}
+			}
+			if !matched && leftJoin {
+				out = append(out, mergeRow(l, nil, alias))
+			}
+		}
+		hashJoinSteps.Add(1)
+		return out, true
+	}
+	return nil, false
 }
 
 // mergeRow 合并左右行：保留裸列名（小写）与 "别名.列" 两种键。
