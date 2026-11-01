@@ -890,8 +890,15 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 			rawMsg = fmt.Sprintf("Query OK, 1 row affected (database %s)", nameTok.val)
 			return
 		}
+		// CREATE [OR REPLACE] VIEW name AS <SELECT>
+		if p.i+1 < len(p.toks) && (p.toks[p.i+1].is("VIEW") || p.toks[p.i+1].is("OR")) {
+			return db.parseCreateView(p)
+		}
 		return db.parseCreateTable(p)
 	case "DROP":
+		if p.i+1 < len(p.toks) && p.toks[p.i+1].is("VIEW") {
+			return db.parseDropView(p)
+		}
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].is("DATABASE") {
 			p.next() // DROP
 			p.next() // DATABASE
@@ -1163,6 +1170,8 @@ type rawCond struct {
 type andGroup []rawCond
 
 func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
+	// 记住本语句起点：若发现目标其实是视图，需要回到这里改用通用路径重解析
+	selectStart := p.i
 	p.next() // SELECT
 	// 无 FROM 的标量查询（SELECT @@version / SELECT VERSION() 等）保持原快路径
 	if c, r, e := db.queryScalarSelect(p); r != nil {
@@ -1486,6 +1495,16 @@ func (db *DB) parseSelect(p *sqlParser) (columns []string, rows [][]interface{},
 	}
 	t := db.getTable(tableName)
 	if t == nil {
+		// 不是真实表：交给通用计划路径处理（视图在这里被物化成虚拟表）。
+		// 快速路径只支持物理表，遇到视图必须往前走，否则会误报"表不存在"。
+		if _, isView := db.resolveView(tableName); isView {
+			// 回到本语句起点重新用通用路径解析：快速路径已经消费了 SELECT 与表名，
+			// 在这里续解析会错位（表现为 unexpected value）。
+			// parseSelectGeneral 期望 parser 位于 SELECT **之后**（与上面的调用约定一致）
+			p.i = selectStart
+			p.next() // SELECT
+			return db.parseSelectGeneral(p)
+		}
 		err = fmt.Errorf("table not found: %s", tableName)
 		return
 	}

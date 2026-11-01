@@ -2373,6 +2373,7 @@ func (t *Table) selectRBytes(conditions map[string]interface{}, filters []RangeC
 					if pkList, ok := tree.Get(idxKey); ok {
 						result := make([][]byte, 0, len(pkList))
 						for _, pk := range pkList {
+
 							if rowData, ok := t.pkTree.Get(pk); ok {
 								if e := decodeExpireAt(rowData); e > 0 && time.Now().UnixNano() > e {
 									t.pkTree.Delete(pk)
@@ -3529,6 +3530,7 @@ func NewDB(cfg *Config) (*DB, error) {
 	// 用户库跟随数据目录：硬编码 "data" 会让测试/非默认部署把 users.json
 	// 写到工作目录下的 data/，造成测试互相污染、部署目录不一致。
 	initUserStore(cfg.WALDir)
+	initViewStore(cfg.WALDir)
 	walPath := cfg.WALDir + "/" + cfg.WALFile
 	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {

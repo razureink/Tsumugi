@@ -602,6 +602,28 @@ func (db *DB) execSelectPlan(p *sqlParser, pl *selectPlan) ([]string, [][]interf
 		phys := db.qualifyTableIn(ft.name, schema)
 		t := db.getTable(phys)
 		if t == nil {
+			// 不是真实表：可能是一个视图。视图按"查询时物化"处理成虚拟表，
+			// 因此它的列/行与基表当前状态天然一致。
+			if v, ok := db.resolveView(phys); ok {
+				cols, vrows, verr := db.materializeView(v, 0)
+				if verr != nil {
+					return nil, nil, verr
+				}
+				m := &TableMeta{Name: ft.alias}
+				for ci, c := range cols {
+					// 按实际值推断列类型：视图可能是 SELECT id, count(*) ...，
+					// 一律当字符串会让 `id > 3` 走字符串比较而漏行。
+					m.Fields = append(m.Fields, Field{
+						Name: c,
+						Type: inferColumnType(vrows, ci),
+						Len:  255,
+					})
+				}
+				metas = append(metas, m)
+				virtual = append(virtual, rowsToMaps(cols, vrows))
+				tables = append(tables, nil)
+				continue
+			}
 			return nil, nil, fmt.Errorf("table not found: %s", ft.name)
 		}
 		metas = append(metas, t.Meta())
