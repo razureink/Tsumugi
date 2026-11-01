@@ -157,8 +157,22 @@ var walFsync atomic.Bool
 // 关闭标记：Close 后 appendWAL/flushWAL 直接返回错误，避免阻塞在已退出的 writer 上
 var walClosed atomic.Bool
 
-// walCloseCh 关闭哨兵：Close 时关闭，阻塞发送通过 select 监听它避免永久挂起
-var walCloseCh = make(chan struct{})
+// walClosePtr 原子发布“当前活跃实例”的关闭哨兵。
+// appendWAL 是包级函数（拿不到 *DB），只能通过它感知关闭；
+// 用 atomic.Pointer 而不是普通包级变量，是因为 Close 的后台 goroutine
+// join 带超时兜底，下一次 NewDB 可能与它并发（-race 实测）。
+var walClosePtr atomic.Pointer[chan struct{}]
+
+func walCloseSignal() chan struct{} {
+	if p := walClosePtr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// 关闭哨兵现在是 DB 实例字段 db.walClose（见 NewDB/Close 与 flushWAL）。
+// 不要再改回包级可变变量：Close 的后台 goroutine join 带 10s 超时兜底，
+// 与下一次 NewDB 可能并发，共享变量会被 -race 判定为数据竞争。
 
 // errWALClosed 表示 WAL 已关闭或不可用：写入必须让调用方看到失败，
 // 而不是返回 nil（旧实现会让关闭窗口内的写入"成功"但不落盘）。
@@ -3144,7 +3158,7 @@ func appendWAL(rec []byte, sync bool) error {
 	// 关闭哨兵兜底——自旋 + Gosched 会在突发写满时烧满一个核。
 	select {
 	case walCh <- entry:
-	case <-walCloseCh:
+	case <-walCloseSignal():
 		return errWALClosed
 	}
 	if entry.sync {
@@ -3160,7 +3174,7 @@ func (db *DB) flushWAL() error {
 	done := make(chan error, 1)
 	select {
 	case walCh <- walEntry{flush: true, done: done}:
-	case <-walCloseCh:
+	case <-db.walClose:
 		return errWALClosed
 	}
 	return <-done
@@ -3553,6 +3567,10 @@ type DB struct {
 	flushTicker       *time.Ticker
 	groupCommit       *GroupCommitter
 	stopCh            chan struct{}
+	// walClose 本实例的 WAL 关闭哨兵。做成实例字段而不是包级变量：
+	// Close 的 join 有 10s 超时兜底，下一次 NewDB 可能与上一次 Close 的
+	// 后台 goroutine 并发，共享可变变量会被 -race 判为数据竞争。
+	walClose          chan struct{}
 	wg                sync.WaitGroup
 	ttlTicker         *time.Ticker
 	stats             *Stats
@@ -3659,10 +3677,14 @@ func NewDB(cfg *Config) (*DB, error) {
 		dirLock:    dirLock,
 		txns:       make(map[uint64]*Transaction),
 		stopCh:     make(chan struct{}),
+		walClose:   make(chan struct{}),
 		stats:      NewStats(),
 		backupDir:  cfg.BackupDir,
 	}
 	db.stats.durability.Store(string(cfg.Durability))
+	// 先发布关闭哨兵，再启动任何后台 goroutine：flushLoop/ttlLoop 会在
+	// tick 时经 appendWAL/flushWAL 读它，晚发布会被 -race 抓到。
+	walClosePtr.Store(&db.walClose)
 	statsHook = db.stats
 	// 反代来源白名单：决定是否采信 X-Forwarded-For（登录限速/审计按真实 IP）
 	setTrustedProxies(cfg.TrustedProxies)
@@ -3726,7 +3748,6 @@ func NewDB(cfg *Config) (*DB, error) {
 	walFaultReset()
 	// 重建关闭哨兵：上一轮 Close 已 close 过。全局 WAL 生命周期一次只允许
 	// 一个活跃 DB（既有设计约束，见 walCh 等包级全局注释）。
-	walCloseCh = make(chan struct{})
 	// 注意：此处绝不能 walRegReset()——loadWAL 已通过 catalog 重放把注册表
 	// 绑定到文件中的表 ID；清空会让重启后新建的表从 1 重新编号，与既有表
 	// 的 tableID 冲突，下次重放时数据会串表（回归测试见 walreg_repro_test.go）。
@@ -3890,7 +3911,7 @@ func (db *DB) Close() {
 	// 标记关闭并广播哨兵：此后 appendWAL/flushWAL 直接返回/退出等待，
 	// 避免阻塞在已退出的 writer 上
 	walClosed.Store(true)
-	close(walCloseCh)
+	close(db.walClose)
 	// 释放数据目录独占锁：进程退出/DB 关闭后，同一目录可以被重新启动
 	releaseDirLock(db.dirLock)
 	// 停止 writer：冲刷并同步所有已入队记录后退出

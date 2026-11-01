@@ -118,15 +118,17 @@ func (t *btree[K, V]) setLocked(key K, val V, cow, nxOnly bool) bool {
 		t.root.Store(n)
 		return true
 	}
+	// COW：根节点必须先变成私有副本。旧实现只在根满（需要分裂）时克隆，
+	// 根不满时 insert 会直接原地改共享根节点的 keys/vals/kids，
+	// 与无锁读者并发即为数据竞争（-race 实测）。
+	if cow {
+		root = t.clone(root)
+	}
 	if root.n >= btMaxKeys {
-		// 根满：新建根并把旧根作为唯一子节点再分裂（标准 B 树增高方式）
-		base := root
-		if cow {
-			base = t.clone(root)
-		}
+		// 根满：新建根并把私有根作为唯一子节点再分裂（标准 B 树增高方式）
 		newRoot := &btNode[K, V]{}
-		newRoot.kids[0] = base
-		t.splitChild(newRoot, 0, true) // base 已私有
+		newRoot.kids[0] = root
+		t.splitChild(newRoot, 0, true) // root 已是私有副本
 		root = newRoot
 	}
 	isNew := t.insert(root, key, val, cow, nxOnly)
@@ -298,13 +300,16 @@ func (t *btree[K, V]) maxKey(n *btNode[K, V]) (K, V) {
 // ensureChild 保证 kids[i] 至少有 btMinKeys+1 个键（借位或合并）。
 // 返回 (可能就地修改过的 n, 有效下标, 是否发生了合并)。
 func (t *btree[K, V]) ensureChild(n *btNode[K, V], i int, cow bool) (*btNode[K, V], int, bool) {
-	if n.kids[i].n > btMinKeys {
-		return n, i, false
-	}
 	self := n.kids[i]
+	// COW：目标子节点在**任何**修改或递归之前就必须私有化。
+	// 旧实现只在下溢（借用/合并）分支克隆；子节点键数足够时直接返回，
+	// 随后 remove 会原地改这个共享子节点，与无锁读者并发（-race 实测）。
 	if cow {
 		self = t.clone(self)
 		n.kids[i] = self
+	}
+	if self.n > btMinKeys {
+		return n, i, false
 	}
 	// 1) 向左兄弟借
 	if i > 0 {

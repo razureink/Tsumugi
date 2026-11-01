@@ -165,6 +165,15 @@ func (t *RBTree[K, V]) enter() treeAccess {
 			continue
 		}
 		t.inflight.Add(1)
+		// 关键：**占住 inflight 之后**必须重新确认是否已升级。
+		// 开头那次 upgraded.Load() 可能在 goroutine 被调度出去前就读到 false，
+		// 而升级者此时看到 inflight==0 并完成了升级；若不在这里复查，
+		// 迟到的进入者会拿到原地写权限，与已经走 COW 无锁读的读者并发，
+		// 直接造成数据竞争（-race 实测）。
+		if t.upgraded.Load() {
+			t.inflight.Add(-1)
+			return accessCOW
+		}
 		if t.upgrading.Load() {
 			// 与升级者竞争失败：归还名额后重试
 			t.inflight.Add(-1)
