@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -56,6 +57,7 @@ const (
 	clientConnectWithDB              = 1 << 3
 	clientCompress                   = 1 << 5
 	clientProtocol41                 = 1 << 9
+	clientSSL                        = 1 << 11
 	clientTransactions               = 1 << 13
 	clientSecureConnection           = 1 << 15
 	clientMultiResults               = 1 << 17
@@ -75,9 +77,12 @@ const (
 //     列定义块后不再发 EOF（见 writeEOF / writeEndOfResultSet）；
 //   - COMPRESS：协商成功后启用 zlib 压缩协议（mysql_compress.go）。
 //
-// 刻意不声明：SSL（未实现 TLS）、MULTI_STATEMENTS、MULTI_RESULTS / PS_MULTI_RESULTS
+// 刻意不声明：MULTI_STATEMENTS、MULTI_RESULTS / PS_MULTI_RESULTS
 // （每条命令只产生一个结果集，CALL/存储过程也不支持）、SESSION_TRACK、CONNECT_ATTRS。
 // 声明了却不实现会让客户端在等待某个永远不会到达的包时卡死。
+//
+// SSL 不在这里：CLIENT_SSL 只在配置了 tls_cert/tls_key 时由 startMySQLServer
+// 动态加到每个连接的 serverCaps 上（见 effectiveCaps / startTLS）。
 const serverCapabilities = clientLongPassword | clientLongFlag | clientConnectWithDB |
 	clientCompress | clientProtocol41 | clientTransactions | clientSecureConnection |
 	clientPluginAuth | clientPluginAuthLenEncClientData | clientDeprecateEOF
@@ -95,6 +100,13 @@ const maxPreparedStmts = 1024
 func startMySQLServer(db *DB, port int) {
 	cfg := db.configSnapshot()
 	addr := cfg.listenAddr(port)
+	// 证书只加载一次；解析失败就拒绝启动 TLS 而不是静默降级成明文
+	// （静默降级会让运维以为连接是加密的）。
+	tlsConf := mysqlTLSConfig(cfg)
+	serverCaps := uint32(serverCapabilities)
+	if tlsConf != nil {
+		serverCaps |= clientSSL
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		logf(LOG_ERR, "mysql listen %s: %v", addr, err)
@@ -102,7 +114,11 @@ func startMySQLServer(db *DB, port int) {
 	}
 	registerServiceCloser("mysql", ln)
 	defer ln.Close()
-	logf(LOG_OK, "mysql protocol listening on %s", addr)
+	if tlsConf != nil {
+		logf(LOG_OK, "mysql protocol listening on %s (TLS enabled)", addr)
+	} else {
+		logf(LOG_OK, "mysql protocol listening on %s", addr)
+	}
 	maxConns := cfg.MaxConns
 	if maxConns <= 0 {
 		maxConns = 512
@@ -149,7 +165,8 @@ func startMySQLServer(db *DB, port int) {
 			}
 			sessID := registerSession("mysql", "", host)
 			defer unregisterSession(sessID)
-			mc := &mysqlConn{db: db, conn: conn, autocommit: true, sessID: sessID}
+			mc := &mysqlConn{db: db, conn: conn, autocommit: true, sessID: sessID,
+				tlsConf: tlsConf, serverCaps: serverCaps}
 			defer touchSession(sessID, func(sv *sessionView) { sv.Command = "Quit" })
 			mc.handle()
 		}()
@@ -188,6 +205,10 @@ type mysqlConn struct {
 	// 客户端显式设置其它级别时必须报错，而不是静默按 RC 运行——
 	// 否则应用以为拿到了 REPEATABLE READ 的读快照，实际会出现不可重复读。
 	isoLevel string
+	// TLS：tlsConf 非 nil 时广播 CLIENT_SSL；客户端可发 SSLRequest 升级。
+	// serverCaps = serverCapabilities（+ CLIENT_SSL），每个连接一份，避免全局可变状态。
+	tlsConf    *tls.Config
+	serverCaps uint32
 }
 
 // mysqlPreparedStmt 记录一条已解析的 prepared statement。
@@ -529,10 +550,10 @@ func (mc *mysqlConn) sendHandshake() error {
 	payload = appendU32LE(payload, randomThreadID()) // thread id
 	payload = append(payload, authData[:8]...)
 	payload = append(payload, 0)
-	payload = appendU16LE(payload, uint16(serverCapabilities&0xffff))
+	payload = appendU16LE(payload, uint16(mc.effectiveCaps()&0xffff))
 	payload = append(payload, defaultCollation)
 	payload = appendU16LE(payload, statusAutocommit)
-	payload = appendU16LE(payload, uint16(serverCapabilities>>16))
+	payload = appendU16LE(payload, uint16(mc.effectiveCaps()>>16))
 	payload = append(payload, 21) // auth plugin data len (1 byte)
 	payload = append(payload, make([]byte, 10)...)
 	payload = append(payload, authData[8:]...)
@@ -554,10 +575,86 @@ func randomThreadID() uint32 {
 	return uint32(time.Now().UnixNano())
 }
 
+// effectiveCaps 返回该连接广播/协商的能力位。
+// 手工构造的 mysqlConn（测试、旧调用点）没有设置 serverCaps，
+// 此时退回默认能力集，行为与加 TLS 之前完全一致。
+func (mc *mysqlConn) effectiveCaps() uint32 {
+	if mc.serverCaps == 0 {
+		return serverCapabilities
+	}
+	return mc.serverCaps
+}
+
+// mysqlTLSConfig 读取 tls_cert/tls_key（与面板共用同一份证书）。
+// 两者都为空表示不启用；只配一个或文件加载失败时记录错误并返回 nil，
+// 明确保持明文而不是静默降级——调用方据此不广播 CLIENT_SSL。
+func mysqlTLSConfig(cfg Config) *tls.Config {
+	if cfg.TLSCert == "" && cfg.TLSKey == "" {
+		return nil
+	}
+	if cfg.TLSCert == "" || cfg.TLSKey == "" {
+		logf(LOG_ERR, "mysql tls: tls_cert and tls_key must both be set; staying plaintext")
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		logf(LOG_ERR, "mysql tls: load %s / %s: %v; staying plaintext", cfg.TLSCert, cfg.TLSKey, err)
+		return nil
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
+// tlsBufferedConn 让 tls.Server 先消费 bufio 里已预读的字节。
+// 升级 TLS 之前 bufio 很可能已经把 ClientHello 的开头读进缓冲区，
+// 直接对裸 net.Conn 做握手会丢数据。
+type tlsBufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *tlsBufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// startTLS 在收到 SSLRequest 之后把连接升级为 TLS，并重建读写缓冲。
+func (mc *mysqlConn) startTLS() error {
+	if mc.tlsConf == nil {
+		return fmt.Errorf("tls requested but not configured")
+	}
+	if err := mc.bw.Flush(); err != nil {
+		return err
+	}
+	tc := tls.Server(&tlsBufferedConn{Conn: mc.conn, r: mc.br}, mc.tlsConf)
+	// 握手限时，避免半开连接长期占用 goroutine 与 fd。
+	_ = tc.SetDeadline(time.Now().Add(30 * time.Second))
+	if err := tc.Handshake(); err != nil {
+		return err
+	}
+	_ = tc.SetDeadline(time.Time{})
+	mc.conn = tc
+	mc.br = bufio.NewReaderSize(tc, connBufBytes)
+	mc.bw = bufio.NewWriterSize(tc, connBufBytes*2)
+	return nil
+}
+
 func (mc *mysqlConn) readAuth() error {
 	_, payload, err := mc.readRawPacket()
 	if err != nil {
 		return err
+	}
+	// CLIENT_SSL：客户端先发一个 32 字节的 SSLRequest（只有能力位，没有
+	// 用户名/认证数据），随后立即在裸 TCP 上开始 TLS 握手；真正的
+	// Handshake Response 在 TLS 通道建立之后才发送。
+	if mc.tlsConf != nil && len(payload) == 32 {
+		if caps := binary.LittleEndian.Uint32(payload[0:4]); caps&clientSSL != 0 {
+			if err := mc.startTLS(); err != nil {
+				return err
+			}
+			if _, payload, err = mc.readRawPacket(); err != nil {
+				return err
+			}
+		}
 	}
 	pos := 0
 	if pos+32 > len(payload) {
@@ -567,7 +664,7 @@ func (mc *mysqlConn) readAuth() error {
 	}
 	// 记录客户端请求的能力位，并与服务端声明求交集：
 	// 只有双方都支持的能力才生效（压缩、deprecate EOF 都以此为准）。
-	mc.capabilities = binary.LittleEndian.Uint32(payload[0:4]) & serverCapabilities
+	mc.capabilities = binary.LittleEndian.Uint32(payload[0:4]) & mc.effectiveCaps()
 	pos += 4 + 4 + 1 + 23 // capabilities + maxpacket + charset + reserved
 	user := readNulString(payload, &pos)
 	mc.user = user
