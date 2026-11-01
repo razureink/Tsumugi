@@ -2262,6 +2262,48 @@ type dupAssign struct {
 	e   *expr
 }
 
+// pkFromValue 把客户端传入的主键值折算成 int64。
+// 二进制协议把 JS number 编码成 MYSQL_TYPE_DOUBLE，所以 float64 必须接受；
+// 非整数浮点（2.5）不是合法主键。auto=true 表示主键缺省/为 0/NULL，
+// 由引擎分配（MySQL AUTO_INCREMENT 语义）。
+func pkFromValue(v interface{}) (pk int64, auto bool, err error) {
+	switch x := v.(type) {
+	case nil:
+		return 0, true, nil
+	case int64:
+		return x, x == 0, nil
+	case int:
+		return int64(x), x == 0, nil
+	case int32:
+		return int64(x), x == 0, nil
+	case uint64:
+		if x > math.MaxInt64 {
+			return 0, false, fmt.Errorf("primary key out of range")
+		}
+		return int64(x), x == 0, nil
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) || x != math.Trunc(x) ||
+			x < math.MinInt64 || x > math.MaxInt64 {
+			return 0, false, fmt.Errorf("primary key must be integer")
+		}
+		n := int64(x)
+		return n, n == 0, nil
+	case float32:
+		return pkFromValue(float64(x))
+	case string:
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return 0, true, nil
+		}
+		n, e := strconv.ParseInt(s, 10, 64)
+		if e != nil {
+			return 0, false, fmt.Errorf("primary key must be integer")
+		}
+		return n, n == 0, nil
+	}
+	return 0, false, fmt.Errorf("primary key must be integer")
+}
+
 func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{}, affected int64, rawMsg string, err error) {
 	replaceMode := false
 	if p.peek().is("REPLACE") {
@@ -2482,8 +2524,17 @@ func (db *DB) parseInsert(p *sqlParser) (columns []string, rows [][]interface{},
 			pkPos := batchColIdx[pkFieldIdx]
 			var pk int64
 			if pkPos >= 0 {
-				if v, ok := values[pkPos].(int64); ok && v != 0 {
-					pk = v
+				v, _, pe := pkFromValue(values[pkPos])
+				if pe != nil {
+					if !colsExplicit {
+						interfaceSlicePool.Put(values[:0])
+					}
+					return rollback(pe)
+				}
+				pk = v
+				if pk != 0 {
+					// 统一成 int64：二进制协议传进来的可能是 float64(3)。
+					values[pkPos] = pk
 				}
 			}
 			if pk == 0 {
@@ -2660,17 +2711,15 @@ func (db *DB) insertRow(p *sqlParser, t *Table, fields []string, colsExplicit bo
 	// 多客户端各自"MAX(pk)+1"播种会撞主键（实测 37% 插入失败），因此交给引擎分配。
 	autoAssign := false
 	if pkIdx >= 0 && pkIdx < len(values) {
-		switch v := values[pkIdx].(type) {
-		case int64:
-			if v == 0 {
-				autoAssign = true
-			} else {
-				pk = v
-			}
-		case nil:
+		v, _, pe := pkFromValue(values[pkIdx])
+		if pe != nil {
+			return 0, pe
+		}
+		if v == 0 {
 			autoAssign = true
-		default:
-			return 0, fmt.Errorf("primary key must be integer")
+		} else {
+			pk = v
+			values[pkIdx] = pk
 		}
 	} else {
 		// 主键缺省：由引擎分配（MySQL AUTO_INCREMENT 语义）。

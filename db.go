@@ -2327,11 +2327,45 @@ func (t *Table) Select(conditions map[string]interface{}, minKey, maxKey *int64)
 
 func matchConditions(row map[string]interface{}, conds map[string]interface{}) bool {
 	for k, v := range conds {
-		if row[k] != v {
+		if !condEqual(row[k], v) {
 			return false
 		}
 	}
 	return true
+}
+
+// condEqual 是 map 路径的单值等值比较，语义必须与 scanConds.matchField 一致：
+//   - INT 与整数浮点相等（id = 2.0 命中，2.5 不命中）；
+//   - 字符串按 utf8mb4 CI 折叠（name = 'ABC' 命中 'abc'）；
+//   - int/int32 与 int64 视为同一数值。
+//
+// 两条路径不一致会出现"同一个查询走索引/全表扫描得到不同结果"的隐性错误。
+func condEqual(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	switch x := a.(type) {
+	case int64:
+		switch y := b.(type) {
+		case int64:
+			return x == y
+		case int:
+			return x == int64(y)
+		case int32:
+			return x == int64(y)
+		case float64:
+			return float64(x) == y
+		}
+	case string:
+		if s, ok := b.(string); ok {
+			return eqFold(x, s)
+		}
+	case bool:
+		if z, ok := b.(bool); ok {
+			return x == z
+		}
+	}
+	return a == b
 }
 
 // RangeCond 一个非主键字段的范围比较条件。
@@ -2530,6 +2564,10 @@ func newScanConds(meta *TableMeta, conditions map[string]interface{}, filters []
 				e.kind = condNil
 			case int64:
 				e.kind, e.i = condInt, c
+			case int:
+				e.kind, e.i = condInt, int64(c)
+			case int32:
+				e.kind, e.i = condInt, int64(c)
 			case float64:
 				e.kind, e.f = condFloat, c
 			case string:
@@ -2545,6 +2583,23 @@ func newScanConds(meta *TableMeta, conditions map[string]interface{}, filters []
 			// matchField 返回 false，而不是把错误值当 0 比较。
 			if e.idx >= 0 && v != nil {
 				switch ftype {
+				case TypeInt:
+					// MySQL 语义：INT 列与 2.0 相等，与 2.5 不相等。
+					// 二进制协议里 JS 数字常被编码成 DOUBLE（mysql2 就是
+					// MYSQL_TYPE_DOUBLE），不折算会让 `WHERE id = ?` 直接
+					// 返回 0 行。
+					switch x := v.(type) {
+					case float64:
+						if x == math.Trunc(x) && x >= math.MinInt64 && x <= math.MaxInt64 {
+							e.kind, e.i = condInt, int64(x)
+						} else {
+							e.kind = condOther
+						}
+					case string:
+						if n, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64); err == nil {
+							e.kind, e.i = condInt, n
+						}
+					}
 				case TypeDate, TypeDatetime:
 					if n, ok := coerceTimeNanos(v, ftype == TypeDate); ok {
 						e.kind, e.i = condInt, n
