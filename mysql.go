@@ -531,14 +531,21 @@ func readNulString(b []byte, pos *int) string {
 // ---- 握手 ----
 
 func (mc *mysqlConn) sendHandshake() error {
-	authData := make([]byte, 20)
-	if _, err := rand.Read(authData); err != nil {
+	// MySQL 的 scramble 只用**可打印 ASCII**生成。这不是风格问题：
+	// Connector/J 把 seed 存成 String，按连接字符集解码后再按
+	// passwordCharacterEncoding 编码回字节；如果 seed 含 0x80 以上的
+	// 非 UTF-8 字节，往返后字节会改变，客户端算出的响应必然校验失败。
+	// 用全 0..255 的 crypto/rand（本实现早期做法）会让 JDBC 全部
+	// "access denied"，即使口令正确。
+	const saltChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'()*+,-./:;<=>?@[]^_`{|}~"
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
 		// 确定性 seed 会让 scramble 可预测（重放认证成为可能），直接拒绝服务
 		return fmt.Errorf("crypto/rand unavailable: %w", err)
 	}
-	// 首字节不能为 0（会被误判为长度编码结束符），确保非零
-	if authData[0] == 0 {
-		authData[0] = 1
+	authData := make([]byte, 20)
+	for i := range authData {
+		authData[i] = saltChars[int(raw[i])%len(saltChars)]
 	}
 	mc.scramble = authData
 	plugin := "mysql_native_password"
