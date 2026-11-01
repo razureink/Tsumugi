@@ -1067,7 +1067,7 @@ func groupKey(groupBy []*expr, row map[string]interface{}) string {
 	parts := make([]string, 0, len(groupBy))
 	for _, g := range groupBy {
 		v := g.eval(row)
-		parts = append(parts, fmt.Sprint(v)+"|"+typeTag(v))
+		parts = append(parts, groupKeyPart(v))
 	}
 	return strings.Join(parts, "\x00")
 }
@@ -1108,7 +1108,7 @@ func dedupRows(rows [][]interface{}) [][]interface{} {
 	for _, r := range rows {
 		parts := make([]string, len(r))
 		for i, v := range r {
-			parts[i] = fmt.Sprint(v) + "|" + typeTag(v)
+			parts[i] = groupKeyPart(v)
 		}
 		k := strings.Join(parts, "\x00")
 		if _, ok := seen[k]; ok {
@@ -1118,4 +1118,26 @@ func dedupRows(rows [][]interface{}) [][]interface{} {
 		out = append(out, r)
 	}
 	return out
+}
+
+// rowKeyPart 生成整行的去重键（DISTINCT 行 / UNION 去重共用）。
+// 逐列走 groupKeyPart，保证整行去重与列值 `=` 语义一致。
+func rowKeyPart(r []interface{}) string {
+	var b strings.Builder
+	for _, v := range r {
+		b.WriteString(groupKeyPart(v))
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// groupKeyPart 生成 DISTINCT / GROUP BY 的分组键。
+// 字符串必须与 `=` 语义一致：utf8mb4 CI 下 'abc' 与 'ABC' 是同一个值，
+// 因此这里用与索引键相同的 foldKey 折叠。否则同一个列上会出现
+// "= 认为相等、GROUP BY 却分成两组"的矛盾语义。
+func groupKeyPart(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return foldKey(s) + "|" + typeTag(v)
+	}
+	return fmt.Sprint(v) + "|" + typeTag(v)
 }

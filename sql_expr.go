@@ -614,7 +614,9 @@ func (e *expr) computeAgg(group []map[string]interface{}) interface{} {
 				if v == nil {
 					continue
 				}
-				seen[fmt.Sprint(v)] = struct{}{}
+				// 与 `=` / GROUP BY 同一套折叠语义：COUNT(DISTINCT name)
+				// 必须把 'abc'/'ABC' 视为同一个值。
+				seen[groupKeyPart(v)] = struct{}{}
 			}
 			return int64(len(seen))
 		}

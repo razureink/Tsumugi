@@ -2233,7 +2233,7 @@ func (db *DB) runUnionAs(user string, toks []sqlToken, idx int, all bool, sql st
 		seen := make(map[string]struct{}, len(rows))
 		dedup := rows[:0]
 		for _, r := range rows {
-			key := fmt.Sprint(r)
+			key := rowKeyPart(r)
 			if _, dup := seen[key]; dup {
 				continue
 			}
