@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,7 @@ func TestWALVersionCompat(t *testing.T) {
 	SetLogMute(true)
 	dir := t.TempDir()
 	cfg := walTestConfig(dir)
+	cfg.WALCompress = "off" // 本测试验证版本/帧兼容性，固定不压缩
 
 	db, err := NewDB(cfg)
 	if err != nil {
@@ -32,18 +34,20 @@ func TestWALVersionCompat(t *testing.T) {
 	}
 	db.Close()
 
-	// 头部版本应为 v5
+	// 头部版本应为 v6（v5 + 帧级压缩标志）
 	path := filepath.Join(dir, "wal")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
-	if got := binary.BigEndian.Uint32(data[len(WALMagic):]); got != WALVersion5 {
-		t.Fatalf("written WAL version = %d, want %d", got, WALVersion5)
+	if got := binary.BigEndian.Uint32(data[len(WALMagic):]); got != WALVersion6 {
+		t.Fatalf("written WAL version = %d, want %d", got, WALVersion6)
 	}
 
-	// 依次把版本改小到 v4（上一代本项目格式）与 v3（远端格式），都必须能读出。
-	for _, ver := range []uint32{WALVersion4, WALVersion3} {
+	// v6 的帧长度带压缩标志，不能只改头版本号。先把帧重写回 v5 布局
+	// （长度左移掉标志位），再降版本号验证 v5/v4/v3 都能读。
+	data = downgradeWALV6Frames(t, data)
+	for _, ver := range []uint32{WALVersion5, WALVersion4, WALVersion3} {
 		binary.BigEndian.PutUint32(data[len(WALMagic):], ver)
 		if err := os.WriteFile(path, data, 0600); err != nil {
 			t.Fatalf("rewrite wal as v%d: %v", ver, err)
@@ -68,4 +72,47 @@ func TestWALVersionCompat(t *testing.T) {
 		}
 		db2.Close()
 	}
+}
+
+// downgradeWALV6Frames 把 v6 帧重写为 v5 布局（长度不再左移、无压缩标志），
+// 用于验证 v5/v4/v3 读取路径。v6 的 CRC 覆盖存盘字节；若帧被压缩，
+// 解压后需要按解压内容重算 CRC。
+func downgradeWALV6Frames(t *testing.T, data []byte) []byte {
+	t.Helper()
+	headerLen := len(WALMagic) + 8
+	if len(data) < headerLen {
+		t.Fatalf("wal too short: %d bytes", len(data))
+	}
+	out := append([]byte(nil), data[:headerLen]...)
+	pos := headerLen
+	for pos < len(data) {
+		start := pos
+		raw, nb := binary.Uvarint(data[pos:])
+		if nb <= 0 {
+			t.Fatalf("invalid frame length at %d", start)
+		}
+		pos += nb
+		storedLen, compressed, err := decodeFrameLen(raw, true)
+		if err != nil {
+			t.Fatalf("frame at %d: %v", start, err)
+		}
+		if pos+walBatchCRCBytes+storedLen > len(data) {
+			t.Fatalf("frame at %d truncated", start)
+		}
+		crc := append([]byte(nil), data[pos:pos+walBatchCRCBytes]...)
+		payload := data[pos+walBatchCRCBytes : pos+walBatchCRCBytes+storedLen]
+		pos += walBatchCRCBytes + storedLen
+		if compressed {
+			inflated, derr := decompressWALPayload(payload)
+			if derr != nil {
+				t.Fatalf("frame at %d: %v", start, derr)
+			}
+			payload = inflated
+			binary.BigEndian.PutUint32(crc, crc32.ChecksumIEEE(payload))
+		}
+		out = appendFrameLen(out, len(payload), false, false)
+		out = append(out, crc...)
+		out = append(out, payload...)
+	}
+	return out
 }

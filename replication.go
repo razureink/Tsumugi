@@ -166,7 +166,7 @@ func (db *DB) WALSince(offset, maxBytes int64) ([]byte, int64, error) {
 //
 // 顺序是"先应用、后追加"：若应用失败，本地 WAL 仍是主库 WAL 的干净前缀，
 // 重启后从同一 offset 重拉即可；若追加失败，返回错误并停止复制，由运维处理。
-func (db *DB) ApplyWALDelta(delta []byte, innerCRC bool) error {
+func (db *DB) ApplyWALDelta(delta []byte, innerCRC, v6 bool) error {
 	if len(delta) == 0 {
 		return nil
 	}
@@ -174,7 +174,7 @@ func (db *DB) ApplyWALDelta(delta []byte, innerCRC bool) error {
 	// 重放写并发操作同一棵树。
 	db.replicaApplyMu.Lock()
 	defer db.replicaApplyMu.Unlock()
-	frames, err := parseWALBatchFrames(delta)
+	frames, err := parseWALBatchFrames(delta, v6)
 	if err != nil {
 		return err
 	}
@@ -202,31 +202,42 @@ func (db *DB) ApplyWALDelta(delta []byte, innerCRC bool) error {
 
 // parseWALBatchFrames 严格切分 [varint len][u32 crc][payload] 帧并逐帧校验。
 // 任何截断/越界/CRC 不符都直接报错——复制流不允许"尽力而为"。
-func parseWALBatchFrames(delta []byte) ([][]byte, error) {
+func parseWALBatchFrames(delta []byte, v6 bool) ([][]byte, error) {
 	var out [][]byte
 	pos := 0
 	for pos < len(delta) {
 		start := pos
-		n, nb := binary.Uvarint(delta[pos:])
+		raw, nb := binary.Uvarint(delta[pos:])
 		if nb <= 0 {
 			return nil, fmt.Errorf("replication frame: invalid length prefix at %d", start)
 		}
 		pos += nb
+		storedLen, compressed, lerr := decodeFrameLen(raw, v6)
+		if lerr != nil {
+			return nil, fmt.Errorf("replication frame at %d: %w", start, lerr)
+		}
 		if pos+4 > len(delta) {
 			return nil, fmt.Errorf("replication frame at %d: truncated crc", start)
 		}
 		want := binary.BigEndian.Uint32(delta[pos : pos+4])
 		pos += 4
-		if n > uint64(len(delta)-pos) {
+		if storedLen > len(delta)-pos {
 			return nil, fmt.Errorf("replication frame at %d: payload %d exceeds remaining %d",
-				start, n, len(delta)-pos)
+				start, storedLen, len(delta)-pos)
 		}
-		payload := delta[pos : pos+int(n)]
+		payload := delta[pos : pos+storedLen]
 		if crc32.ChecksumIEEE(payload) != want {
 			return nil, fmt.Errorf("replication frame at %d: crc mismatch", start)
 		}
+		pos += storedLen
+		if compressed {
+			inflated, derr := decompressWALPayload(payload)
+			if derr != nil {
+				return nil, fmt.Errorf("replication frame at %d: %w", start, derr)
+			}
+			payload = inflated
+		}
 		out = append(out, payload)
-		pos += int(n)
 	}
 	return out, nil
 }
@@ -274,6 +285,7 @@ func (db *DB) handleReplicationWAL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-WAL-End", strconv.FormatInt(end, 10))
 	w.Header().Set("X-WAL-Offset", strconv.FormatInt(offset, 10))
 	w.Header().Set("X-WAL-Checksum", strconv.FormatBool(cfg.EnableChecksum))
+	w.Header().Set("X-WAL-Version", strconv.FormatUint(uint64(walVersion.Load()), 10))
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	_, _ = w.Write(data)
 }
@@ -337,6 +349,13 @@ func (db *DB) fetchAndApplyOnce(client *http.Client, base string) {
 	}
 	end, _ := strconv.ParseInt(resp.Header.Get("X-WAL-End"), 10, 64)
 	innerCRC := resp.Header.Get("X-WAL-Checksum") != "false"
+	// 主库 WAL 版本决定帧长度是否带压缩标志；缺失时按 v5 处理（旧主库）。
+	masterVer := uint64(WALVersion5)
+	if h := resp.Header.Get("X-WAL-Version"); h != "" {
+		if v, e := strconv.ParseUint(h, 10, 32); e == nil {
+			masterVer = v
+		}
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 	if err != nil {
 		db.setReplicaStatus(replicaError, err)
@@ -351,7 +370,7 @@ func (db *DB) fetchAndApplyOnce(client *http.Client, base string) {
 		db.setReplicaStatus(replicaRunning, nil)
 		return
 	}
-	if err := db.ApplyWALDelta(body, innerCRC); err != nil {
+	if err := db.ApplyWALDelta(body, innerCRC, masterVer >= WALVersion6); err != nil {
 		db.setReplicaStatus(replicaError, err)
 		return
 	}

@@ -31,6 +31,7 @@ const (
 	ERParseError          = 1064 // 语法错误（兜底）
 	ERUnknownError        = 1105 // 未分类
 	ERReadOnly            = 1290 // 只读实例（从库未提升）
+	ERDiskFull            = 1021 // 磁盘空间不足（WAL 写入故障）
 )
 
 // sqlStateFor 返回 errno 对应的 SQLSTATE。
@@ -43,6 +44,8 @@ func sqlStateFor(code int) string {
 	case ERLockWaitTimeout:
 		return "HY000"
 	case ERReadOnly:
+		return "HY000"
+	case ERDiskFull:
 		return "HY000"
 	case ERNoSuchTable:
 		return "42S02"
@@ -76,6 +79,9 @@ func mysqlErrno(err error) int {
 	}
 	if errors.Is(err, errReadOnly) {
 		return ERReadOnly
+	}
+	if errors.Is(err, errDiskFull) {
+		return ERDiskFull
 	}
 	msg := err.Error()
 	low := strings.ToLower(msg)

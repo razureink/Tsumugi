@@ -353,7 +353,10 @@ func (db *DB) startMetricsServer() {
 			"group_commit_ms":   int(cfg.GroupCommitInterval / time.Millisecond),
 			"ttl_clean_ms":      int(cfg.TTLCleanInterval / time.Millisecond),
 			"checksum":          cfg.EnableChecksum,
+			"wal_compress":      walCompress.Load(),
+			"wal_version":       walVersion.Load(),
 		}
+		snap["disk_full"] = walDiskFull.Load()
 		json.NewEncoder(w).Encode(snap)
 	}))
 

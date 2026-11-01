@@ -181,6 +181,14 @@ func walCloseSignal() chan struct{} {
 // 而不是返回 nil（旧实现会让关闭窗口内的写入"成功"但不落盘）。
 var errWALClosed = errors.New("wal is closed")
 
+// errDiskFull 磁盘写满时的稳定错误（映射 MySQL 1021）。进入只读故障态后，
+// 所有写都返回它，客户端可按"空间不足"分支处理，而不是看到平台相关的
+// 系统调用文本。
+var errDiskFull = errors.New("no space left on device: WAL write failed, instance is in read-only fault state")
+
+// walDiskFull 当前故障是否为磁盘写满（错误映射与监控展示用）。
+var walDiskFull atomic.Bool
+
 // walFault 记录 writer 遇到的首个不可恢复 IO 错误（磁盘满 / EIO / EBADF）。
 // 一旦置位，后续 appendWAL 直接返回该错误，避免"提交成功但没落盘"。
 var (
@@ -191,6 +199,9 @@ var (
 func walFail(err error) {
 	if err == nil {
 		return
+	}
+	if isDiskFull(err) {
+		walDiskFull.Store(true)
 	}
 	walFaultMu.Lock()
 	if walFault == nil {
@@ -210,6 +221,7 @@ func walFaultReset() {
 	walFaultMu.Lock()
 	walFault = nil
 	walFaultMu.Unlock()
+	walDiskFull.Store(false)
 }
 
 // 全局统计钩子：appendWAL 是包级函数，借该指针上报磁盘写入速率
@@ -3200,8 +3212,12 @@ func (t *Table) writeLog(cmd byte, txnID uint64, pk int64, data []byte) error {
 // appendWAL 将记录提交给单写者队列。sync=false 时发送即返回；sync=true 时
 // 等待 writer 将该记录（连同同批并发写者）一起 Flush+Sync 后返回。
 func appendWAL(rec []byte, sync bool) error {
-	if err := walFaultErr(); err != nil {
-		return err
+	if f := walFaultErr(); f != nil {
+		// 磁盘写满时返回稳定的 errDiskFull（MySQL 1021），其余 IO 故障原样返回。
+		if walDiskFull.Load() {
+			return errDiskFull
+		}
+		return f
 	}
 	if walClosed.Load() {
 		return errWALClosed
@@ -3268,19 +3284,33 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 	// 读侧因此可以按批流式读入（不必整文件入内存），并且一次 CRC 校验整批。
 	var batch []byte
 	batchCount := 0
+	// dirty：自上次成功 Sync 以来是否有新字节写入。
+	// 空转时 flushLoop 每 100ms 仍会发 flush，但若没有新数据就跳过 Sync——
+	// SD 卡/机械盘上 10 次/秒的空 fsync 是真实的磨损与功耗。
+	dirty := false
 	flushBatch := func() {
 		if len(batch) == 0 {
 			return
 		}
+		v6 := walIsV6.Load()
+		stored := batch
+		compressed := false
+		if v6 && walCompress.Load() {
+			if c, ok := compressWALPayload(batch); ok {
+				stored = c
+				compressed = true
+			}
+		}
 		var head [16]byte
-		h := appendVarUint(head[:0], uint64(len(batch)))
-		h = appendU32(h, crc32.ChecksumIEEE(batch))
+		h := appendFrameLen(head[:0], len(stored), compressed, v6)
+		h = appendU32(h, crc32.ChecksumIEEE(stored))
 		if _, err := bw.Write(h); err != nil {
 			walFail(err)
 		}
-		if _, err := bw.Write(batch); err != nil {
+		if _, err := bw.Write(stored); err != nil {
 			walFail(err)
 		}
+		dirty = true
 		batch = batch[:0]
 		batchCount = 0
 	}
@@ -3301,18 +3331,27 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 		if _, err := bw.Write(rec); err != nil {
 			walFail(err)
 		}
+		dirty = true
 		walBufPut(rec)
 	}
 	// flushSync 冲刷并落盘，返回首个错误。
 	flushSync := func() error {
 		flushBatch()
 		reportWal()
+		// 自上次 Sync 没有任何新字节：跳过 Flush+Sync。空转时这是纯浪费，
+		// 在闪存设备上还是实打实的写入寿命消耗。
+		if !dirty && bw.Buffered() == 0 {
+			return nil
+		}
 		err := bw.Flush()
 		if err == nil {
 			err = file.Sync()
 		}
-		if err == nil && statsHook != nil {
-			statsHook.IncFsync()
+		if err == nil {
+			dirty = false
+			if statsHook != nil {
+				statsHook.IncFsync()
+			}
 		}
 		walFail(err)
 		return err
@@ -3335,6 +3374,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 				walFail(err)
 			}
 			pendingBytes += len(e.raw)
+			dirty = true
 			if e.sync {
 				walSignal(e.done, flushSync())
 			}
@@ -3370,6 +3410,7 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 						walFail(err)
 					}
 					pendingBytes += len(e2.raw)
+					dirty = true
 					if e2.sync {
 						waiters = append(waiters, e2.done)
 					}
@@ -3460,16 +3501,14 @@ func (db *DB) Compact() error {
 	if err != nil {
 		return err
 	}
-	// 只写临时文件的头，不动全局分帧开关：压缩失败时 writer 仍会在旧文件上追加，
-	// 若提前把开关切成 true，v1/v2 旧文件会被塞进批次头而无法重放。
-	if err := writeWALHeaderV(f, WALVersion5); err != nil {
+	// 临时文件写 v6 头（帧级压缩标志）。真正的全局开关在改名成功后切换。
+	if err := writeWALHeaderV(f, WALVersion6); err != nil {
 		f.Close()
 		return err
 	}
 	w := bufio.NewWriterSize(f, 64*1024)
-	// 压缩产物是 v5 文件，因此记录必须按批分帧写入，
-	// 直接写裸记录会让重放时把首条记录当成批次长度解析。
-	wb := &walBatchWriter{w: w}
+	// 压缩产物是 v6 文件，记录必须按批分帧写入，并沿用当前压缩策略。
+	wb := &walBatchWriter{w: w, v6: true, compress: walCompress.Load()}
 
 	for _, t := range tables {
 		// v1 紧凑 catalog 记录：[100][subop=1][varint tableID]...
@@ -3550,8 +3589,10 @@ func (db *DB) Compact() error {
 		return err
 	}
 	db.walFile = nf
-	// 压缩产物确定落位后才切换分帧开关（旧文件可能是 v1/v2 裸记录格式）
+	// 压缩产物确定落位后才切换分帧/版本开关（旧文件可能是 v1/v2 裸记录格式）
 	walFramed.Store(true)
+	walIsV6.Store(true)
+	walVersion.Store(WALVersion6)
 	// 重启单写者 writer：接管新文件，并排空压缩期间积压在 walCh 的记录
 	restarted = true
 	go walWriterLoop(nf, nil)
@@ -3757,7 +3798,9 @@ func NewDB(cfg *Config) (*DB, error) {
 			releaseDirLock(dirLock)
 			return nil, err
 		}
-		walFramed.Store(v == WALVersion3 || v == WALVersion4 || v == WALVersion5)
+		walFramed.Store(v == WALVersion3 || v == WALVersion4 || v == WALVersion5 || v == WALVersion6)
+		walIsV6.Store(v >= WALVersion6)
+		walVersion.Store(v)
 	}
 
 	privStore, err := NewPrivilegeStore(cfg.WALDir + "/" + cfg.PrivilegeFile)
@@ -3866,10 +3909,12 @@ func NewDB(cfg *Config) (*DB, error) {
 
 // writeWALHeader 新建 WAL 文件时写 v5 头（分帧 + 批量校验）。
 func writeWALHeader(f *os.File) error {
-	if err := writeWALHeaderV(f, WALVersion5); err != nil {
+	if err := writeWALHeaderV(f, WALVersion6); err != nil {
 		return err
 	}
 	walFramed.Store(true)
+	walIsV6.Store(true)
+	walVersion.Store(WALVersion6)
 	return nil
 }
 
@@ -3889,8 +3934,8 @@ func verifyWALHeader(f *os.File) error {
 		return err
 	}
 	// v1 紧凑格式版本号即为 1；v2 同格式；v3/v4/v5 为分帧格式（带批次长度与校验和）
-	if version != 1 && version != 2 && version != WALVersion3 && version != WALVersion4 && version != WALVersion5 {
-		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d, %d or %d", version, WALVersion3, WALVersion4, WALVersion5)
+	if version != 1 && version != 2 && version != WALVersion3 && version != WALVersion4 && version != WALVersion5 && version != WALVersion6 {
+		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d, %d, %d or %d", version, WALVersion3, WALVersion4, WALVersion5, WALVersion6)
 	}
 	var reserved uint32
 	if err := binary.Read(f, binary.BigEndian, &reserved); err != nil {
@@ -4092,13 +4137,15 @@ func (db *DB) loadWAL() error {
 	ctx.startApplier()
 	defer ctx.stopApplier()
 	switch version {
-	case WALVersion3, WALVersion4, WALVersion5:
+	case WALVersion3, WALVersion4, WALVersion5, WALVersion6:
 		// v3/v4/v5 分帧：按批流式读入（内存只与最大批次相关，不再整文件入内存）
 		// 三个版本的分帧布局一致，复用 loadV3；版本号只用于标识记录语义差异。
 		// 显式定位到记录区，不依赖 walHeaderVersion 读完后遗留的偏移
 		if _, err := file.Seek(int64(headerLen), io.SeekStart); err != nil {
 			return err
 		}
+		ctx.walV6 = version >= WALVersion6
+		walIsV6.Store(ctx.walV6)
 		err = ctx.loadV3(st.Size())
 		// 等所有在途段应用完再统计行数/收尾进度条（异步应用可能仍在跑）
 		ctx.flushPending()
@@ -4121,7 +4168,7 @@ func (db *DB) loadWAL() error {
 		ctx.atEOF = true
 		return ctx.loadV2()
 	default:
-		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d, %d or %d", version, WALVersion3, WALVersion4, WALVersion5)
+		return fmt.Errorf("unsupported WAL version %d, expected 1, 2, %d, %d, %d or %d", version, WALVersion3, WALVersion4, WALVersion5, WALVersion6)
 	}
 }
 
@@ -4135,6 +4182,8 @@ type walReplayCtx struct {
 	// cowApply 活库增量应用（复制）必须走写时复制：启动期重放可以原地改树，
 	// 但复制是在运行中应用，无锁 COW 读者可能正在遍历旧快照。
 	cowApply bool
+	// walV6 本文件是否使用 v6 帧语义（长度最低位为压缩标志）。
+	walV6 bool
 	pending     map[string][]walOp
 	pendingTxns map[uint64][]walOp
 	// pendingBytes 当前缓冲里记录数据的总字节数，与 pendingOps 共同决定何时切段。

@@ -10,10 +10,14 @@ import (
 	"testing"
 )
 
-// walV3Frames 按 v3 批次边界切分文件（只做长度解析，不做 CRC 校验），返回每批的 [起始偏移, 负载长度]。
+// walV3Frames 按批次边界切分文件（只做长度解析，不做 CRC 校验），
+// 返回每批的 [起始偏移, 存盘负载长度]。v6 的长度最低位是压缩标志，
+// 这里按文件头版本决定是否右移。
 func walV3Frames(t *testing.T, data []byte) [][2]int {
 	t.Helper()
 	var out [][2]int
+	ver := binary.BigEndian.Uint32(data[len(WALMagic):])
+	v6 := ver >= WALVersion6
 	pos := len(WALMagic) + 8
 	for pos < len(data) {
 		start := pos
@@ -30,6 +34,9 @@ func walV3Frames(t *testing.T, data []byte) [][2]int {
 				break
 			}
 			shift += 7
+		}
+		if v6 {
+			n >>= 1 // 最低位是压缩标志，返回存盘长度
 		}
 		payload := pos + walBatchCRCBytes
 		if n > uint64(len(data)-payload) {
@@ -65,8 +72,8 @@ func TestWALV3MultiBatchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read wal: %v", err)
 	}
-	if v := binary.BigEndian.Uint32(data[len(WALMagic):]); v != WALVersion5 {
-		t.Fatalf("WAL version = %d, want %d (v4+1)", v, WALVersion5)
+	if v := binary.BigEndian.Uint32(data[len(WALMagic):]); v != WALVersion6 {
+		t.Fatalf("WAL version = %d, want %d (v5+1)", v, WALVersion6)
 	}
 	frames := walV3Frames(t, data)
 	if len(frames) < 2 {

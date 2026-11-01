@@ -97,6 +97,10 @@ type Config struct {
 	// ReplicationToken 本实例作为主库时，允许从库拉取 WAL 的令牌。
 	// 为空则要求管理员会话（不建议生产使用，从库通常没有交互式会话）。
 	ReplicationToken string
+	// WALCompress WAL 帧压缩策略：off | auto（默认） | on。
+	// auto：落盘延迟 >= 1ms 且核数 >= 2 时开启；磁盘余量紧张时强制开启。
+	// 压缩减少落盘字节与 fsync 数据量，代价是 CPU（单核设备默认不压）。
+	WALCompress string
 }
 
 // loadDotEnvKV 读取 .env 文件（若存在），返回 KEY=VALUE 映射与是否成功。
@@ -166,6 +170,7 @@ type configFile struct {
 	ReplicaToken       *string  `json:"replica_token,omitempty"`
 	ReplicaPollMS      *int     `json:"replica_poll_ms,omitempty"`
 	ReplicationToken   *string  `json:"replication_token,omitempty"`
+	WALCompress        *string  `json:"wal_compress,omitempty"`
 }
 
 // loadConfigFile 从 /config/tsumugi.json 读取 Tsumugi 自身配置（若存在）。
@@ -287,6 +292,9 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	if raw.ReplicationToken != nil {
 		cfg.ReplicationToken = *raw.ReplicationToken
 	}
+	if raw.WALCompress != nil {
+		cfg.WALCompress = *raw.WALCompress
+	}
 	return existed, true
 }
 
@@ -331,6 +339,7 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 		ReplicaToken:       str(cfg.ReplicaToken),
 		ReplicaPollMS:      intp(cfg.ReplicaPollMS),
 		ReplicationToken:   str(cfg.ReplicationToken),
+		WALCompress:        str(cfg.WALCompress),
 	}
 }
 
@@ -592,6 +601,7 @@ func loadConfig() *Config {
 		ReplicaToken:        "",
 		ReplicaPollMS:       200,
 		ReplicationToken:    "",
+		WALCompress:         "auto",
 	}
 	// 顺序很重要：先读已有配置文件（单一事实源），再把 .env 叠加其上。
 	// 旧实现先应用 .env 再读文件，升级用户带残留 .env 时自定义配置会被默认值覆盖。

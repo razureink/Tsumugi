@@ -45,7 +45,9 @@ func countRows(t *testing.T, db *DB, table string) int64 {
 func TestReplicationBootstrapAndApply(t *testing.T) {
 	SetLogMute(true)
 	dirA := t.TempDir()
-	db1, err := NewDB(walTestConfig(dirA))
+	cfgA := walTestConfig(dirA)
+	cfgA.WALCompress = "on"
+	db1, err := NewDB(cfgA)
 	if err != nil {
 		t.Fatalf("db1: %v", err)
 	}
@@ -75,7 +77,9 @@ func TestReplicationBootstrapAndApply(t *testing.T) {
 	if err := copyWALPrefix(walA, filepath.Join(dirB, "wal"), pos1); err != nil {
 		t.Fatalf("bootstrap copy: %v", err)
 	}
-	db2, err := NewDB(walTestConfig(dirB))
+	cfgB := walTestConfig(dirB)
+	cfgB.WALCompress = "on"
+	db2, err := NewDB(cfgB)
 	if err != nil {
 		t.Fatalf("db2: %v", err)
 	}
@@ -87,7 +91,7 @@ func TestReplicationBootstrapAndApply(t *testing.T) {
 		t.Fatalf("bootstrap offset=%d want %d", got, pos1)
 	}
 
-	if err := db2.ApplyWALDelta(delta, true); err != nil {
+	if err := db2.ApplyWALDelta(delta, true, true); err != nil {
 		t.Fatalf("ApplyWALDelta: %v", err)
 	}
 	if n := countRows(t, db2, "ship_t"); n != 3 {
@@ -102,7 +106,7 @@ func TestReplicationBootstrapAndApply(t *testing.T) {
 	}
 
 	// 幂等边界：空增量不改变任何东西
-	if err := db2.ApplyWALDelta(nil, true); err != nil {
+	if err := db2.ApplyWALDelta(nil, true, true); err != nil {
 		t.Fatalf("empty delta: %v", err)
 	}
 	if n := countRows(t, db2, "ship_t"); n != 3 {
@@ -115,7 +119,9 @@ func TestReplicationBootstrapAndApply(t *testing.T) {
 func TestReplicationRejectsCorruptDelta(t *testing.T) {
 	SetLogMute(true)
 	dirA := t.TempDir()
-	db1, err := NewDB(walTestConfig(dirA))
+	cfgA := walTestConfig(dirA)
+	cfgA.WALCompress = "on"
+	db1, err := NewDB(cfgA)
 	if err != nil {
 		t.Fatalf("db1: %v", err)
 	}
@@ -141,7 +147,7 @@ func TestReplicationRejectsCorruptDelta(t *testing.T) {
 		t.Fatalf("db2: %v", err)
 	}
 	defer db2.Close()
-	if err := db2.ApplyWALDelta(bad, true); err == nil {
+	if err := db2.ApplyWALDelta(bad, true, true); err == nil {
 		t.Fatal("corrupt delta must be rejected")
 	}
 	if n := countRows(t, db2, "corrupt_t"); n != 1 {
@@ -267,6 +273,7 @@ func TestReplicaLoopEndToEnd(t *testing.T) {
 		off, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
 		w.Header().Set("X-WAL-End", itoa64(end))
 		w.Header().Set("X-WAL-Checksum", "true")
+		w.Header().Set("X-WAL-Version", strconv.Itoa(WALVersion6))
 		if off == pos {
 			_, _ = w.Write(delta)
 			return

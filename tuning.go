@@ -280,6 +280,24 @@ func applyTuning(cfg *Config) deviceTuning {
 			lowDiskSpace = true
 		}
 	}
+	// 4.5) WAL 帧压缩：极端设备上最直接的 I/O 优化。
+	//   - 慢盘（fsync >= 1ms）且核数 >= 2：压缩省下的落盘字节通常大于 CPU 代价；
+	//   - 单核设备：CPU 比 I/O 更稀缺，auto 默认关闭（可显式配置 on）；
+	//   - 磁盘余量紧张：即使单核也压，优先保证能写下去。
+	switch strings.ToLower(strings.TrimSpace(cfg.WALCompress)) {
+	case "on", "true", "1", "yes":
+		walCompress.Store(true)
+	case "off", "false", "0", "no":
+		walCompress.Store(false)
+	default: // auto
+		enable := cores >= 2 && t.FsyncLatency >= 1*time.Millisecond
+		if lowDiskSpace {
+			enable = true
+		}
+		walCompress.Store(enable)
+	}
+	logf(LOG_VERB, "wal frame compression: %v (policy=%s)", walCompress.Load(), cfg.WALCompress)
+
 	if replaySegmentOps < minReplaySegmentOps {
 		replaySegmentOps = minReplaySegmentOps
 	}
@@ -308,6 +326,13 @@ func applyTuning(cfg *Config) deviceTuning {
 	}
 	if n, ok := envInt("TSUMUGI_MAX_SCAN_ROWS"); ok {
 		maxScanRows = n
+	}
+	// 压缩策略也可用环境变量强制（容器里最方便）
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TSUMUGI_WAL_COMPRESS"))) {
+	case "1", "true", "on", "yes":
+		walCompress.Store(true)
+	case "0", "false", "off", "no":
+		walCompress.Store(false)
 	}
 
 	logf(LOG_VERB,
