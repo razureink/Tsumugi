@@ -3725,6 +3725,11 @@ type DB struct {
 	// replicaApplyMu 串行化"应用增量"与"提升"：提升后立即允许写入，
 	// 若有增量正在应用，必须等它完成，否则会与用户写并发改成同一棵树。
 	replicaApplyMu sync.Mutex
+	// replicaID 本实例作为从库时的标识（回传 ack 用）。
+	replicaID string
+	// replicaAcks 主库侧记录每个从库最后一次回传的已应用偏移。
+	replicaAckMu sync.Mutex
+	replicaAcks  map[string]replicaAck
 }
 
 type Transaction struct {
@@ -3823,6 +3828,13 @@ func NewDB(cfg *Config) (*DB, error) {
 		backupDir:  cfg.BackupDir,
 	}
 	db.stats.durability.Store(string(cfg.Durability))
+	// 从库标识（ack 用）与主库侧 ack 表
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	db.replicaID = fmt.Sprintf("%s-%d", host, os.Getpid())
+	db.replicaAcks = make(map[string]replicaAck)
 	// 先发布关闭哨兵，再启动任何后台 goroutine：flushLoop/ttlLoop 会在
 	// tick 时经 appendWAL/flushWAL 读它，晚发布会被 -race 抓到。
 	walClosePtr.Store(&db.walClose)

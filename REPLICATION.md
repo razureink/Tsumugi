@@ -61,18 +61,26 @@ SQL：
 
 ```sql
 SHOW MASTER STATUS;   -- File / Position（主库当前 WAL 末尾）
-SHOW SLAVE STATUS;    -- Slave_IO_State / Read_Master_Log_Pos / Seconds_Behind_Master / Last_Error
+SHOW SLAVE STATUS;    -- 从库自身：状态 / 主库位置 / 延迟 / 最后错误
+SHOW SLAVE HOSTS;     -- 主库视角：每个从库最后回传的 Offset / Age_s
 ```
+
+从库每次成功应用后会 `POST /replication/ack` 回传 `{id, offset}`（单调不回退），
+主库据此展示各从库进度。**这只用于监控，不是半同步**：主库提交不等待 ack。
 
 HTTP（管理员）：
 
 ```
-GET /api/stats        -> snap["replication"] = {offset, lag_ms, status, error, master, read_only, promoted}
+GET /api/stats        -> snap["replication"] = {
+                          replica_id, offset, lag_ms, status, error,
+                          master, read_only, promoted,
+                          replicas: [{id, host, offset, age_s}]
+                        }
 ```
 
 `status` 为 `running | stopped | error`；`error` 时原因在 `error` 字段。
-拉取端点是 `GET /replication/wal?offset=N`，响应头带 `X-WAL-End` 与
-`X-WAL-Checksum`。
+拉取端点是 `GET /replication/wal?offset=N`，响应头带 `X-WAL-End`、
+`X-WAL-Checksum` 与 `X-WAL-Version`（v6 压缩帧需要）。
 
 ## 故障切换（failover）
 

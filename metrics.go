@@ -321,8 +321,9 @@ func (db *DB) startMetricsServer() {
 		}
 	})
 
-	// 复制：从库拉取 WAL 增量（凭据见 replication_token / metrics_token）
+	// 复制：从库拉取 WAL 增量 + 回传已应用偏移（凭据见 replication_token）
 	mux.HandleFunc("/replication/wal", db.handleReplicationWAL)
+	mux.HandleFunc("/replication/ack", db.handleReplicationAck)
 
 	// JSON API（需管理员认证）
 	mux.HandleFunc("/api/stats", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {

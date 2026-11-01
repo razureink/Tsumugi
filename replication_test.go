@@ -7,12 +7,15 @@ package main
 // 这正好覆盖真实复制里最容易错的三个点：帧边界、LSN 对齐、只读语义。
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -269,7 +272,23 @@ func TestReplicaLoopEndToEnd(t *testing.T) {
 	end := st.Size()
 	delta := readFileRange(t, walA, pos, end)
 
+	var ackMu sync.Mutex
+	ackOffset := int64(-1)
+	ackID := ""
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/replication/ack" {
+			var req struct {
+				ID     string `json:"id"`
+				Offset int64  `json:"offset"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			ackMu.Lock()
+			ackOffset, ackID = req.Offset, req.ID
+			ackMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
 		off, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
 		w.Header().Set("X-WAL-End", itoa64(end))
 		w.Header().Set("X-WAL-Checksum", "true")
@@ -310,6 +329,68 @@ func TestReplicaLoopEndToEnd(t *testing.T) {
 	}
 	if got := db2.ReplicaStatus()["status"]; got != replicaRunning {
 		t.Fatalf("replica status=%v want running", got)
+	}
+
+	// 主库必须收到从库回传的已应用偏移（= 本 WAL 末尾）
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ackMu.Lock()
+		got := ackOffset
+		ackMu.Unlock()
+		if got == end {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ackMu.Lock()
+	gotAck, gotID := ackOffset, ackID
+	ackMu.Unlock()
+	if gotAck != end {
+		t.Fatalf("master did not receive ack: got %d want %d", gotAck, end)
+	}
+	if gotID == "" {
+		t.Fatal("ack carried an empty replica id")
+	}
+}
+
+// TestReplicationAckHandler 主库回传端点：鉴权、单调不回退、快照可见。
+func TestReplicationAckHandler(t *testing.T) {
+	SetLogMute(true)
+	cfg := walTestConfig(t.TempDir())
+	cfg.ReplicationToken = "rt"
+	db, err := NewDB(cfg)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+
+	post := func(token, id string, off int64) int {
+		body := fmt.Sprintf(`{"id":%q,"offset":%d}`, id, off)
+		req := httptest.NewRequest(http.MethodPost, "/replication/ack", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		db.handleReplicationAck(rec, req)
+		return rec.Code
+	}
+	if code := post("wrong", "r1", 100); code != http.StatusUnauthorized {
+		t.Fatalf("wrong token status=%d want 401", code)
+	}
+	if code := post("rt", "r1", 100); code != http.StatusOK {
+		t.Fatalf("valid token status=%d want 200", code)
+	}
+	snaps := db.replicaAckSnapshot()
+	if len(snaps) != 1 || snaps[0]["offset"] != int64(100) {
+		t.Fatalf("ack snapshot=%v", snaps)
+	}
+	// 单调：更小的偏移不应让进度倒退
+	if code := post("rt", "r1", 50); code != http.StatusOK {
+		t.Fatalf("lower ack status=%d", code)
+	}
+	if snaps := db.replicaAckSnapshot(); snaps[0]["offset"] != int64(100) {
+		t.Fatalf("ack regressed to %v", snaps[0]["offset"])
+	}
+	if got := db.ReplicaStatus()["replicas"]; got == nil {
+		t.Fatal("ReplicaStatus must expose master-side replica progress")
 	}
 }
 

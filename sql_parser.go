@@ -744,8 +744,13 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 		}
 		if p.matchKeyword("SLAVE") {
 			if p.matchKeyword("HOSTS") {
-				columns = []string{"Server_id", "Host", "Port", "Master_id", "Slave_UUID"}
-				rows = nil
+				columns = []string{"Server_id", "Host", "Port", "Master_id", "Slave_UUID", "Offset", "Age_s"}
+				for _, a := range db.replicaAckSnapshot() {
+					rows = append(rows, []interface{}{
+						a["id"], a["host"], int64(0), int64(1),
+						a["id"], a["offset"], a["age_s"],
+					})
+				}
 				return
 			}
 			p.matchKeyword("STATUS")

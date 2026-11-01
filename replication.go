@@ -24,13 +24,16 @@ package main
 //   - 只支持 Tsumugi→Tsumugi，不兼容 MySQL 原生从库。
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,8 +80,10 @@ func (db *DB) setReplicaStatus(status string, err error) {
 // ReplicaStatus 返回复制状态供监控使用。
 func (db *DB) ReplicaStatus() map[string]interface{} {
 	out := map[string]interface{}{
-		"offset": db.replicaOffset.Load(),
-		"lag_ms": db.replicaLagMS.Load(),
+		"offset":     db.replicaOffset.Load(),
+		"lag_ms":     db.replicaLagMS.Load(),
+		"replica_id": db.replicaID,
+		"replicas":   db.replicaAckSnapshot(),
 	}
 	if p := db.replicaStatus.Load(); p != nil {
 		out["status"] = *p
@@ -242,6 +247,87 @@ func parseWALBatchFrames(delta []byte, v6 bool) ([][]byte, error) {
 	return out, nil
 }
 
+// replicaAck 主库侧记录的从库进度。
+type replicaAck struct {
+	Offset int64
+	At     time.Time
+	Host   string
+}
+
+// replicaAckSnapshot 返回各从库最后回传的偏移（按 id 排序，便于稳定展示）。
+func (db *DB) replicaAckSnapshot() []map[string]interface{} {
+	db.replicaAckMu.Lock()
+	defer db.replicaAckMu.Unlock()
+	now := time.Now()
+	out := make([]map[string]interface{}, 0, len(db.replicaAcks))
+	for id, a := range db.replicaAcks {
+		out = append(out, map[string]interface{}{
+			"id":     id,
+			"offset": a.Offset,
+			"age_s":  int64(now.Sub(a.At) / time.Second),
+			"host":   a.Host,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i]["id"].(string) < out[j]["id"].(string) })
+	return out
+}
+
+// handleReplicationAck 接收从库回传的已应用偏移（单调不回退）。
+func (db *DB) handleReplicationAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	if !db.replicationAuthorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		ID     string `json:"id"`
+		Offset int64  `json:"offset"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil ||
+		req.ID == "" || req.Offset < 0 {
+		http.Error(w, "bad ack payload", http.StatusBadRequest)
+		return
+	}
+	db.replicaAckMu.Lock()
+	if db.replicaAcks == nil {
+		db.replicaAcks = make(map[string]replicaAck)
+	}
+	if prev, ok := db.replicaAcks[req.ID]; !ok || req.Offset >= prev.Offset {
+		db.replicaAcks[req.ID] = replicaAck{Offset: req.Offset, At: time.Now(), Host: r.RemoteAddr}
+	}
+	db.replicaAckMu.Unlock()
+	writeJSON(w, map[string]interface{}{"ok": true})
+}
+
+// sendReplicaAck 从库在成功应用后把偏移回传主库（失败不影响复制）。
+func (db *DB) sendReplicaAck(client *http.Client, base string, offset int64) {
+	cfg := db.configSnapshot()
+	payload, err := json.Marshal(map[string]interface{}{
+		"id":     db.replicaID,
+		"offset": offset,
+	})
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/replication/ack", bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.ReplicaToken != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.ReplicaToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+	resp.Body.Close()
+}
+
 // ---- 主库侧 HTTP：给从库提供 WAL 增量 ----
 
 // replicationAuthorized 校验从库的拉取凭据。
@@ -368,6 +454,7 @@ func (db *DB) fetchAndApplyOnce(client *http.Client, base string) {
 		}
 		db.replicaLagMS.Store(0)
 		db.setReplicaStatus(replicaRunning, nil)
+		db.sendReplicaAck(client, base, offset)
 		return
 	}
 	if err := db.ApplyWALDelta(body, innerCRC, masterVer >= WALVersion6); err != nil {
@@ -382,4 +469,5 @@ func (db *DB) fetchAndApplyOnce(client *http.Client, base string) {
 	}
 	db.replicaLagMS.Store(time.Since(start).Milliseconds())
 	db.setReplicaStatus(replicaRunning, nil)
+	db.sendReplicaAck(client, base, db.replicaOffset.Load())
 }
