@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/metrics"
 	"strconv"
@@ -489,6 +491,97 @@ func (db *DB) startMetricsServer() {
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "dir": db.backupDir, "files": files})
 	}))
+
+	// 逻辑备份：GET 导出 SQL 文本，POST 导入（需显式 confirm=restore，防误触）。
+	mux.HandleFunc("/api/admin/dump", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, "dump is admin-only") {
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "GET required"})
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition",
+			`attachment; filename="tsumugi_dump_`+time.Now().Format("20060102_150405")+`.sql"`)
+		if err := db.DumpSQL(w); err != nil {
+			// 头已发出，只能记录；客户端会看到截断的文件并自行判断。
+			logf(LOG_ERR, "dump failed: %v", err)
+		}
+	}))
+	mux.HandleFunc("/api/admin/restore", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, "restore is admin-only") {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "POST required"})
+			return
+		}
+		if r.URL.Query().Get("confirm") != "restore" {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "pass ?confirm=restore to proceed"})
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 512<<20))
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		if err := db.RestoreSQL(string(body)); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": true})
+	}))
+
+	mux.HandleFunc("/api/admin/pitr", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r, "pitr is admin-only") {
+			return
+		}
+		// GET 查询当前 WAL 偏移；POST 把指定偏移写入目标目录供离线恢复。
+		if r.Method == http.MethodGet {
+			pos, err := db.WALPosition()
+			if err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+				return
+			}
+			writeJSON(w, map[string]interface{}{"ok": true, "wal_position": pos})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "GET or POST required"})
+			return
+		}
+		var req struct {
+			Dest string `json:"dest"`
+			UpTo int64  `json:"up_to"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		if req.Dest == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": "dest is required"})
+			return
+		}
+		cfg := db.configSnapshot()
+		// 只允许写到 backup_dir 之下，避免任意路径写（恢复目录常被误配成 / 或 C:\）。
+		if err := requireUnderDir(db.backupDir, req.Dest); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		walName := cfg.WALFile
+		if walName == "" {
+			walName = "wal"
+		}
+		// 不能对运行中的实例做 PITR（会抢 WAL 单例）：这里只把前缀落盘，
+		// 真正的恢复在停服后用 RestorePointInTime 完成。
+		if err := copyWALPrefix(db.walFile.Name(), filepath.Join(req.Dest, walName), req.UpTo); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "dest": req.Dest, "up_to": req.UpTo})
+	}))
+
 
 	mux.HandleFunc("/api/admin/restart", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
 		if !requireAdmin(w, r, "restart is admin-only") {
