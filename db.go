@@ -146,6 +146,9 @@ type walEntry struct {
 	done  chan error
 	stop  bool
 	flush bool
+	// raw 已分帧的原始字节（复制流从主库拉到的完整 batch）。写协程必须
+	// 先 flushBatch 把本地记录定格成帧，再原样写入，保证帧边界不交错。
+	raw []byte
 }
 
 // 串行化 Compact：多个压缩请求不能并发换文件
@@ -2335,6 +2338,61 @@ func (t *Table) replayDelete(pk int64) {
 	}
 }
 
+// ---- 活库增量应用（复制专用）：必须走 COW 写路径 ----
+// 启动期重放可以原地改树（无读者）；复制增量是在**运行中**应用，
+// 无锁 COW 读者可能正在遍历旧快照，原地修改会让它们看到撕裂节点。
+// 这些函数与上面 replay* 语义相同，只是把 *Mutable 换成 COW 版本。
+
+func (t *Table) replayInsertCOW(pk int64, data []byte) {
+	if !t.pkTree.SetNX(pk, data) {
+		return
+	}
+	t.notePK(pk)
+	if decodeExpireAt(data) > 0 {
+		t.ttlRows.Store(true)
+	}
+	if len(t.Meta().Indexes) == 0 {
+		return
+	}
+	row, _, _ := decodeRow(t.Meta(), data)
+	for idxName, fieldName := range t.Meta().Indexes {
+		t.indexAddPK(idxName, t.encodeIndexValue(fieldName, row[fieldName]), pk)
+	}
+}
+
+func (t *Table) replayUpdateCOW(pk int64, data []byte) {
+	oldData, ok := t.pkTree.Get(pk)
+	if !ok {
+		return
+	}
+	if len(t.Meta().Indexes) == 0 {
+		t.pkTree.Set(pk, data)
+		return
+	}
+	oldRow, _, _ := decodeRow(t.Meta(), oldData)
+	newRow, _, _ := decodeRow(t.Meta(), data)
+	t.pkTree.Set(pk, data)
+	for idxName, fieldName := range t.Meta().Indexes {
+		t.updateIndex(fieldName, idxName, oldRow[fieldName], newRow[fieldName], pk)
+	}
+}
+
+func (t *Table) replayDeleteCOW(pk int64) {
+	if len(t.Meta().Indexes) == 0 {
+		t.pkTree.Delete(pk)
+		return
+	}
+	oldData, ok := t.pkTree.Get(pk)
+	if !ok {
+		return
+	}
+	oldRow, _, _ := decodeRow(t.Meta(), oldData)
+	t.pkTree.Delete(pk)
+	for idxName, fieldName := range t.Meta().Indexes {
+		t.indexRemovePK(idxName, t.encodeIndexValue(fieldName, oldRow[fieldName]), pk)
+	}
+}
+
 func (t *Table) Select(conditions map[string]interface{}, minKey, maxKey *int64) ([]map[string]interface{}, error) {
 	return t.SelectR(conditions, nil, minKey, maxKey, -1)
 }
@@ -3269,6 +3327,18 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 		case e.flush:
 			walSignal(e.done, flushSync())
 			continue
+		case e.raw != nil:
+			// 复制来的原始帧：先把本地缓冲的记录收成一个完整帧，
+			// 再原样追加，避免半帧与新帧交错。
+			flushBatch()
+			if _, err := bw.Write(e.raw); err != nil {
+				walFail(err)
+			}
+			pendingBytes += len(e.raw)
+			if e.sync {
+				walSignal(e.done, flushSync())
+			}
+			continue
 		}
 		// 普通记录
 		writeRec(e.rec)
@@ -3293,6 +3363,16 @@ func walWriterLoop(file *os.File, wg *sync.WaitGroup) {
 					drain = false
 				case e2.flush:
 					waiters = append(waiters, e2.done)
+				case e2.raw != nil:
+					// 同批里的复制帧：同样先定格本地批再原样写。
+					flushBatch()
+					if _, err := bw.Write(e2.raw); err != nil {
+						walFail(err)
+					}
+					pendingBytes += len(e2.raw)
+					if e2.sync {
+						waiters = append(waiters, e2.done)
+					}
 				default:
 					writeRec(e2.rec)
 					if e2.sync {
@@ -3329,6 +3409,11 @@ func walSignal(d chan error, err error) {
 func (db *DB) Compact() error {
 	if walClosed.Load() {
 		return fmt.Errorf("wal is closed")
+	}
+	// 复制两侧都禁止压缩：重写 WAL 会让主库的从库偏移失效，
+	// 或让从库的 WAL 不再是主库 WAL 的前缀，两种都会读错位置。
+	if db.walOffsetsPinned() {
+		return fmt.Errorf("compact is disabled while replication is active (master serving replicas, or replica not yet promoted): it rewrites the WAL and breaks LSN alignment")
 	}
 	compactMu.Lock()
 	defer compactMu.Unlock()
@@ -3586,6 +3671,19 @@ type DB struct {
 	// dirLock 数据目录独占锁句柄：保证同一 data 目录只有一个进程在跑
 	// （两个进程共享 WAL 会互相覆盖数据）。
 	dirLock *os.File
+	// ---- C1 复制（物理 WAL 传送）----
+	// replicaOffset：已应用到本库的 WAL 字节偏移（LSN），与主库对齐。
+	replicaOffset atomic.Int64
+	// replicaLagMS：最近一次成功拉取时主库端到端延迟估计（毫秒）。
+	replicaLagMS atomic.Int64
+	// replicaStatus：running / stopped / error 之一；error 时原因见 replicaErr。
+	replicaStatus atomic.Pointer[string]
+	replicaErr    atomic.Pointer[string]
+	// promoted：从库已提升为主库（解除只读、停止拉取）。
+	promoted atomic.Bool
+	// replicaApplyMu 串行化"应用增量"与"提升"：提升后立即允许写入，
+	// 若有增量正在应用，必须等它完成，否则会与用户写并发改成同一棵树。
+	replicaApplyMu sync.Mutex
 }
 
 type Transaction struct {
@@ -3752,9 +3850,16 @@ func NewDB(cfg *Config) (*DB, error) {
 	// 绑定到文件中的表 ID；清空会让重启后新建的表从 1 重新编号，与既有表
 	// 的 tableID 冲突，下次重放时数据会串表（回归测试见 walreg_repro_test.go）。
 	db.walFile = walFile
+	// 从库的 LSN 起点 = 本地 WAL 长度。用主库 WAL 前缀副本做初始状态时，
+	// 这个值天然等于主库对应时刻的偏移。
+	if st, err := walFile.Stat(); err == nil {
+		db.replicaOffset.Store(st.Size())
+	}
 	// 启动唯一 WAL writer：此后所有 appendWAL/flushWAL 经通道交给它串行落盘
 	db.wg.Add(1)
 	go walWriterLoop(walFile, &db.wg)
+	// 从库拉取循环必须在 writer 启动之后：拉到的增量要经 walCh 追加。
+	db.startReplicaLoop()
 	logf(LOG_VERB, "WAL loaded (%d tables, %d rows) in %v", db.tablesCount.Load(), atomic.LoadInt64(&walLoadRows), time.Since(walLoadStart))
 	return db, nil
 }
@@ -3831,6 +3936,11 @@ func (db *DB) autoCompactLoop() {
 func (db *DB) maybeCompact() {
 	cfg := db.configSnapshot()
 	if !cfg.AutoCompact || compactBusy.Load() {
+		return
+	}
+	// 主库对外提供复制流、或本实例是从库时禁止自动压缩：
+	// Compact 会重写 WAL，主库让从库偏移失效，从库则打断与主库的前缀关系。
+	if db.walOffsetsPinned() {
 		return
 	}
 	minMB := cfg.CompactMinWALMB
@@ -4022,6 +4132,9 @@ type walReplayCtx struct {
 	headerLen   int
 	buf         []byte
 	enableCRC   bool
+	// cowApply 活库增量应用（复制）必须走写时复制：启动期重放可以原地改树，
+	// 但复制是在运行中应用，无锁 COW 读者可能正在遍历旧快照。
+	cowApply bool
 	pending     map[string][]walOp
 	pendingTxns map[uint64][]walOp
 	// pendingBytes 当前缓冲里记录数据的总字节数，与 pendingOps 共同决定何时切段。
@@ -4200,6 +4313,17 @@ func (c *walReplayCtx) walProgressFinish() {
 // 计数由调用方在整批/整表应用完后一次性累加：每行一次原子加会让所有并行
 // worker 争用同一 cache line，是大表重放里明显的串行化点。
 func (c *walReplayCtx) applyOpOnTable(t *Table, cmd byte, pk int64, data []byte) {
+	if c.cowApply {
+		switch cmd {
+		case WALInsert:
+			t.replayInsertCOW(pk, data)
+		case WALUpdate:
+			t.replayUpdateCOW(pk, data)
+		case WALDelete:
+			t.replayDeleteCOW(pk)
+		}
+		return
+	}
 	switch cmd {
 	case WALInsert:
 		t.replayInsert(pk, data)

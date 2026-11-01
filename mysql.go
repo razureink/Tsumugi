@@ -1051,7 +1051,8 @@ func (mc *mysqlConn) handleSetIsolation(lower string) {
 func isWriteStatement(sql string) bool {
 	switch strings.ToUpper(firstWordRaw(sql)) {
 	case "INSERT", "REPLACE", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
-		"TRUNCATE", "RENAME", "GRANT", "REVOKE":
+		"TRUNCATE", "RENAME", "GRANT", "REVOKE", "LOAD", "FLUSH", "OPTIMIZE",
+		"ANALYZE", "CALL", "IMPORT":
 		return true
 	}
 	return false

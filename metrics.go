@@ -321,6 +321,9 @@ func (db *DB) startMetricsServer() {
 		}
 	})
 
+	// 复制：从库拉取 WAL 增量（凭据见 replication_token / metrics_token）
+	mux.HandleFunc("/replication/wal", db.handleReplicationWAL)
+
 	// JSON API（需管理员认证）
 	mux.HandleFunc("/api/stats", adminAuthRequired(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -337,6 +340,8 @@ func (db *DB) startMetricsServer() {
 		})
 		db.mu.RUnlock()
 		snap["total_rows"] = rowTotal
+		// C1：复制状态（主从偏移/延迟/只读/提升）供面板与告警使用
+		snap["replication"] = db.ReplicaStatus()
 		snap["wal_file_mb"] = walFileSizeMB(db)
 		snap["server_version"] = "Tsumugi-0.1"
 		cfg := db.configSnapshot()

@@ -86,6 +86,17 @@ type Config struct {
 	// SlowQueryMS 慢查询阈值（毫秒）；0 = 关闭记录。超阈值语句进环形缓冲，
 	// 可用 SHOW SLOWQUERIES 查看。默认 500ms（MySQL 默认 10s，这里更贴近内存库）。
 	SlowQueryMS int
+	// ---- C1 复制 ----
+	// ReplicaOf 非空表示本实例作为从库，从该主库拉取 WAL 增量，例如
+	// "http://10.0.0.1:10232"。从库默认只读，PROMOTE 后解除。
+	ReplicaOf string
+	// ReplicaToken 拉取 WAL 的凭据（主库的 metrics_token 或管理员会话）。
+	ReplicaToken string
+	// ReplicaPollMS 拉取间隔（毫秒），默认 200。
+	ReplicaPollMS int
+	// ReplicationToken 本实例作为主库时，允许从库拉取 WAL 的令牌。
+	// 为空则要求管理员会话（不建议生产使用，从库通常没有交互式会话）。
+	ReplicationToken string
 }
 
 // loadDotEnvKV 读取 .env 文件（若存在），返回 KEY=VALUE 映射与是否成功。
@@ -151,6 +162,10 @@ type configFile struct {
 	TreeKind           *string  `json:"tree_kind,omitempty"`
 	TreeMode           *string  `json:"tree_mode,omitempty"`
 	SlowQueryMS        *int     `json:"slow_query_ms,omitempty"`
+	ReplicaOf          *string  `json:"replica_of,omitempty"`
+	ReplicaToken       *string  `json:"replica_token,omitempty"`
+	ReplicaPollMS      *int     `json:"replica_poll_ms,omitempty"`
+	ReplicationToken   *string  `json:"replication_token,omitempty"`
 }
 
 // loadConfigFile 从 /config/tsumugi.json 读取 Tsumugi 自身配置（若存在）。
@@ -260,6 +275,18 @@ func loadConfigFile(cfg *Config) (bool, bool) {
 	if raw.SlowQueryMS != nil {
 		cfg.SlowQueryMS = *raw.SlowQueryMS
 	}
+	if raw.ReplicaOf != nil {
+		cfg.ReplicaOf = *raw.ReplicaOf
+	}
+	if raw.ReplicaToken != nil {
+		cfg.ReplicaToken = *raw.ReplicaToken
+	}
+	if raw.ReplicaPollMS != nil {
+		cfg.ReplicaPollMS = *raw.ReplicaPollMS
+	}
+	if raw.ReplicationToken != nil {
+		cfg.ReplicationToken = *raw.ReplicationToken
+	}
 	return existed, true
 }
 
@@ -300,6 +327,10 @@ func (f *configFile) fillFromConfig(cfg *Config) {
 		TreeKind:           str(cfg.TreeKind),
 		TreeMode:           str(cfg.TreeMode),
 		SlowQueryMS:        intp(cfg.SlowQueryMS),
+		ReplicaOf:          str(cfg.ReplicaOf),
+		ReplicaToken:       str(cfg.ReplicaToken),
+		ReplicaPollMS:      intp(cfg.ReplicaPollMS),
+		ReplicationToken:   str(cfg.ReplicationToken),
 	}
 }
 
@@ -557,6 +588,10 @@ func loadConfig() *Config {
 		TreeKind:            "llrb",
 		TreeMode:            "cow",
 		SlowQueryMS:         500,
+		ReplicaOf:           "",
+		ReplicaToken:        "",
+		ReplicaPollMS:       200,
+		ReplicationToken:    "",
 	}
 	// 顺序很重要：先读已有配置文件（单一事实源），再把 .env 叠加其上。
 	// 旧实现先应用 .env 再读文件，升级用户带残留 .env 时自定义配置会被默认值覆盖。

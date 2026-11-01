@@ -138,3 +138,20 @@ WAL 版本策略（本轮已落地，`wal_version_test.go` 覆盖）：
 - 新增测试：`wal_version_test.go`（v4 写入 + v3 兼容读取）、`batch_insert_test.go`、`batch_columns_test.go`、`scan_limit_test.go`、`tree_test.go`、`tuning_test.go`、`index_pushdown_test.go`、`mode_bench_test.go`
 - 可切换的索引实现与并发模式：`tree_kind` = `llrb|btree`，`tree_mode` = `cow|lock|auto`
 - 设备自适应：`tuning.go`（fsync/核数/内存/磁盘四维探测）
+
+---
+
+## 6. C1 复制（已落地部分，详见 `REPLICATION.md`）
+
+已实现 **物理 WAL 传送**的 Tsumugi→Tsumugi 复制：
+
+- 主库 `GET /replication/wal?offset=N` 返回原始分帧字节（CRC 由从库逐帧校验）；
+- 从库按偏移轮询、增量应用并原样追加到本地 WAL，LSN 天然对齐；
+- 活库增量应用走 **COW 写路径**，不会与无锁读者产生数据竞争；
+- 从库默认只读（errno 1290），`PROMOTE` 互斥提升；
+- `SHOW MASTER STATUS` / `SHOW SLAVE STATUS` / `/api/stats.replication`
+  提供偏移、延迟、错误；
+- 复制激活期间两侧强制禁止 `Compact`（重写 WAL 会破坏 LSN 对齐）。
+
+尚未实现：GTID、半同步、多源、自动选主/fencing、MySQL 原生 binlog 协议。
+这些属于 C1 的运维纵深，不影响单主单从的基本替换。

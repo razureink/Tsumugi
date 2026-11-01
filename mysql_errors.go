@@ -30,6 +30,7 @@ const (
 	ERDataTooLong         = 1406 // 数据超长
 	ERParseError          = 1064 // 语法错误（兜底）
 	ERUnknownError        = 1105 // 未分类
+	ERReadOnly            = 1290 // 只读实例（从库未提升）
 )
 
 // sqlStateFor 返回 errno 对应的 SQLSTATE。
@@ -40,6 +41,8 @@ func sqlStateFor(code int) string {
 	case ERLockDeadlock:
 		return "40001"
 	case ERLockWaitTimeout:
+		return "HY000"
+	case ERReadOnly:
 		return "HY000"
 	case ERNoSuchTable:
 		return "42S02"
@@ -70,6 +73,9 @@ func mysqlErrno(err error) int {
 	// 1) 哨兵错误
 	if errors.Is(err, errPKExists) {
 		return ERDupEntry
+	}
+	if errors.Is(err, errReadOnly) {
+		return ERReadOnly
 	}
 	msg := err.Error()
 	low := strings.ToLower(msg)

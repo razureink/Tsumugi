@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -596,6 +597,12 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 		err = fmt.Errorf("empty query")
 		return
 	}
+	// 从库只读：未提升前拒绝一切写语句（错误码 1290，与 MySQL --read-only 一致）。
+	// 复制自身的应用路径不经过 SQL 解析器（直接走重放器），所以不会被这里挡住。
+	if db.replicaReadOnly() && isWriteStatement(sql) {
+		err = errReadOnly
+		return
+	}
 	// 语句首词归一：JOIN/BEGIN/REPLACE/TRUNCATE 等不在关键字表里（避免占用
 	// 标识符命名空间），必须按 token 原文比较，否则这些语句会落到 default 报错。
 	switch strings.ToUpper(first.val) {
@@ -720,24 +727,47 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 			sortRowsByFirst(rows)
 			return
 		}
-		// SHOW MASTER STATUS / SHOW BINARY LOGS / SHOW SLAVE STATUS
+		// SHOW MASTER STATUS：Position 是主库当前 WAL 末尾（从库据此判断是否追平）
 		if p.matchKeyword("MASTER") {
 			p.matchKeyword("STATUS")
+			pos, _ := db.WALPosition()
 			columns = []string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB", "Executed_Gtid_Set"}
-			rows = [][]interface{}{{"tsumugi-bin.000001", int64(4), "", "", ""}}
+			rows = [][]interface{}{{"tsumugi-bin.000001", pos, "", "", ""}}
 			return
 		}
 		if p.matchKeyword("BINARY") {
 			p.matchKeyword("LOGS")
 			columns = []string{"Log_name", "File_size"}
-			rows = [][]interface{}{{"tsumugi-bin.000001", int64(0)}}
+			pos, _ := db.WALPosition()
+			rows = [][]interface{}{{"tsumugi-bin.000001", pos}}
 			return
 		}
 		if p.matchKeyword("SLAVE") {
+			if p.matchKeyword("HOSTS") {
+				columns = []string{"Server_id", "Host", "Port", "Master_id", "Slave_UUID"}
+				rows = nil
+				return
+			}
 			p.matchKeyword("STATUS")
-			p.matchKeyword("HOSTS")
-			columns = []string{"Slave_IO_State", "Master_Host", "Master_Port"}
-			rows = nil
+			cfg := db.configSnapshot()
+			host := ""
+			port := int64(0)
+			if cfg.ReplicaOf != "" {
+				if u, e := url.Parse(cfg.ReplicaOf); e == nil && u.Host != "" {
+					host = u.Hostname()
+					if pn, e2 := strconv.Atoi(u.Port()); e2 == nil {
+						port = int64(pn)
+					}
+				}
+			}
+			st := db.ReplicaStatus()
+			status, _ := st["status"].(string)
+			errMsg, _ := st["error"].(string)
+			columns = []string{"Slave_IO_State", "Master_Host", "Master_Port",
+				"Master_Log_File", "Read_Master_Log_Pos", "Seconds_Behind_Master",
+				"Slave_IO_Running", "Slave_SQL_Running", "Last_Error"}
+			rows = [][]interface{}{{status, host, port, "tsumugi-bin.000001",
+				st["offset"], st["lag_ms"], status, status, errMsg}}
 			return
 		}
 		if p.matchKeyword("PRIVILEGES") {
@@ -871,6 +901,12 @@ func (db *DB) runSQLTokensAsOut(user string, toks []sqlToken, sql string, params
 		}
 		db.setCurDB(nameTok.val)
 		rawMsg = "Database changed"
+		return
+	case "PROMOTE":
+		// 从库提升为主库：停止拉取、解除只读（故障切换用）。
+		p.next()
+		old := db.Promote()
+		rawMsg = "promoted to primary (detached from " + old + ")"
 		return
 	case "CREATE":
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].is("DATABASE") {
