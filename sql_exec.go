@@ -1046,19 +1046,32 @@ func (db *DB) groupAndProject(pl *selectPlan, rows []map[string]interface{}, ite
 		}
 		g.rows = append(g.rows, r)
 	}
+	// MySQL 隐式聚合语义：没有 GROUP BY 时，即使输入 0 行也必须产出一个分组，
+	// 让 COUNT(*)=0 而不是返回 0 行（`SELECT COUNT(*) ... WHERE 无匹配` 是
+	// 最常见的分页/判空写法，返回 0 行会让 ORM 直接下标越界）。
+	// 有 GROUP BY 时 0 行就是 0 组，保持不变。
+	if len(order) == 0 && len(pl.groupBy) == 0 {
+		order = append(order, &grp{})
+	}
 	out = make([][]interface{}, 0, len(order))
 	reps = make([]map[string]interface{}, 0, len(order))
 	for _, g := range order {
 		memo := map[*expr]interface{}{}
+		// 空分组没有代表行：用空 map 求值，聚合函数按 0 行计算，
+		// 非聚合列得到 NULL（与 MySQL 一致）。
+		rep := map[string]interface{}{}
+		if len(g.rows) > 0 {
+			rep = g.rows[0]
+		}
 		row := make([]interface{}, len(items))
 		for i, it := range items {
-			row[i] = it.e.evalGroup(g.rows[0], g.rows, memo)
+			row[i] = it.e.evalGroup(rep, g.rows, memo)
 		}
-		if pl.having != nil && !truthy(pl.having.evalGroup(g.rows[0], g.rows, memo)) {
+		if pl.having != nil && !truthy(pl.having.evalGroup(rep, g.rows, memo)) {
 			continue
 		}
 		out = append(out, row)
-		reps = append(reps, g.rows[0])
+		reps = append(reps, rep)
 	}
 	return out, reps
 }
