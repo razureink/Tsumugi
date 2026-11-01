@@ -3742,7 +3742,19 @@ func (db *DB) maybeCompact() {
 	if minMB <= 0 {
 		minMB = 64
 	}
-	if walFileSizeMB(db) < float64(minMB) {
+	walMB := walFileSizeMB(db)
+	// 磁盘余量紧张时**提前压缩**：WAL 不清就会一路写满盘，届时写入失败甚至损坏。
+	// 这种情况下不看"低峰"条件也要压——小盘设备上可用性优先于吞吐。
+	if thresholdMB, tight := db.diskPressure(); tight {
+		if walMB >= thresholdMB {
+			logf(LOG_WARN, "low disk: compacting WAL early (%.1fMB >= %.1fMB threshold)", walMB, thresholdMB)
+			if err := db.Compact(); err != nil {
+				logf(LOG_ERR, "emergency compact failed: %v", err)
+			}
+		}
+		return
+	}
+	if walMB < float64(minMB) {
 		return
 	}
 	// 低峰判定：最近 1 秒命令数低于阈值则视为空闲

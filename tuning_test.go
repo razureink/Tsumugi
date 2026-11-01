@@ -227,3 +227,71 @@ func TestApplyMemoryBudget(t *testing.T) {
 			walWriteBufBytes, walBatchMaxBytes, replaySegmentBytes)
 	}
 }
+
+// ==================== 极端设备：缓冲缩放与磁盘压力 ====================
+
+// TestConnBufScalesWithRAM 小内存机器必须缩小连接缓冲。
+func TestConnBufScalesWithRAM(t *testing.T) {
+	saveTuningState(t)
+	reset := func() {
+		walWriteBufBytes = 1 << 20
+		walBatchMaxBytes = 4 << 20
+		replaySegmentBytes = 8 << 20
+		replaySegmentOps = 65536
+		replayWorkers = 16
+		replayPipeline = true
+		connBufBytes = 32 << 10
+		maxScanRows = 2000000
+	}
+	cases := []struct {
+		ram  uint64
+		want int
+	}{
+		{192 << 20, 8 << 10},
+		{512 << 20, 16 << 10},
+		{2 << 30, 32 << 10},
+		{32 << 30, 32 << 10},
+	}
+	for _, c := range cases {
+		reset()
+		applyMemoryBudget(c.ram)
+		if connBufBytes != c.want {
+			t.Fatalf("ram=%s connBuf=%d want %d", fmtBytes(c.ram), connBufBytes, c.want)
+		}
+	}
+}
+
+// TestDiskPressureThreshold 磁盘紧张时给出紧急压缩阈值；宽松时不干预。
+func TestDiskPressureThreshold(t *testing.T) {
+	saveTuningState(t)
+	SetLogMute(true)
+	db, closeDB := openIndexTestDB(t)
+	defer closeDB()
+
+	thr, tight := db.diskPressure()
+	free := freeDiskBytes(db.configSnapshot().WALDir)
+	t.Logf("free=%s threshold=%.1fMB tight=%v", fmtBytes(free), thr, tight)
+
+	if free == 0 {
+		t.Skip("当前平台无法探测磁盘余量")
+	}
+	total := totalMemoryBytes()
+	expectTight := free < 2<<30 || (total > 0 && total <= 4<<30 && free < total)
+	if tight != expectTight {
+		t.Fatalf("tight=%v want %v (free=%s ram=%s)", tight, expectTight, fmtBytes(free), fmtBytes(total))
+	}
+	if !tight {
+		if thr != 0 {
+			t.Fatalf("磁盘宽松时阈值应为 0，实际 %.1fMB", thr)
+		}
+		return
+	}
+	// 紧张时阈值 = 剩余/4，且不低于 8MB 下限
+	wantMB := float64(free) / 4 / (1 << 20)
+	if wantMB < 8 {
+		wantMB = 8
+	}
+	if thr != wantMB {
+		t.Fatalf("阈值=%.1fMB want %.1fMB", thr, wantMB)
+	}
+}

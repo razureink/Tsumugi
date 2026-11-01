@@ -305,8 +305,8 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	session := &Session{
 		conn: conn,
-		br:   bufio.NewReaderSize(conn, 32*1024),
-		bw:   bufio.NewWriterSize(conn, 32*1024),
+		br:   bufio.NewReaderSize(conn, connBufBytes),
+		bw:   bufio.NewWriterSize(conn, connBufBytes),
 		db:   s.db,
 		auth: false,
 	}

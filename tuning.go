@@ -32,6 +32,9 @@ var (
 	replayPipeline = true
 	// lowDiskSpace 启动时 WAL 目录剩余空间过低的提示级别标记（0=正常）
 	lowDiskSpace bool
+	// connBufBytes 单连接的读/写缓冲大小。默认 32KB；
+	// 小内存机器按档位调小（100 连接 × 64KB = 6.4MB，在 256MB 机器上是可观开销）。
+	connBufBytes = 32 << 10
 	// maxScanRows 单条查询最多物化的行数。SQL 路径会把结果集整体物化成
 	// [][]interface{}，超大结果集会直接吃光内存（极端小内存设备上是 OOM 主因）。
 	// 超过上限时明确报错并提示加 LIMIT，而不是让进程被 OOM-killer 杀掉。
@@ -62,6 +65,7 @@ func applyMemoryBudget(totalRAM uint64) {
 	switch {
 	case totalRAM < 256<<20: // < 256MB：只保留最小可用缓冲，单 worker、无流水线
 		maxScanRows = 50000
+		connBufBytes = 8 << 10
 		capBuf(&walWriteBufBytes, 32<<10)
 		capBuf(&walBatchMaxBytes, 128<<10)
 		capBuf(&replaySegmentBytes, 1<<20)
@@ -72,6 +76,7 @@ func applyMemoryBudget(totalRAM uint64) {
 		replayPipeline = false
 	case totalRAM < 1<<30: // < 1GB
 		maxScanRows = 200000
+		connBufBytes = 16 << 10
 		capBuf(&walWriteBufBytes, 64<<10)
 		capBuf(&walBatchMaxBytes, 256<<10)
 		capBuf(&replaySegmentBytes, 2<<20)
@@ -306,10 +311,10 @@ func applyTuning(cfg *Config) deviceTuning {
 	}
 
 	logf(LOG_VERB,
-		"device profile: class=%s fsync≈%v cores=%d ram=%s disk_free=%s | commit window %v..%v, wal buf %dKB, batch %d rec/%dKB, replay %d ops/%dMB x %d workers (pipeline=%v), max scan rows %d, mem limit %s",
+		"device profile: class=%s fsync≈%v cores=%d ram=%s disk_free=%s | commit window %v..%v, wal buf %dKB, batch %d rec/%dKB, conn buf %dKB, replay %d ops/%dMB x %d workers (pipeline=%v), max scan rows %d, mem limit %s",
 		t.Class, t.FsyncLatency, cores, fmtBytes(t.TotalRAM), fmtBytes(t.FreeDisk),
 		t.CommitMin, t.CommitMax,
-		walWriteBufBytes>>10, walBatchMaxRecords, walBatchMaxBytes>>10,
+		walWriteBufBytes>>10, walBatchMaxRecords, walBatchMaxBytes>>10, connBufBytes>>10,
 		replaySegmentOps, replaySegmentBytes>>20, replayWorkerCount(1<<8), replayPipeline,
 		maxScanRows, fmtBytes(t.MemoryCap))
 
@@ -350,4 +355,26 @@ func fmtBytes(n uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTP"[exp])
+}
+
+// diskPressure 判断 WAL 目录是否处于磁盘紧张状态，并给出"紧急压缩"的
+// WAL 大小阈值（MB）。返回 (阈值MB, 是否紧张)。
+// 语义：剩余空间 < 2GB，或（内存 <= 4GB 的机器上）剩余 < 内存总量时视为紧张；
+// 此时 WAL 一旦超过剩余空间的 1/4 就该压缩，避免把盘写满导致写入失败。
+func (db *DB) diskPressure() (float64, bool) {
+	free := freeDiskBytes(db.configSnapshot().WALDir)
+	if free == 0 {
+		return 0, false // 探测不可用：保持默认行为，不引入意外压缩
+	}
+	total := totalMemoryBytes()
+	tight := free < 2<<30 || (total > 0 && total <= 4<<30 && free < total)
+	if !tight {
+		return 0, false
+	}
+	thresholdMB := float64(free) / 4 / (1 << 20)
+	const minThresholdMB = 8.0
+	if thresholdMB < minThresholdMB {
+		thresholdMB = minThresholdMB
+	}
+	return thresholdMB, true
 }

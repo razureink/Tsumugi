@@ -208,8 +208,8 @@ func (mc *mysqlConn) handle() {
 			logf(LOG_ERR, "mysql conn panic: %v", r)
 		}
 	}()
-	mc.br = bufio.NewReaderSize(mc.conn, 32*1024)
-	mc.bw = bufio.NewWriterSize(mc.conn, 64*1024)
+	mc.br = bufio.NewReaderSize(mc.conn, connBufBytes)
+	mc.bw = bufio.NewWriterSize(mc.conn, connBufBytes*2)
 	// 握手阶段：读用短超时，写单独设不限（写超时会在每命令前续期）。
 	mc.conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	if err := mc.sendHandshake(); err != nil {
@@ -343,7 +343,7 @@ func (mc *mysqlConn) enableCompression() error {
 	mc.compSeq = 0
 	mc.compReader = &mysqlCompReader{br: mc.br, seq: &mc.compSeq}
 	mc.compWriter = &mysqlCompWriter{w: mc.conn, seq: &mc.compSeq}
-	mc.bw = bufio.NewWriterSize(mc.compWriter, 64*1024)
+	mc.bw = bufio.NewWriterSize(mc.compWriter, connBufBytes*2)
 	return nil
 }
 
